@@ -137,6 +137,7 @@ void GCS_MAVLINK_Copter::send_position_target_local_ned()
         target_pos_ned_m = copter.mode_guided.get_target_pos_NED_m().tofloat();
         break;
     case ModeGuided::SubMode::PosVelAccel:
+    case ModeGuided::SubMode::TrajStream:
         type_mask = POSITION_TARGET_TYPEMASK_YAW_IGNORE| POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE; // ignore everything except position, velocity & acceleration
         target_pos_ned_m = copter.mode_guided.get_target_pos_NED_m().tofloat();
         target_vel_ned_ms = copter.mode_guided.get_target_vel_NED_ms();
@@ -1074,6 +1075,47 @@ void GCS_MAVLINK_Copter::handle_message_set_position_target_local_ned(const mavl
     }
 }
 
+void GCS_MAVLINK_Copter::handle_message_mpc_trajectory(const mavlink_message_t &msg)
+{
+    // decode packet
+    mavlink_mpc_trajectory_t packet;
+    mavlink_msg_mpc_trajectory_decode(&msg, &packet);
+
+    // only accept while in Guided (or Auto-Guided) mode
+    if (!copter.flightmode->in_guided_mode()) {
+        return;
+    }
+
+    // sanity-check chunk node count (message carries up to 6 nodes)
+    if (packet.count == 0 || packet.count > 6) {
+        return;
+    }
+
+    // reject the chunk if any node component is NaN or Inf (fabsf(inf) > bound)
+    for (uint8_t i = 0; i < packet.count; i++) {
+        if (isnan(packet.pos_n[i]) || isnan(packet.pos_e[i]) ||
+            isnan(packet.vel_n[i]) || isnan(packet.vel_e[i]) ||
+            isnan(packet.acc_n[i]) || isnan(packet.acc_e[i]) ||
+            fabsf(packet.pos_n[i]) > 1.0e6f || fabsf(packet.pos_e[i]) > 1.0e6f ||
+            fabsf(packet.vel_n[i]) > 1000.0f || fabsf(packet.vel_e[i]) > 1000.0f ||
+            fabsf(packet.acc_n[i]) > 1000.0f || fabsf(packet.acc_e[i]) > 1000.0f) {
+            return;
+        }
+    }
+
+    // reject a non-finite or implausible drag coefficient (k/m for an ag drone is ~0.02 1/m)
+    if (isnan(packet.drag_k) || packet.drag_k < 0.0f || packet.drag_k > 1.0f) {
+        return;
+    }
+
+    // hand the chunk to guided mode; on the committing chunk it (re-)bases the
+    // replay buffer and auto-starts SubMode::TrajStream if not already there
+    copter.mode_guided.mpc_trajectory_chunk(
+        packet.traj_id, packet.num_points, packet.start_index, packet.count, packet.dt_ms,
+        packet.pos_n, packet.pos_e, packet.vel_n, packet.vel_e, packet.acc_n, packet.acc_e,
+        packet.time_boot_ms, packet.drag_k);
+}
+
 void GCS_MAVLINK_Copter::handle_message_set_position_target_global_int(const mavlink_message_t &msg)
 {
     // decode packet
@@ -1187,6 +1229,9 @@ void GCS_MAVLINK_Copter::handle_message(const mavlink_message_t &msg)
         break;
     case MAVLINK_MSG_ID_SET_POSITION_TARGET_GLOBAL_INT:
         handle_message_set_position_target_global_int(msg);
+        break;
+    case MAVLINK_MSG_ID_MPC_TRAJECTORY:
+        handle_message_mpc_trajectory(msg);
         break;
 #endif
 

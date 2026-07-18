@@ -1134,6 +1134,16 @@ public:
     bool set_pos_vel_NED_m(const Vector3p& pos_ned_m, const Vector3f& vel_ned_ms, bool use_yaw = false, float yaw_rad = 0.0, bool use_yaw_rate = false, float yaw_rate_rads = 0.0, bool yaw_relative = false);
     bool set_pos_vel_accel_NED_m(const Vector3p& pos_ned_m, const Vector3f& vel_ned_ms, const Vector3f& accel_ned_mss, bool use_yaw = false, float yaw_rad = 0.0, bool use_yaw_rate = false, float yaw_rate_rads = 0.0, bool yaw_relative = false);
 
+    // ingest one chunk of an onboard-MPC trajectory (NE-only, local NED). Chunks
+    // sharing a traj_id assemble one trajectory; the chunk containing the final
+    // node commits it and (if not already there) enters SubMode::TrajStream.
+    // Returns true when the trajectory commits.
+    bool mpc_trajectory_chunk(uint16_t traj_id, uint16_t num_points, uint16_t start_index, uint8_t count, uint16_t dt_ms,
+                              const float* pos_n, const float* pos_e,
+                              const float* vel_n, const float* vel_e,
+                              const float* acc_n, const float* acc_e,
+                              uint32_t time_boot_ms = 0, float drag_k = 0.0f);
+
     // get position, velocity and acceleration targets
     const Vector3p& get_target_pos_NED_m() const;
     const Vector3f& get_target_vel_NED_ms() const;
@@ -1168,6 +1178,7 @@ public:
         VelAccel,
         Accel,
         Angle,
+        TrajStream,
     };
 
     SubMode submode() const { return guided_mode; }
@@ -1230,6 +1241,8 @@ private:
     void velaccel_control_run();
     void pause_control_run();
     void posvelaccel_control_run();
+    void trajstream_control_start();
+    void trajstream_control_run();
     void set_yaw_state_rad(bool use_yaw, float yaw_rad, bool use_yaw_rate, float yaw_rate_rads, bool relative_angle);
 
     // controls which controller is run (pos or vel):
@@ -1240,6 +1253,63 @@ private:
 
     // guided mode is paused or not
     bool _paused;
+
+    // Onboard-MPC trajectory replay buffer (used by SubMode::TrajStream).
+    // Chunks fill pending[]; the committing chunk copies pending->active and
+    // re-bases commit_ms, so trajstream_control_run() can sample by true elapsed
+    // time. A single main-loop thread touches this (MAVLink ingestion and mode
+    // run() are both on the main loop), so no locking is needed - the payload
+    // (active[]) is written before commit_ms/active_n are published.
+    struct TrajBuffer {
+        struct Sample {
+            float t_s;      // node time from trajectory start (s)
+            float pos_n;    // north position (m, local NED)
+            float pos_e;    // east position (m, local NED)
+            float vel_n;    // north velocity (m/s)
+            float vel_e;    // east velocity (m/s)
+            float acc_n;    // north acceleration (m/s/s)
+            float acc_e;    // east acceleration (m/s/s)
+        };
+        static const uint16_t TRAJ_MAX = 128;   // 61-node plan + headroom
+
+        Sample active[TRAJ_MAX];    // trajectory currently being replayed
+        Sample pending[TRAJ_MAX];   // trajectory being assembled from chunks
+        uint16_t active_n {0};      // number of valid nodes in active[]
+        uint16_t pending_n {0};     // number of valid nodes in pending[]
+        uint16_t pending_next {0};  // next expected node index (chunks must arrive in order, gap-free)
+        bool pending_valid {false}; // false once a gap/out-of-order chunk poisons the assembly
+        uint32_t commit_ms {0};     // replay time base: sender anchor time_boot_ms if given, else arrival millis()
+        uint16_t active_id {0};     // traj_id of active[]
+        uint16_t pending_id {0};    // traj_id of pending[]
+        uint16_t dt_ms {0};         // nominal node spacing (ms)
+        float drag_k {0};           // k/m (1/m) of the committed trajectory's airframe model (0 = no drag FF)
+        float pending_drag_k {0};   // drag_k of the trajectory being assembled
+
+        // begin assembling a new pending trajectory (dt must be non-zero, checked by the caller)
+        void begin(uint16_t id, uint16_t n, uint16_t dt, float drag_k_perm);
+        // store one node into pending[index]; returns false if index out of range
+        bool put(uint16_t index, float pos_n, float pos_e, float vel_n, float vel_e, float acc_n, float acc_e);
+        // publish pending[] as active[] and re-base the replay clock to base_ms
+        void commit(uint32_t base_ms);
+        // replay duration of the active trajectory in ms (0 if none)
+        uint32_t duration_ms() const;
+        // sample the active trajectory at elapsed_s (linear interpolation).
+        // Before start clamps to the first node; past the end holds the final
+        // position with zero velocity/acceleration (Tier-1 replay-until-new).
+        // Returns false if there is no active trajectory.
+        bool sample(float elapsed_s, float &posN, float &posE, float &velN, float &velE, float &accN, float &accE) const;
+    } _traj;
+
+    // altitude (NED down) captured at TrajStream entry; held while replaying (NE-only first cut)
+    postype_t _trajstream_entry_pos_d_m {0};
+
+    // Tier-2 station-keep: position captured once when the failsafe hold engages
+    // (re-pinning to the live estimate every loop would drift with the estimate)
+    bool _trajstream_hold_active {false};
+    Vector2p _trajstream_hold_pos_ne_m;
+
+    // rate limiter for GUIP dataflash logging of the replayed target
+    uint32_t _trajstream_last_log_ms {0};
 };
 
 #if AP_SCRIPTING_ENABLED
