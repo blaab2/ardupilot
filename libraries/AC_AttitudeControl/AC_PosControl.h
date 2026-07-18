@@ -306,6 +306,16 @@ public:
     // Use when path planning or shaping is done outside this controller.
     void set_pos_vel_accel_NE_m(const Vector2p& pos_ne_m, const Vector2f& vel_ne_ms, const Vector2f& accel_ne_mss);
 
+    // Sets the thrust-side drag feed-forward (m/s²) added to the NE acceleration target
+    // AFTER the velocity PID (see NE_update_controller). Lets a mode with a known airframe
+    // drag model (e.g. k/m*|v|*v) supply the modeled drag share of the lean angle directly,
+    // so the desired acceleration stays kinematic and the velocity PID corrects only
+    // unmodeled effects. Cleared by NE_init_controller. When preserve_output is true the
+    // velocity-PID I term is shifted by -(new-old FF) so the commanded acceleration is
+    // continuous at engagement (the I term seeded from attitude already contains the drag
+    // share - this prevents double counting).
+    void set_drag_accel_ff_NE_mss(const Vector2f& drag_accel_ne_mss, bool preserve_output);
+
 
     /// Position
 
@@ -756,6 +766,7 @@ protected:
     Vector3f    _vel_desired_ned_ms;        // desired velocity in NED m/s
     Vector3f    _vel_target_ned_ms;         // velocity target in NED m/s calculated by pos_to_rate step
     Vector3f    _accel_desired_ned_mss;     // desired acceleration in NED m/s² (feed forward)
+    Vector2f    _accel_drag_ff_ne_mss;      // thrust-side drag feed-forward in NE m/s², added after the velocity PID (see set_drag_accel_ff_NE_mss)
     Vector3f    _accel_target_ned_mss;      // acceleration target in NED m/s²
     // todo: seperate the limit vector into ne and u. ne is based on acceleration while u is set +-1 based on throttle saturation. Together they don't form a direction vector because the units are different.
     Vector3f    _limit_vector_ned;          // the direction that the position controller is limited, zero when not limited

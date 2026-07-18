@@ -563,6 +563,9 @@ void AC_PosControl::NE_init_controller()
     // Set desired acceleration to zero because raw acceleration is prone to noise
     _accel_desired_ned_mss.xy().zero();
 
+    // clear any externally supplied drag feed-forward (modes re-engage it after init)
+    _accel_drag_ff_ne_mss.zero();
+
     if (!NE_is_active()) {
         lean_angles_to_accel_NE_mss(_accel_target_ned_mss.x, _accel_target_ned_mss.y);
     }
@@ -757,7 +760,7 @@ void AC_PosControl::NE_update_controller()
 
     // pass the correction acceleration to the target acceleration output
     _accel_target_ned_mss.xy() = accel_target_ne_mss;
-    _accel_target_ned_mss.xy() += _accel_desired_ned_mss.xy() + _accel_offset_ned_mss.xy();
+    _accel_target_ned_mss.xy() += _accel_desired_ned_mss.xy() + _accel_offset_ned_mss.xy() + _accel_drag_ff_ne_mss;
 
     // limit acceleration using maximum lean angles
     const float angle_max_rad = MIN(_attitude_control.get_althold_lean_angle_max_rad(), get_lean_angle_max_rad());
@@ -1187,6 +1190,16 @@ void AC_PosControl::set_pos_vel_accel_NE_m(const Vector2p& pos_ne_m, const Vecto
     _pos_desired_ned_m.xy() = pos_ne_m;
     _vel_desired_ned_ms.xy() = vel_ne_ms;
     _accel_desired_ned_mss.xy() = accel_ne_mss;
+}
+
+// Sets the thrust-side drag feed-forward added after the velocity PID (see header).
+void AC_PosControl::set_drag_accel_ff_NE_mss(const Vector2f& drag_accel_ne_mss, bool preserve_output)
+{
+    if (preserve_output) {
+        // shift the velocity-PID I term so FF + I is unchanged at this instant
+        _pid_vel_ne_m.set_integrator(_pid_vel_ne_m.get_i() - (drag_accel_ne_mss - _accel_drag_ff_ne_mss));
+    }
+    _accel_drag_ff_ne_mss = drag_accel_ne_mss;
 }
 
 // Converts lean angles (rad) to NED acceleration in m/s².
