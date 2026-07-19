@@ -1,0 +1,190 @@
+{
+ "generator": "scripts/mpc/csolver/model/gen_model.py",
+ "casadi": "3.7.2",
+ "constants": {
+  "K_OVER_M": 0.018017,
+  "A_TRIM": 2.506008610380144,
+  "A_CAP": 5.6638061407502285,
+  "J_MAX": 5.0
+ },
+ "corridor": {
+  "approach_ub": [
+   [
+    -10.0,
+    0.09188246409357641
+   ],
+   [
+    -6.0,
+    0.2172256448920521
+   ],
+   [
+    -4.0,
+    0.38580706665249176
+   ],
+   [
+    -2.0,
+    0.8081863834862264
+   ],
+   [
+    -1.0,
+    1.4248305041798541
+   ],
+   [
+    -0.5,
+    2.1407635773188334
+   ]
+  ],
+  "return_lb": [
+   [
+    -10.0,
+    14.044914856398927
+   ],
+   [
+    -6.0,
+    13.844453647245732
+   ],
+   [
+    -4.0,
+    13.616445026361509
+   ],
+   [
+    -2.0,
+    12.94689342997128
+   ],
+   [
+    -1.0,
+    12.011891017060014
+   ],
+   [
+    -0.5,
+    11.074778971003463
+   ]
+  ],
+  "slack_fwd": [
+   19.1,
+   -5.0
+  ]
+ },
+ "files": {
+  "turn_r5_common.c": [
+   "turn_r5_expl_ode_fun",
+   "turn_r5_expl_vde_forw",
+   "turn_r5_constr_h",
+   "turn_r5_constr_h_jac"
+  ],
+  "turn_r5_N15.c": [
+   "turn_r5_N15_disc_step",
+   "turn_r5_N15_disc_step_jac"
+  ],
+  "turn_r5_N20.c": [
+   "turn_r5_N20_disc_step",
+   "turn_r5_N20_disc_step_jac"
+  ],
+  "turn_r5_N30.c": [
+   "turn_r5_N30_disc_step",
+   "turn_r5_N30_disc_step_jac"
+  ],
+  "turn_r5_N60.c": [
+   "turn_r5_N60_disc_step",
+   "turn_r5_N60_disc_step_jac"
+  ]
+ },
+ "work": {
+  "turn_r5_expl_ode_fun": {
+   "sz_arg": 3,
+   "sz_res": 1,
+   "sz_iw": 0,
+   "sz_w": 8,
+   "n_in": 3,
+   "n_out": 1
+  },
+  "turn_r5_expl_vde_forw": {
+   "sz_arg": 5,
+   "sz_res": 3,
+   "sz_iw": 0,
+   "sz_w": 26,
+   "n_in": 5,
+   "n_out": 3
+  },
+  "turn_r5_constr_h": {
+   "sz_arg": 3,
+   "sz_res": 2,
+   "sz_iw": 4,
+   "sz_w": 9,
+   "n_in": 2,
+   "n_out": 1
+  },
+  "turn_r5_constr_h_jac": {
+   "sz_arg": 7,
+   "sz_res": 5,
+   "sz_iw": 4,
+   "sz_w": 18,
+   "n_in": 2,
+   "n_out": 3
+  },
+  "turn_r5_N15_disc_step": {
+   "sz_arg": 3,
+   "sz_res": 1,
+   "sz_iw": 0,
+   "sz_w": 30,
+   "n_in": 3,
+   "n_out": 1
+  },
+  "turn_r5_N15_disc_step_jac": {
+   "sz_arg": 3,
+   "sz_res": 4,
+   "sz_iw": 0,
+   "sz_w": 87,
+   "n_in": 3,
+   "n_out": 4
+  },
+  "turn_r5_N20_disc_step": {
+   "sz_arg": 3,
+   "sz_res": 1,
+   "sz_iw": 0,
+   "sz_w": 30,
+   "n_in": 3,
+   "n_out": 1
+  },
+  "turn_r5_N20_disc_step_jac": {
+   "sz_arg": 3,
+   "sz_res": 4,
+   "sz_iw": 0,
+   "sz_w": 87,
+   "n_in": 3,
+   "n_out": 4
+  },
+  "turn_r5_N30_disc_step": {
+   "sz_arg": 3,
+   "sz_res": 1,
+   "sz_iw": 0,
+   "sz_w": 30,
+   "n_in": 3,
+   "n_out": 1
+  },
+  "turn_r5_N30_disc_step_jac": {
+   "sz_arg": 3,
+   "sz_res": 4,
+   "sz_iw": 0,
+   "sz_w": 87,
+   "n_in": 3,
+   "n_out": 4
+  },
+  "turn_r5_N60_disc_step": {
+   "sz_arg": 3,
+   "sz_res": 1,
+   "sz_iw": 0,
+   "sz_w": 30,
+   "n_in": 3,
+   "n_out": 1
+  },
+  "turn_r5_N60_disc_step_jac": {
+   "sz_arg": 3,
+   "sz_res": 4,
+   "sz_iw": 0,
+   "sz_w": 87,
+   "n_in": 3,
+   "n_out": 4
+  }
+ }
+}

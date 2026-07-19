@@ -9,6 +9,14 @@
 #include "afs_copter.h"
 #endif
 
+#include <AP_MPCSolver/AP_MPCTurnPlanner.h>
+
+// AUTO MpcTurn stage: the onboard turn MPC needs the solver library and the
+// shared MPCTrajReplay helper (which lives behind MODE_GUIDED_ENABLED)
+#ifndef AUTO_MPC_TURN_ENABLED
+#define AUTO_MPC_TURN_ENABLED (AP_MPCSOLVER_ENABLED && MODE_GUIDED_ENABLED && MODE_AUTO_ENABLED)
+#endif
+
 class Parameters;
 class ParametersG2;
 
@@ -575,6 +583,9 @@ public:
 #endif
         NAV_SCRIPT_TIME,
         NAV_ATTITUDE_TIME,
+#if AUTO_MPC_TURN_ENABLED
+        MPC_TURN,           // onboard turn-MPC flies a detected headland turn (MPCTrajReplay)
+#endif
     };
 
     // set submode.  returns true on success, false on failure
@@ -677,6 +688,33 @@ private:
     void loiter_run();
     void loiter_to_alt_run();
     void nav_attitude_time_run();
+
+#if AUTO_MPC_TURN_ENABLED
+    // AUTO MpcTurn stage: onboard turn-MPC on detected headland turns.
+    // dataflash/GCS event ids (MPCT.Ev)
+    enum class MpcTurnEvent : uint8_t {
+        DETECT = 0,     // planner scan found a turn
+        ARM    = 1,     // solver armed for the upcoming corner leg
+        READY  = 2,     // seed preconverged; waiting for the engage gate
+        ENGAGE = 3,     // replay started; SubMode::MPC_TURN flying
+        EXIT   = 4,     // turn done (t_rem < exit threshold or forced exit)
+        ABORT  = 5,     // teardown without a normal exit
+    };
+    void mpc_turn_update();                 // per-loop state machine (run())
+    void mpc_turn_run();                    // SubMode::MPC_TURN controller
+    void mpc_turn_check_arm(const AP_Mission::Mission_Command& cmd);  // do_nav_wp hook
+    void mpc_turn_finish(bool forced);      // normal/forced exit: resume mission at exit_wp_idx
+    void mpc_turn_abort(const char *reason);// hard abort (mission change, watchdog)
+    void mpc_turn_teardown();               // stop replay + disarm solver (idempotent)
+    void mpc_turn_log(MpcTurnEvent ev, const AP_MPCSolver::TurnRecord &rec, float t_rem, float xi);
+
+    AP_MPCTurnPlanner mpc_turn_planner;     // mission scanner (cached per mission change)
+    AP_MPCSolver::TurnRecord mpc_turn_rec {};   // armed turn (valid while mpc_turn_armed)
+    bool mpc_turn_armed;                    // solver armed for mpc_turn_rec
+    bool mpc_turn_ready_logged;             // READY event latched for this arm
+    uint16_t mpc_turn_inhibit_idx = 0xFFFF; // entry idx blocked from re-arming (post-abort)
+    uint32_t mpc_turn_engage_ms;            // engage time (no-plan watchdog)
+#endif
 
     // get the Location portion of a command.  If the command's lat and lon and/or alt are zero the default_loc's lat,lon and/or alt are returned instead
     // returns false if the location cannot be determined which only happens if the terrain data is unavailable
@@ -1134,16 +1172,6 @@ public:
     bool set_pos_vel_NED_m(const Vector3p& pos_ned_m, const Vector3f& vel_ned_ms, bool use_yaw = false, float yaw_rad = 0.0, bool use_yaw_rate = false, float yaw_rate_rads = 0.0, bool yaw_relative = false);
     bool set_pos_vel_accel_NED_m(const Vector3p& pos_ned_m, const Vector3f& vel_ned_ms, const Vector3f& accel_ned_mss, bool use_yaw = false, float yaw_rad = 0.0, bool use_yaw_rate = false, float yaw_rate_rads = 0.0, bool yaw_relative = false);
 
-    // ingest one chunk of an onboard-MPC trajectory (NE-only, local NED). Chunks
-    // sharing a traj_id assemble one trajectory; the chunk containing the final
-    // node commits it and (if not already there) enters SubMode::TrajStream.
-    // Returns true when the trajectory commits.
-    bool mpc_trajectory_chunk(uint16_t traj_id, uint16_t num_points, uint16_t start_index, uint8_t count, uint16_t dt_ms,
-                              const float* pos_n, const float* pos_e,
-                              const float* vel_n, const float* vel_e,
-                              const float* acc_n, const float* acc_e,
-                              uint32_t time_boot_ms = 0, float drag_k = 0.0f);
-
     // get position, velocity and acceleration targets
     const Vector3p& get_target_pos_NED_m() const;
     const Vector3f& get_target_vel_NED_ms() const;
@@ -1211,6 +1239,11 @@ protected:
 
 private:
 
+    // the copter-level MPC trajectory-replay helper drives the TrajStream
+    // submode (auto-start on a committing MPC_TRAJECTORY chunk via
+    // trajstream_control_start) — see ArduCopter/mpc_replay.h
+    friend class MPCTrajReplay;
+
     // enum for GUID_OPTIONS parameter
     enum class Option : uint32_t {
         AllowArmingFromTX   = (1U << 0),
@@ -1254,62 +1287,10 @@ private:
     // guided mode is paused or not
     bool _paused;
 
-    // Onboard-MPC trajectory replay buffer (used by SubMode::TrajStream).
-    // Chunks fill pending[]; the committing chunk copies pending->active and
-    // re-bases commit_ms, so trajstream_control_run() can sample by true elapsed
-    // time. A single main-loop thread touches this (MAVLink ingestion and mode
-    // run() are both on the main loop), so no locking is needed - the payload
-    // (active[]) is written before commit_ms/active_n are published.
-    struct TrajBuffer {
-        struct Sample {
-            float t_s;      // node time from trajectory start (s)
-            float pos_n;    // north position (m, local NED)
-            float pos_e;    // east position (m, local NED)
-            float vel_n;    // north velocity (m/s)
-            float vel_e;    // east velocity (m/s)
-            float acc_n;    // north acceleration (m/s/s)
-            float acc_e;    // east acceleration (m/s/s)
-        };
-        static const uint16_t TRAJ_MAX = 128;   // 61-node plan + headroom
-
-        Sample active[TRAJ_MAX];    // trajectory currently being replayed
-        Sample pending[TRAJ_MAX];   // trajectory being assembled from chunks
-        uint16_t active_n {0};      // number of valid nodes in active[]
-        uint16_t pending_n {0};     // number of valid nodes in pending[]
-        uint16_t pending_next {0};  // next expected node index (chunks must arrive in order, gap-free)
-        bool pending_valid {false}; // false once a gap/out-of-order chunk poisons the assembly
-        uint32_t commit_ms {0};     // replay time base: sender anchor time_boot_ms if given, else arrival millis()
-        uint16_t active_id {0};     // traj_id of active[]
-        uint16_t pending_id {0};    // traj_id of pending[]
-        uint16_t dt_ms {0};         // nominal node spacing (ms)
-        float drag_k {0};           // k/m (1/m) of the committed trajectory's airframe model (0 = no drag FF)
-        float pending_drag_k {0};   // drag_k of the trajectory being assembled
-
-        // begin assembling a new pending trajectory (dt must be non-zero, checked by the caller)
-        void begin(uint16_t id, uint16_t n, uint16_t dt, float drag_k_perm);
-        // store one node into pending[index]; returns false if index out of range
-        bool put(uint16_t index, float pos_n, float pos_e, float vel_n, float vel_e, float acc_n, float acc_e);
-        // publish pending[] as active[] and re-base the replay clock to base_ms
-        void commit(uint32_t base_ms);
-        // replay duration of the active trajectory in ms (0 if none)
-        uint32_t duration_ms() const;
-        // sample the active trajectory at elapsed_s (linear interpolation).
-        // Before start clamps to the first node; past the end holds the final
-        // position with zero velocity/acceleration (Tier-1 replay-until-new).
-        // Returns false if there is no active trajectory.
-        bool sample(float elapsed_s, float &posN, float &posE, float &velN, float &velE, float &accN, float &accE) const;
-    } _traj;
-
-    // altitude (NED down) captured at TrajStream entry; held while replaying (NE-only first cut)
-    postype_t _trajstream_entry_pos_d_m {0};
-
-    // Tier-2 station-keep: position captured once when the failsafe hold engages
-    // (re-pinning to the live estimate every loop would drift with the estimate)
-    bool _trajstream_hold_active {false};
-    Vector2p _trajstream_hold_pos_ne_m;
-
-    // rate limiter for GUIP dataflash logging of the replayed target
-    uint32_t _trajstream_last_log_ms {0};
+    // NOTE: the onboard-MPC trajectory replay buffer + Tier-1/Tier-2 state
+    // that used to live here moved to the copter-level MPCTrajReplay helper
+    // (ArduCopter/mpc_replay.{h,cpp}) so AUTO's MpcTurn stage can run the
+    // same replay; SubMode::TrajStream delegates to it (trajstream_control_*).
 };
 
 #if AP_SCRIPTING_ENABLED

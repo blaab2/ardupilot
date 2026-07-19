@@ -1185,6 +1185,12 @@ const AP_Param::GroupInfo ParametersG2::var_info2[] = {
     AP_GROUPINFO("SURFTRAK_GLSAM", 22, ParametersG2, surf_dist_parameters.glitch_num_samples, AP_SURFACEDISTANCE_GLITCH_NUM_SAMPLES_DEFAULT),
 #endif
 
+#if MODE_GUIDED_ENABLED && AP_MPCSOLVER_ENABLED
+    // @Group: MPC_
+    // @Path: ../libraries/AP_MPCSolver/AP_MPCSolver.cpp
+    AP_SUBGROUPPTR(mpc_solver_ptr, "MPC_", 23, ParametersG2, AP_MPCSolver),
+#endif
+
     // ID 62 is reserved for the AP_SUBGROUPEXTENSION
 
     AP_GROUPEND
@@ -1250,6 +1256,9 @@ ParametersG2::ParametersG2(void) :
     ,mode_land_ptr(&copter.mode_land)
 #if MODE_POSHOLD_ENABLED
     ,mode_poshold_ptr(&copter.mode_poshold)
+#endif
+#if MODE_GUIDED_ENABLED && AP_MPCSOLVER_ENABLED
+    ,mpc_solver_ptr(&copter.mpc_solver)
 #endif
 {
     AP_Param::setup_object_defaults(this, var_info);

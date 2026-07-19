@@ -25,7 +25,12 @@ def build(bld):
             'AP_Devo_Telem',
             'AC_AutoTune',
             'AP_KDECAN',
-            'AP_SurfaceDistance'
+            'AP_SurfaceDistance',
+            # onboard turn-MPC: AP_MPCSolver class + the vendored csolver C
+            # core, compiled through the per-file mpc_build_*.c wrapper TUs
+            # (f32 flight config; see AP_MPCSolver/mpc_cs_defs.h and
+            # scripts/mpc/csolver/sync_firmware.sh)
+            'AP_MPCSolver'
         ],
     )
 

@@ -32,6 +32,12 @@ bool ModeAuto::init(bool ignore_checks)
 
         _mode = SubMode::LOITER;
 
+#if AUTO_MPC_TURN_ENABLED
+        // clear any turn-MPC state left from a previous AUTO session
+        mpc_turn_teardown();
+        mpc_turn_inhibit_idx = 0xFFFF;
+#endif
+
         // stop ROI from carrying over from previous runs of the mission
         // To-Do: reset the yaw as part of auto_wp_start when the previous command was not a wp command to remove the need for this special ROI check
         if (auto_yaw.mode() == AutoYaw::Mode::ROI) {
@@ -70,6 +76,15 @@ bool ModeAuto::init(bool ignore_checks)
 // stop mission when we leave auto mode
 void ModeAuto::exit()
 {
+#if AUTO_MPC_TURN_ENABLED
+    // a mode change out of AUTO mid-turn must stop the replay and disarm
+    // the solver cleanly (the new mode owns the position controller)
+    if (_mode == SubMode::MPC_TURN || mpc_turn_armed) {
+        mpc_turn_log(MpcTurnEvent::ABORT, mpc_turn_rec, copter.mpc_solver.t_rem(), copter.mpc_solver.current_xi());
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn aborted (mode change)");
+    }
+    mpc_turn_teardown();
+#endif
     if (copter.mode_auto.mission.state() == AP_Mission::MISSION_RUNNING) {
         copter.mode_auto.mission.stop();
     }
@@ -99,6 +114,18 @@ void ModeAuto::run()
     } else {
         // check for mission changes
         if (mis_change_detector.check_for_mission_change()) {
+#if AUTO_MPC_TURN_ENABLED
+            // the detected-turn table and any armed/engaged turn are built
+            // from the old mission: abort back to waypoint navigation
+            if (_mode == SubMode::MPC_TURN) {
+                mpc_turn_abort("mission changed");
+            } else if (mpc_turn_armed) {
+                copter.mpc_solver.disarm();
+                mpc_turn_armed = false;
+                mpc_turn_log(MpcTurnEvent::ABORT, mpc_turn_rec, NAN, NAN);
+            }
+            mpc_turn_planner.invalidate();
+#endif
             // if mission is running restart the current command if it is a waypoint or spline command
             if ((mission.state() == AP_Mission::MISSION_RUNNING) && (_mode == SubMode::WP)) {
                 if (mission.restart_current_nav_cmd()) {
@@ -112,6 +139,12 @@ void ModeAuto::run()
 
         mission.update();
     }
+
+#if AUTO_MPC_TURN_ENABLED
+    // onboard turn-MPC state machine: snapshot service + engage gate while a
+    // turn is armed, exit decision while SubMode::MPC_TURN flies
+    mpc_turn_update();
+#endif
 
     // call the correct auto controller
     switch (_mode) {
@@ -161,6 +194,12 @@ void ModeAuto::run()
     case SubMode::NAV_ATTITUDE_TIME:
         nav_attitude_time_run();
         break;
+
+#if AUTO_MPC_TURN_ENABLED
+    case SubMode::MPC_TURN:
+        mpc_turn_run();
+        break;
+#endif
     }
 
     // only pretend to be in auto RTL so long as mission still thinks its in a landing sequence or the mission has completed
@@ -242,7 +281,10 @@ bool ModeAuto::move_vehicle_on_ekf_reset() const
     case SubMode::NAV_ATTITUDE_TIME:
         // these submodes reset their targets so the vehicle does not physically move
         return false;
-    case SubMode::WP:    
+    case SubMode::WP:
+#if AUTO_MPC_TURN_ENABLED
+    case SubMode::MPC_TURN:
+#endif
         // these submodes smoothly move to maintain an absolute position
         return true;
     }
@@ -1106,6 +1148,229 @@ void ModeAuto::wp_run()
     attitude_control->input_thrust_vector_heading(pos_control->get_thrust_vector(), auto_yaw.get_heading());
 }
 
+#if AUTO_MPC_TURN_ENABLED
+// ---------------------------------------------------------------------------
+// AUTO MpcTurn stage: the onboard turn MPC (AP_MPCSolver) flies detected
+// 180-deg boustrophedon headland turns through the shared MPCTrajReplay.
+// Lifecycle: do_nav_wp arms the solver when a leg targets a detected entry
+// corner; mpc_turn_update() engages at the seed's along-row gate; while
+// SubMode::MPC_TURN flies, the corner waypoint's verify_nav_wp keeps
+// returning false naturally (wp_nav is no longer updated, so its latched
+// reached_destination flag stays false and the mission does not advance);
+// the exit resumes the mission at the waypoint after the second corner.
+// ---------------------------------------------------------------------------
+
+// accepted-plan remaining time below which the turn hands back to waypoint
+// navigation (the validated harness exit threshold)
+static const float MPC_TURN_EXIT_T_REM_S = 0.8f;
+// engaged-with-no-accepted-plan watchdog
+static const uint32_t MPC_TURN_NO_PLAN_TIMEOUT_MS = 2000;
+
+// compact MPCT dataflash event record (+ nothing else: per-event GCS text is
+// sent by the specific call sites)
+void ModeAuto::mpc_turn_log(MpcTurnEvent ev, const AP_MPCSolver::TurnRecord &rec, float t_rem, float xi)
+{
+#if HAL_LOGGING_ENABLED
+    copter.Log_Write_MPC_Turn((uint8_t)ev, rec.entry_wp_idx, rec.exit_wp_idx,
+                              rec.d, rec.mirror, t_rem, xi);
+#endif
+}
+
+// stop the replay and disarm the solver (idempotent)
+void ModeAuto::mpc_turn_teardown()
+{
+    mpc_turn_armed = false;
+    if (!copter.mpc_solver.enabled()) {
+        return;
+    }
+    copter.mpc_replay.stop();
+    copter.mpc_solver.disarm();
+    // undo what the replay start() changed: the widened NE envelope goes
+    // back to the waypoint-nav defaults and the drag-FF lean map disengages
+    // (preserve_output shifts the velocity-PID I term so the commanded
+    // acceleration stays continuous through the handback)
+    pos_control->NE_set_max_speed_accel_m(wp_nav->get_default_speed_NE_ms(), wp_nav->get_wp_acceleration_mss());
+    pos_control->NE_set_correction_speed_accel_m(wp_nav->get_default_speed_NE_ms(), wp_nav->get_wp_acceleration_mss());
+    pos_control->set_drag_accel_ff_NE_mss(Vector2f{}, true);
+}
+
+// do_nav_wp hook: rescan a changed mission and arm the solver when this
+// leg's target waypoint is a detected turn-entry corner
+void ModeAuto::mpc_turn_check_arm(const AP_Mission::Mission_Command& cmd)
+{
+    if (!copter.mpc_solver.enabled()) {
+        return;
+    }
+
+    // lazily rescan the mission (a cheap timestamp compare when unchanged)
+    if (mpc_turn_planner.update(mission, copter.mpc_solver)) {
+        for (uint8_t i = 0; i < mpc_turn_planner.num_turns(); i++) {
+            const AP_MPCSolver::TurnRecord &det = mpc_turn_planner.turn(i);
+            mpc_turn_log(MpcTurnEvent::DETECT, det, NAN, NAN);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn wp %u->%u d=%.1f%s",
+                          unsigned(det.entry_wp_idx), unsigned(det.exit_wp_idx),
+                          (double)det.d, det.mirror ? " (mirror)" : "");
+        }
+    }
+
+    // starting any other leg clears the post-abort re-arm inhibit
+    if (cmd.index != mpc_turn_inhibit_idx) {
+        mpc_turn_inhibit_idx = 0xFFFF;
+    }
+
+    // an arm left over from a different leg is stale
+    if (mpc_turn_armed && mpc_turn_rec.entry_wp_idx != cmd.index) {
+        copter.mpc_solver.disarm();
+        mpc_turn_armed = false;
+        mpc_turn_log(MpcTurnEvent::ABORT, mpc_turn_rec, NAN, NAN);
+    }
+
+    const AP_MPCSolver::TurnRecord *rec = mpc_turn_planner.find_entry(cmd.index);
+    if (rec == nullptr || cmd.index == mpc_turn_inhibit_idx) {
+        return;
+    }
+    if (copter.mpc_solver.arm_turn(*rec)) {
+        mpc_turn_rec = *rec;
+        mpc_turn_armed = true;
+        mpc_turn_ready_logged = false;
+        mpc_turn_log(MpcTurnEvent::ARM, mpc_turn_rec, NAN, NAN);
+    }
+}
+
+// per-loop state machine, called from ModeAuto::run() before the submode
+// dispatch: engage gate while armed, exit decision while flying the turn
+void ModeAuto::mpc_turn_update()
+{
+    if (!copter.mpc_solver.enabled()) {
+        return;
+    }
+
+    if (_mode == SubMode::MPC_TURN) {
+        // TSTALL latch: the solver demands the handback NOW
+        if (copter.mpc_solver.exit_forced()) {
+            mpc_turn_finish(true);
+            return;
+        }
+        const float t_rem = copter.mpc_solver.t_rem();
+        if (!isnan(t_rem)) {
+            if (t_rem < MPC_TURN_EXIT_T_REM_S) {
+                mpc_turn_finish(false);
+            }
+        } else if (millis() - mpc_turn_engage_ms > MPC_TURN_NO_PLAN_TIMEOUT_MS) {
+            // engaged but no plan ever accepted: hand back to the corner leg
+            mpc_turn_abort("no plan");
+        }
+        return;
+    }
+
+    if (!mpc_turn_armed) {
+        return;
+    }
+
+    // publish the state snapshot the solver preconverges/solves from
+    // (MPCTrajReplay::run() takes over this service once engaged)
+    copter.mpc_solver.update();
+
+    if (_mode != SubMode::WP) {
+        return;
+    }
+    if (!copter.mpc_solver.ready()) {
+        return;
+    }
+    if (!mpc_turn_ready_logged) {
+        mpc_turn_ready_logged = true;
+        mpc_turn_log(MpcTurnEvent::READY, mpc_turn_rec, NAN, copter.mpc_solver.current_xi());
+    }
+
+    // engage gate: along-row position past the seed's entry point, while
+    // actually flying the leg (not paused, not on the ground)
+    const float xi = copter.mpc_solver.current_xi();
+    if (isnan(xi) || xi < copter.mpc_solver.engage_xi()) {
+        return;
+    }
+    if (is_disarmed_or_landed() || wp_nav->paused()) {
+        return;
+    }
+
+    // engage (contract order): replay controller first, then the 10 Hz
+    // receding-horizon cycles, then the submode switch
+    copter.mpc_replay.start();
+    copter.mpc_solver.engage();
+    mpc_turn_engage_ms = millis();
+    set_submode(SubMode::MPC_TURN);
+    mpc_turn_log(MpcTurnEvent::ENGAGE, mpc_turn_rec, NAN, xi);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn engaged (xi %.1f)", (double)xi);
+}
+
+// SubMode::MPC_TURN controller - called by auto_run at 100hz or more
+void ModeAuto::mpc_turn_run()
+{
+    // ground/disarm handling first (the ModeGuided trajstream wrapper
+    // pattern); a mid-turn disarm or landing is a hard stop of the turn
+    if (is_disarmed_or_landed()) {
+        mpc_turn_teardown();
+        make_safe_ground_handling(copter.is_tradheli() && motors->get_interlock());
+        return;
+    }
+
+    // the shared replay controller does everything else per loop (solver
+    // snapshot service, plan commit, sampling, drag-FF lean map, staleness
+    // fallback tiers, GUIP logging, attitude output)
+    copter.mpc_replay.run();
+}
+
+// normal (t_rem below threshold) or forced (TSTALL) turn exit: stop the
+// replay, disarm the solver and resume the mission at the waypoint AFTER
+// the second corner
+void ModeAuto::mpc_turn_finish(bool forced)
+{
+    const uint16_t exit_idx = mpc_turn_rec.exit_wp_idx;
+    const float t_rem = copter.mpc_solver.t_rem();      // read before disarm
+    const float xi = copter.mpc_solver.current_xi();
+    mpc_turn_teardown();
+    mpc_turn_log(MpcTurnEvent::EXIT, mpc_turn_rec, t_rem, xi);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn exit%s -> wp %u",
+                  forced ? " (forced)" : "", unsigned(exit_idx));
+
+    // while RUNNING, set_current_cmd delegates advance_current_nav_cmd ->
+    // start_command -> do_nav_wp -> a clean wp_start from the current
+    // position (and may immediately re-arm a back-to-back next turn)
+    if (!mission.set_current_cmd(exit_idx)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "MPC: resume at wp %u failed", unsigned(exit_idx));
+        if (!loiter_start()) {
+            set_mode(Mode::Number::LAND, ModeReason::MISSION_END);
+        }
+    }
+}
+
+// hard abort (mission changed under the turn, no-plan watchdog): teardown
+// and hand control back to waypoint navigation on the current leg
+void ModeAuto::mpc_turn_abort(const char *reason)
+{
+    const bool was_engaged = (_mode == SubMode::MPC_TURN);
+    const uint16_t entry_idx = mpc_turn_rec.entry_wp_idx;
+    const float t_rem = copter.mpc_solver.t_rem();      // read before disarm
+    const float xi = copter.mpc_solver.current_xi();
+    mpc_turn_teardown();
+    mpc_turn_log(MpcTurnEvent::ABORT, mpc_turn_rec, t_rem, xi);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "MPC: turn abort (%s)", reason);
+
+    if (!was_engaged) {
+        return;
+    }
+    // do not immediately re-arm the same corner after an abort
+    mpc_turn_inhibit_idx = entry_idx;
+    // the corner waypoint is still the mission's current nav command:
+    // restarting it runs a clean wp_start (and sets SubMode::WP)
+    if (mission.state() == AP_Mission::MISSION_RUNNING && mission.restart_current_nav_cmd()) {
+        return;
+    }
+    if (!loiter_start()) {
+        set_mode(Mode::Number::LAND, ModeReason::MISSION_END);
+    }
+}
+#endif  // AUTO_MPC_TURN_ENABLED
+
 // auto_land_run - lands in auto mode
 //      called by auto_run at 100hz or more
 void ModeAuto::land_run()
@@ -1590,6 +1855,12 @@ void ModeAuto::do_nav_wp(const AP_Mission::Mission_Command& cmd)
         copter.failsafe_terrain_on_event();
         return;
     }
+
+#if AUTO_MPC_TURN_ENABLED
+    // arm the onboard turn MPC when this leg's target is a detected
+    // headland-turn entry corner (also lazily rescans a changed mission)
+    mpc_turn_check_arm(cmd);
+#endif
 }
 
 // checks the next mission command and adds it as a destination if necessary

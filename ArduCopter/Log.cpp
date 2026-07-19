@@ -356,6 +356,19 @@ struct PACKED log_Rate_Thread_Dt {
     float dtMin;
 };
 
+// AUTO MpcTurn event (turn detection / solver lifecycle)
+struct PACKED log_MPC_Turn {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t event;          // ModeAuto::MpcTurnEvent
+    uint16_t entry_idx;     // mission index of the entry corner waypoint
+    uint16_t exit_idx;      // mission index resumed after the turn
+    float d;                // detected row spacing [m]
+    uint8_t mirror;         // 1 = mirrored (right-handed) turn
+    float t_rem;            // accepted-plan remaining time [s] (NaN if n/a)
+    float xi;               // canonical along-row position [m] (NaN if n/a)
+};
+
 // Write a Guided mode position target
 // pos_target_ned_m is lat, lon, alt OR offset from ekf origin in m
 // terrain should be 0 if pos_target_ned_m.z is alt-above-ekf-origin, 1 if alt-above-terrain
@@ -399,6 +412,23 @@ void Copter::Log_Write_Guided_Attitude_Target(ModeGuided::SubMode submode, float
         yaw_rate_degs   : degrees(ang_vel_rads.z),  // rad/s to deg/s
         thrust          : thrust,
         climb_rate_ms   : climb_rate_ms
+    };
+    logger.WriteBlock(&pkt, sizeof(pkt));
+}
+
+// Write an AUTO MpcTurn event (DETECT/ARM/READY/ENGAGE/EXIT/ABORT)
+void Copter::Log_Write_MPC_Turn(uint8_t event, uint16_t entry_idx, uint16_t exit_idx, float d, bool mirror, float t_rem, float xi)
+{
+    const log_MPC_Turn pkt {
+        LOG_PACKET_HEADER_INIT(LOG_MPC_TURN_MSG),
+        time_us         : AP_HAL::micros64(),
+        event           : event,
+        entry_idx       : entry_idx,
+        exit_idx        : exit_idx,
+        d               : d,
+        mirror          : (uint8_t)(mirror ? 1 : 0),
+        t_rem           : t_rem,
+        xi              : xi
     };
     logger.WriteBlock(&pkt, sizeof(pkt));
 }
@@ -571,6 +601,20 @@ const struct LogStructure Copter::log_structure[] = {
 
     { LOG_RATE_THREAD_DT_MSG, sizeof(log_Rate_Thread_Dt),
       "RTDT", "Qffff", "TimeUS,dt,dtAvg,dtMax,dtMin", "sssss", "F----" , true },
+
+// @LoggerMessage: MPCT
+// @Description: AUTO MpcTurn onboard turn-MPC event
+// @Field: TimeUS: Time since system startup
+// @Field: Ev: Event (0:DETECT 1:ARM 2:READY 3:ENGAGE 4:EXIT 5:ABORT)
+// @Field: EIdx: Mission index of the turn entry corner waypoint
+// @Field: XIdx: Mission index resumed after the turn
+// @Field: D: Detected row spacing
+// @Field: Mir: 1 if the turn is mirrored (opposite handedness)
+// @Field: TRem: Accepted-plan remaining time
+// @Field: Xi: Along-row position in the canonical turn frame
+
+    { LOG_MPC_TURN_MSG, sizeof(log_MPC_Turn),
+      "MPCT", "QBHHfBff", "TimeUS,Ev,EIdx,XIdx,D,Mir,TRem,Xi", "s---m-sm", "F---0-00" , true },
 
 };
 

@@ -15,6 +15,8 @@ class ModeRTL;
 #if WEATHERVANE_ENABLED
  #include <AC_AttitudeControl/AC_WeatherVane.h>
 #endif
+// defines AP_MPCSOLVER_ENABLED (the MPC_ subgroup pointer below)
+#include <AP_MPCSolver/AP_MPCSolver.h>
 
 // Global parameter class.
 //
@@ -734,6 +736,11 @@ public:
 
 #if MODE_POSHOLD_ENABLED
     void *mode_poshold_ptr;
+#endif
+
+#if MODE_GUIDED_ENABLED && AP_MPCSOLVER_ENABLED
+    // we need a pointer to the onboard turn MPC for the G2 table (MPC_)
+    void *mpc_solver_ptr;
 #endif
 
 };

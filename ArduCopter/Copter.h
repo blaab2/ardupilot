@@ -172,10 +172,13 @@
 #include "UserParameters.h"
 #endif
 #include "mode.h"
+#include "mpc_replay.h"
+#include <AP_MPCSolver/AP_MPCSolver.h>
 
 class Copter : public AP_Vehicle {
 public:
     friend class GCS_MAVLINK_Copter;
+    friend class MPCTrajReplay;
     friend class GCS_Copter;
     friend class AP_Rally_Copter;
     friend class Parameters;
@@ -917,6 +920,7 @@ private:
     void Log_Write_SysID_Data(float waveform_time, float waveform_sample, float waveform_freq_hz, float angle_x_degs, float angle_y_degs, float angle_z_degs, float accel_x_mss, float accel_y_mss, float accel_z_mss);
     void Log_Write_Vehicle_Startup_Messages();
     void Log_Write_Rate_Thread_Dt(float dt, float dtAvg, float dtMax, float dtMin);
+    void Log_Write_MPC_Turn(uint8_t event, uint16_t entry_idx, uint16_t exit_idx, float d, bool mirror, float t_rem, float xi);
 #endif  // HAL_LOGGING_ENABLED
 
     // mode.cpp
@@ -1058,6 +1062,15 @@ private:
 #if AP_SCRIPTING_ENABLED
     // Custom modes registered at runtime
     ModeGuidedCustom *mode_guided_custom[5];
+#endif
+    // onboard-MPC trajectory replay helper (Step-E TrajStream controller,
+    // shared by GUIDED SubMode::TrajStream and AUTO's MpcTurn stage)
+    MPCTrajReplay mpc_replay;
+#if AP_MPCSOLVER_ENABLED
+    // onboard time-optimal turn MPC (csolver core on a dedicated thread).
+    // Parameter wiring (MPC_ subgroup in ParametersG2) + boot init() call
+    // are added with the AUTO MpcTurn stage.
+    AP_MPCSolver mpc_solver;
 #endif
 #endif
     ModeLand mode_land;

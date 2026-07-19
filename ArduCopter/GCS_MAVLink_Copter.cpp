@@ -1108,9 +1108,10 @@ void GCS_MAVLINK_Copter::handle_message_mpc_trajectory(const mavlink_message_t &
         return;
     }
 
-    // hand the chunk to guided mode; on the committing chunk it (re-)bases the
-    // replay buffer and auto-starts SubMode::TrajStream if not already there
-    copter.mode_guided.mpc_trajectory_chunk(
+    // hand the chunk to the copter-level replay helper; on the committing
+    // chunk it (re-)bases the replay buffer and auto-starts GUIDED
+    // SubMode::TrajStream if not already there
+    copter.mpc_replay.handle_chunk(
         packet.traj_id, packet.num_points, packet.start_index, packet.count, packet.dt_ms,
         packet.pos_n, packet.pos_e, packet.vel_n, packet.vel_e, packet.acc_n, packet.acc_e,
         packet.time_boot_ms, packet.drag_k);

@@ -1,0 +1,16 @@
+DAQP kernel subset, vendored per CUSTOM-SOLVER-PLAN.md section 4.5.
+
+Upstream: https://github.com/darnstrom/daqp
+Pinned commit: b84fe8716325db90b4ef3ee3969f92cf045a4931 (the acados/external/daqp checkout)
+
+Files (byte-identical to upstream; verify: diff -r against the pin):
+  include/{types,constants,daqp,auxiliary,factorization,utils}.h -> ./
+  src/{daqp,auxiliary,factorization,utils}.c -> ./
+  LICENSE (MIT)
+
+Subset rationale: only the LDP active-set kernel + QP->LDP transform.
+NOT vendored: api.c (malloc-based setup — csolver carves the workspace
+from its arena instead), daqp_prox.c (eps_prox=0 always), bnb.c (no
+binaries), codegen/, interfaces/. Build defines: no SOFT_WEIGHTS (elastic
+columns are explicit in the condensed QP), no PROFILING; f64 build uses
+the default c_float=double, f32 (M2) will define DAQP_SINGLE_PRECISION.

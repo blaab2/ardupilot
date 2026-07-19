@@ -155,6 +155,12 @@ void Copter::init_ardupilot()
 #endif
 #endif
 
+#if MODE_GUIDED_ENABLED && AP_MPCSOLVER_ENABLED
+    // initialise the onboard turn MPC (solver arena + thread); parameters
+    // are already loaded here and init() is a no-op unless MPC_ENABLE=1
+    mpc_solver.init();
+#endif
+
 #if MODE_SMARTRTL_ENABLED
     // initialize SmartRTL
     g2.smart_rtl.init();
