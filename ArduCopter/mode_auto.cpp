@@ -1162,7 +1162,13 @@ void ModeAuto::wp_run()
 
 // accepted-plan remaining time below which the turn hands back to waypoint
 // navigation (the validated harness exit threshold)
-static const float MPC_TURN_EXIT_T_REM_S = 0.8f;
+// Hand over at the plan's cruise-on-row terminal, not 0.8 s (~6 m) early
+// while still curving: the plan terminal is eta = d exactly, heading
+// straight down-row at cruise, so the resumed WPNav leg has ~zero
+// cross-track to correct -> no dip below the row into the inter-row area,
+// and the vehicle is settled on the straight. 0.12 s is reachable since
+// the CS_PD_T_MIN 0.2 fix lets T_rem drain that far (was 1.0 -> stalled).
+static const float MPC_TURN_EXIT_T_REM_S = 0.12f;
 // engaged-with-no-accepted-plan watchdog
 static const uint32_t MPC_TURN_NO_PLAN_TIMEOUT_MS = 2000;
 
@@ -1253,7 +1259,14 @@ void ModeAuto::mpc_turn_update()
         }
         const float t_rem = copter.mpc_solver.t_rem();
         if (!isnan(t_rem)) {
-            if (t_rem < MPC_TURN_EXIT_T_REM_S) {
+            // Hand over when SETTLED on the return row (on the line, ~zero
+            // cross-row rate) so the resumed WPNav has no cross-track motion
+            // to project into the inter-row area — with a late t_rem backstop
+            // for the case the settle window is missed. A pure time threshold
+            // catches the settling oscillation at a random phase (measured:
+            // eta 13.5 overshoot -> 12.5 undershoot -> field dip up to 1.3 m).
+            if (copter.mpc_solver.settled_on_row(0.15f, 0.4f) ||
+                t_rem < MPC_TURN_EXIT_T_REM_S) {
                 mpc_turn_finish(false);
             }
         } else if (millis() - mpc_turn_engage_ms > MPC_TURN_NO_PLAN_TIMEOUT_MS) {
@@ -1332,14 +1345,34 @@ void ModeAuto::mpc_turn_finish(bool forced)
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn exit%s -> wp %u",
                   forced ? " (forced)" : "", unsigned(exit_idx));
 
+    // Resume: the cold wp_start inside set_current_cmd re-inits WPNav from
+    // its own PROJECTED stopping point (ahead of the vehicle) — with the
+    // handover now at the cruise-on-row terminal (change 1) the cross-track
+    // is ~0, so the leg to the far waypoint is a mild along-track catch-up,
+    // not the old brake+field-dip. (A prime with origin = current position
+    // was tried and REGRESSED: it puts the S-curve origin BEHIND the moving
+    // vehicle -> near-stop. Any velocity-preserving resume must seed the
+    // origin ahead / carry the leg profile, not reset behind.)
+
+    // capture the handover speed BEFORE set_current_cmd's wp_start resets
+    // the controller to a stopping point
+    const float handover_speed_ms = pos_control->get_vel_estimate_NED_ms().xy().length();
+
     // while RUNNING, set_current_cmd delegates advance_current_nav_cmd ->
-    // start_command -> do_nav_wp -> a clean wp_start from the current
-    // position (and may immediately re-arm a back-to-back next turn)
+    // start_command -> do_nav_wp -> a clean wp_start (builds the leg to the
+    // exit WP; may immediately re-arm a back-to-back next turn)
     if (!mission.set_current_cmd(exit_idx)) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "MPC: resume at wp %u failed", unsigned(exit_idx));
         if (!loiter_start()) {
             set_mode(Mode::Number::LAND, ModeReason::MISSION_END);
         }
+    } else if (_mode == SubMode::WP) {
+        // Velocity-preserving handover: seed the just-built S-curve leg to
+        // start at the handover speed instead of from rest, so the resumed
+        // WPNav continues down-row rather than braking to ~2.7 m/s (the brake
+        // also dragged eta into the inter-row area). Only when we actually
+        // resumed a WP leg (a back-to-back re-arm switches to MPC_TURN).
+        wp_nav->set_this_leg_origin_speed_ms(handover_speed_ms);
     }
 }
 

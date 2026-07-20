@@ -264,6 +264,35 @@ float AP_MPCSolver::current_xi() const
     return xi;
 }
 
+bool AP_MPCSolver::settled_on_row(float d_tol, float rate_tol) const
+{
+    if (_state != State::ENGAGED) {
+        return false;
+    }
+    Snapshot snap;
+    if (!read_snapshot(snap)) {
+        return false;
+    }
+    // canonical cross-row position eta and rate eta_dot (world_to_canonical
+    // math, extended to return the cross-row velocity component)
+    const float dx = snap.pos_n - _rec.origin_ne.x;
+    const float dy = snap.pos_e - _rec.origin_ne.y;
+    float eta = -_rec.sin_h * dx + _rec.cos_h * dy;
+    float eta_dot = -_rec.sin_h * snap.vel_n + _rec.cos_h * snap.vel_e;
+    if (_rec.mirror) {
+        eta = -eta;
+        eta_dot = -eta_dot;
+    }
+    // fire at/above the row (headland side = the turn-around zone, safe),
+    // NOT below it (the crop): the plan overshoots to the headland then
+    // settles THROUGH the row toward the terminal, so the only clean
+    // handover is the overshoot apex (eta >= d, cross-rate ~0). d_tol is the
+    // small BELOW-row slack; above-row is bounded loosely so a normal
+    // overshoot (~0.7 m) qualifies but a still-climbing crossing does not.
+    return eta > _rec.d - d_tol && eta < _rec.d + 1.0f &&
+           fabsf(eta_dot) < rate_tol;
+}
+
 // ------------------------------------------------------ main-loop plumbing
 void AP_MPCSolver::update()
 {

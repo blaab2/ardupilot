@@ -101,6 +101,12 @@ public:
     // Derived from the WP_SPD parameter.
     float get_default_speed_NE_ms() const { return _wp_speed_ms; }
 
+    // Seed the CURRENT active leg to start already in motion at speed_ms
+    // (instead of the S-curve's default from-rest ramp). Used to hand a
+    // waypoint leg over from an external controller at speed without the
+    // stopping-point brake. Call right after set_wp_destination_*.
+    void set_this_leg_origin_speed_ms(float speed_ms) { _scurve_this_leg.set_origin_speed_max(speed_ms); }
+
     // Returns the default climb speed in cm/s used during waypoint navigation.
     // See get_default_speed_up_ms() for full details.
     float get_default_speed_up_cms() const { return get_default_speed_up_ms() * 100.0; }

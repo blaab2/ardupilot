@@ -114,6 +114,13 @@ public:
     // current_xi() >= engage_xi()
     float current_xi() const;
 
+    // true when the vehicle is settled on the RETURN row: canonical eta
+    // within d_tol of the row (d) AND the cross-row rate |eta_dot| below
+    // rate_tol. The turn-exit gate uses this so handover happens on the
+    // straight with ~zero cross-track motion - otherwise the resumed WPNav
+    // projects the settling-oscillation velocity into the inter-row area.
+    bool settled_on_row(float d_tol, float rate_tol) const;
+
     // ---- main-loop plumbing ----
     // publish the AHRS world-NED pos/vel snapshot for the solver thread.
     // Call at >= 50 Hz while non-IDLE (MPCTrajReplay::run() calls it; before
