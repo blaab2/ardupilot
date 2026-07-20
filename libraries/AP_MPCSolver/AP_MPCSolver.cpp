@@ -363,6 +363,7 @@ void AP_MPCSolver::thread_main()
             thread_preconverge();
             break;
         case State::READY:
+            thread_track();
             break;
         case State::ENGAGED:
             if (last_state != State::ENGAGED) {
@@ -409,6 +410,8 @@ void AP_MPCSolver::thread_rearm()
     }
     int rc = cs_rh_init(rh, _solver, cs_seed_X[sel], cs_seed_T[sel],
                         PLAN_N, MPC_K_ITERS);
+    memcpy(_track_xN, &cs_seed_X[sel][PLAN_N * 6], sizeof(_track_xN));
+    _last_track_ms = 0;
     if (rc == CS_OK) {
         rc = cs_rh_set_frame_d(rh, d);
     }
@@ -499,24 +502,18 @@ void AP_MPCSolver::stage_plan(const float *X, float T, const Snapshot &snap)
     _staged_seq++;
 }
 
-void AP_MPCSolver::thread_cycle()
+// x_meas the harness way (plan-carried a/theta + psi branch at the nearest
+// node of the current iterate; a MEASURED accel IC was tested and REGRESSED
+// the closed loop — sitl_closed_loop.py TURN branch). Shared by the ENGAGED
+// cycle and the READY tracking preconvergence.
+bool AP_MPCSolver::build_x_meas(const Snapshot &snap, float x_meas[6],
+                                float &xi_out)
 {
-    Snapshot snap;
-    if (!read_snapshot(snap)) {
-        return;
-    }
-    cs_rh *rh = (cs_rh *)_rh;
-
-    // ---- world -> canonical measured state ----
     float v_raw, psi_raw, xi, eta;
     world_to_canonical(snap, v_raw, psi_raw, xi, eta);
-
-    // ---- x_meas the harness way (plan-carried a/theta + psi branch at the
-    // nearest node of the current iterate; a MEASURED accel IC was tested
-    // and REGRESSED the closed loop — sitl_closed_loop.py TURN branch) ----
     float T_cur = 0;
     if (cs_solver_get_iterate(_solver, _X, _U, &T_cur) != CS_OK) {
-        return;
+        return false;
     }
     uint16_t k0 = 0;
     float best_d2 = FLT_MAX;
@@ -534,14 +531,67 @@ void AP_MPCSolver::thread_cycle()
                                         MPC_A_TRIM - MPC_ENV_TOL, MPC_A_CAP);
     const float chi = constrain_float(_X[k0 * 6 + 5] - psi_m,
                                       -0.2f + 1.0e-3f, M_PI - 1.0e-3f);
-    const float x_meas[6] {
-        constrain_float(v_raw, MPC_V_MIN + 1.0e-3f, MPC_V_INF - 5.0e-3f),
-        psi_m,
-        xi,
-        MAX(eta, -5.0f),
-        a_pin,
-        psi_m + chi,
-    };
+    x_meas[0] = constrain_float(v_raw, MPC_V_MIN + 1.0e-3f,
+                                MPC_V_INF - 5.0e-3f);
+    x_meas[1] = psi_m;
+    x_meas[2] = xi;
+    x_meas[3] = MAX(eta, -5.0f);
+    x_meas[4] = a_pin;
+    x_meas[5] = psi_m + chi;
+    xi_out = xi;
+    return true;
+}
+
+// READY-state tracking preconvergence (the turn-2 fix): the ARMED
+// preconvergence converged the SEED's nominal entry, but the vehicle can
+// arrive laterally offset (measured: turn 2 engages at eta ~ -0.15 after
+// turn 1's handback leaves row 2 a shallow diagonal) and the engaged
+// solver then pays a ~1 s slack-reject burst plus tau0/restretch re-adds
+// re-converging. Anchor the iterate at the LIVE state (solve-only, no
+// plan publishing, no cs_rh bookkeeping) in the final approach so engage
+// starts from a converged-to-reality warm start whatever the offset.
+void AP_MPCSolver::thread_track()
+{
+    const uint32_t now = AP_HAL::millis();
+    if (now - _last_track_ms < 150) {
+        return;
+    }
+    Snapshot snap;
+    if (!read_snapshot(snap)) {
+        return;
+    }
+    float x_meas[6], xi = 0;
+    if (!build_x_meas(snap, x_meas, xi)) {
+        return;
+    }
+    // only inside the final-approach zone: far from the gate the min-time
+    // problem from the live state has a much longer horizon and would
+    // reshape the warm start away from the turn solution
+    if (xi < _engage_xi - 12.0f || xi >= _engage_xi) {
+        return;
+    }
+    _last_track_ms = now;
+    if (cs_solver_set_pins(_solver, x_meas, _track_xN) != CS_OK) {
+        return;
+    }
+    for (uint8_t i = 0; i < 2; i++) {
+        if (cs_solver_iterate(_solver) != CS_OK) {
+            break;
+        }
+    }
+}
+
+void AP_MPCSolver::thread_cycle()
+{
+    Snapshot snap;
+    if (!read_snapshot(snap)) {
+        return;
+    }
+    cs_rh *rh = (cs_rh *)_rh;
+    float x_meas[6], xi_unused = 0;
+    if (!build_x_meas(snap, x_meas, xi_unused)) {
+        return;
+    }
 
     // ---- one full rh cycle: spiral detection, restretch, leg-gated
     // corridor relaxations, pin, iterate, validate, accept/fallback and

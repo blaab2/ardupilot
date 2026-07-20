@@ -146,7 +146,9 @@ private:
     void thread_main();
     void thread_rearm();        // ARMED entry work (seed load) on the thread
     void thread_preconverge();  // ARMED -> READY
+    void thread_track();        // READY: live-state tracking preconvergence
     void thread_cycle();        // one ENGAGED 10 Hz rh cycle
+    bool build_x_meas(const Snapshot &snap, float x_meas[6], float &xi_out);
     bool read_snapshot(Snapshot &out) const;
     void stage_plan(const float *X, float T, const Snapshot &snap);
 
@@ -201,6 +203,8 @@ private:
     bool _first_cycle;          // engage bootstrap: stage the first plan
                                 // regardless of accept (harness `sent_traj`)
     uint8_t _pre_iters;         // preconverge bookkeeping
+    float _track_xN[6];         // seed terminal pin for READY tracking
+    uint32_t _last_track_ms;    // READY tracking cadence
     float _pre_step;
 };
 
