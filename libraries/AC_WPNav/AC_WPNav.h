@@ -107,6 +107,20 @@ public:
     // stopping-point brake. Call right after set_wp_destination_*.
     void set_this_leg_origin_speed_ms(float speed_ms) { _scurve_this_leg.set_origin_speed_max(speed_ms); }
 
+    // Velocity-preserving mid-leg handoff: build a straight leg with an EXPLICIT
+    // origin and seed the S-curve to START at `speed_ms` (set_origin_speed_max).
+    // Pass origin = the vehicle's PROJECTION onto the leg line at its current
+    // along-track position: the S-curve target then starts co-located with the
+    // vehicle AND at its actual speed, so there is no ahead position error to
+    // chase (the over-speed sprint) and no velocity step, while still flying the
+    // true leg line. Unlike set_wp_destination_NED_m this does NOT re-init from
+    // the projected stopping point. Used to hand a headland turn back to WPNav.
+    // CONTRACT: must be called immediately after a wp_and_spline_init_m / wp_start
+    // (which resets _track_dt_scalar, offsets, _wp_desired_speed_ne_ms etc. that
+    // advance_wp_target_along_track relies on); it does not re-init those itself.
+    bool set_wp_leg_advanced_NED_m(const Vector3p& origin_ned_m, const Vector3p& destination_ned_m,
+                                   float speed_ms, bool is_terrain_alt = false);
+
     // Returns the default climb speed in cm/s used during waypoint navigation.
     // See get_default_speed_up_ms() for full details.
     float get_default_speed_up_cms() const { return get_default_speed_up_ms() * 100.0; }

@@ -449,6 +449,44 @@ bool AC_WPNav::set_wp_destination_NED_m(const Vector3p& destination_ned_m, bool 
     return true;
 }
 
+// Velocity-preserving mid-leg handoff (see header). Builds an explicit
+// origin->destination straight leg and seeds the S-curve to start at speed_ms.
+// The caller passes origin = the vehicle's on-leg projection at its current
+// along-track position, so the target (which starts at the origin) is co-located
+// with the vehicle at its actual speed. Deliberately does NOT call
+// wp_and_spline_init_m: that would re-project the origin to the stopping point
+// ahead of the vehicle and zero the desired velocity, which is exactly the
+// ahead-target chase that oversped the resume.
+bool AC_WPNav::set_wp_leg_advanced_NED_m(const Vector3p& origin_ned_m, const Vector3p& destination_ned_m,
+                                         float speed_ms, bool is_terrain_alt)
+{
+    _scurve_prev_leg.init();
+    _scurve_next_leg.init();
+
+    _origin_ned_m = origin_ned_m;
+    _destination_ned_m = destination_ned_m;
+    _is_terrain_alt = is_terrain_alt;
+    _this_leg_is_spline = false;
+
+    _scurve_this_leg.calculate_track(_origin_ned_m, _destination_ned_m, 0.0f,
+                                     _pos_control.NE_get_max_speed_ms(), _pos_control.get_max_speed_up_ms(), _pos_control.get_max_speed_down_ms(),
+                                     get_wp_acceleration_mss(), get_accel_D_mss(), get_corner_acceleration_mss(),
+                                     _scurve_snap_max_mssss, _scurve_jerk_max_msss);
+
+    // start already in motion at the handover speed (target begins at the origin
+    // = the vehicle's along-track position, so no from-rest brake and no gap)
+    if (is_positive(speed_ms)) {
+        _scurve_this_leg.set_origin_speed_max(speed_ms);
+    }
+
+    _next_destination_ned_m.zero();
+    _flags.fast_waypoint = false;
+    _flags.reached_destination = false;
+    _wp_last_update_ms = AP_HAL::millis();  // mark active so update_wpnav runs
+
+    return true;
+}
+
 // Sets the next waypoint destination using a NED position vector in meters.
 // Only updates if terrain frame matches current leg.
 // Calculates trajectory preview for smoother transition into next segment.

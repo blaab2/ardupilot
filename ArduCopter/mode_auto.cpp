@@ -1338,6 +1338,11 @@ void ModeAuto::mpc_turn_run()
 void ModeAuto::mpc_turn_finish(bool forced)
 {
     const uint16_t exit_idx = mpc_turn_rec.exit_wp_idx;
+    // Snapshot THIS turn's frame before set_current_cmd: that call re-arms a
+    // back-to-back next turn (whose entry corner == this turn's exit WP) and
+    // OVERWRITES mpc_turn_rec, so the row-line reconstruction below must use the
+    // copy, not the re-armed record. (mpc_turn_teardown does not clear it.)
+    const AP_MPCSolver::TurnRecord rec = mpc_turn_rec;
     const float t_rem = copter.mpc_solver.t_rem();      // read before disarm
     const float xi = copter.mpc_solver.current_xi();
     mpc_turn_teardown();
@@ -1345,34 +1350,44 @@ void ModeAuto::mpc_turn_finish(bool forced)
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: turn exit%s -> wp %u",
                   forced ? " (forced)" : "", unsigned(exit_idx));
 
-    // Resume: the cold wp_start inside set_current_cmd re-inits WPNav from
-    // its own PROJECTED stopping point (ahead of the vehicle) — with the
-    // handover now at the cruise-on-row terminal (change 1) the cross-track
-    // is ~0, so the leg to the far waypoint is a mild along-track catch-up,
-    // not the old brake+field-dip. (A prime with origin = current position
-    // was tried and REGRESSED: it puts the S-curve origin BEHIND the moving
-    // vehicle -> near-stop. Any velocity-preserving resume must seed the
-    // origin ahead / carry the leg profile, not reset behind.)
-
-    // capture the handover speed BEFORE set_current_cmd's wp_start resets
-    // the controller to a stopping point
+    // capture the handover speed + position at the exit instant, BEFORE
+    // set_current_cmd's wp_start resets the controller desired state
     const float handover_speed_ms = pos_control->get_vel_estimate_NED_ms().xy().length();
+    const Vector3p pos_ned = pos_control->get_pos_estimate_NED_m();
 
     // while RUNNING, set_current_cmd delegates advance_current_nav_cmd ->
-    // start_command -> do_nav_wp -> a clean wp_start (builds the leg to the
-    // exit WP; may immediately re-arm a back-to-back next turn)
+    // start_command -> do_nav_wp -> a clean wp_start (builds the leg to the exit
+    // WP; may immediately re-arm a back-to-back next turn -> hence the snapshot)
     if (!mission.set_current_cmd(exit_idx)) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "MPC: resume at wp %u failed", unsigned(exit_idx));
         if (!loiter_start()) {
             set_mode(Mode::Number::LAND, ModeReason::MISSION_END);
         }
     } else if (_mode == SubMode::WP) {
-        // Velocity-preserving handover: seed the just-built S-curve leg to
-        // start at the handover speed instead of from rest, so the resumed
-        // WPNav continues down-row rather than braking to ~2.7 m/s (the brake
-        // also dragged eta into the inter-row area). Only when we actually
-        // resumed a WP leg (a back-to-back re-arm switches to MPC_TURN).
-        wp_nav->set_this_leg_origin_speed_ms(handover_speed_ms);
+        // Velocity-preserving handover on the TRUE row line. The cold wp_start
+        // above built the leg from an ahead-projected stopping point, leaving the
+        // slow-exiting vehicle BEHIND the target -> it sprinted past cruise to
+        // close the gap (measured 14.3 m/s vs WP_SPD 12). Rebuild the leg on the
+        // actual row (exit corner C -> resume WP D) with the origin at the
+        // vehicle's PROJECTION onto that line, seeded at the handover speed: the
+        // S-curve target starts co-located with the vehicle AND at its speed, so
+        // there is no along-track error to chase and no velocity step -- it
+        // accelerates smoothly to WP_SPD (capped there) while rejoining the exact
+        // row. C = canonical (xi=0, eta=d) of THIS turn (from the snapshot).
+        const Vector2f eta_hat(-rec.sin_h, rec.cos_h);                 // canonical +eta in world NE
+        const Vector2f corner_c_ne = rec.origin_ne + eta_hat * (rec.mirror ? -rec.d : rec.d);
+        const Vector3p dest_ned = wp_nav->get_wp_destination_NED_m();  // D (row end)
+        const Vector2f row_vec = dest_ned.tofloat().xy() - corner_c_ne; // C -> D
+        const float row_len = row_vec.length();
+        if (is_positive(row_len)) {
+            const Vector2f row_unit = row_vec / row_len;
+            // vehicle's along-track position on the C->D row line, clamped to it
+            const float s = constrain_float((pos_ned.tofloat().xy() - corner_c_ne) * row_unit, 0.0f, row_len);
+            const Vector2f origin_ne = corner_c_ne + row_unit * s;
+            const Vector3p origin_ned(origin_ne.x, origin_ne.y, dest_ned.z);
+            wp_nav->set_wp_leg_advanced_NED_m(origin_ned, dest_ned, handover_speed_ms,
+                                              wp_nav->origin_and_destination_are_terrain_alt());
+        }
     }
 }
 
