@@ -157,7 +157,8 @@ private:
     void thread_cycle();        // one ENGAGED 10 Hz rh cycle
     bool build_x_meas(const Snapshot &snap, float x_meas[6], float &xi_out);
     bool read_snapshot(Snapshot &out) const;
-    void stage_plan(const float *X, float T, const Snapshot &snap);
+    bool stage_plan(const float *X, float T, const Snapshot &snap,
+                    uint32_t arm_generation);
 
     // canonical<->world helpers of the armed frame (_rec)
     void world_to_canonical(const Snapshot &snap, float &v, float &psi_w,
@@ -183,6 +184,8 @@ private:
     HAL_Semaphore _sem;
     volatile State _state;
     bool _rearm_pending;        // arm_turn asked the thread to (re)load
+    uint32_t _arm_generation;   // increments on every arm; rejects results
+                                // completed by a previous turn's cycle
     TurnRecord _rec;            // armed frame (stable while non-IDLE)
     float _engage_xi;           // effective gate (filled on the thread)
     volatile bool _exit_forced; // TSTALL latch

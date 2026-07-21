@@ -99,6 +99,7 @@ AP_MPCSolver::AP_MPCSolver() :
     _rh(nullptr),
     _state(State::IDLE),
     _rearm_pending(false),
+    _arm_generation(0),
     _engage_xi(0),
     _exit_forced(false),
     _accepted_T(0),
@@ -188,6 +189,7 @@ bool AP_MPCSolver::arm_turn(const TurnRecord &rec)
     }
     {
         WITH_SEMAPHORE(_sem);
+        ++_arm_generation;
         _rec = rec;
         _exit_forced = false;
         _have_accepted = false;
@@ -503,8 +505,16 @@ void AP_MPCSolver::thread_preconverge()
     }
 }
 
-void AP_MPCSolver::stage_plan(const float *X, float T, const Snapshot &snap)
+bool AP_MPCSolver::stage_plan(const float *X, float T, const Snapshot &snap,
+                              uint32_t arm_generation)
 {
+    // A solve from the previous turn can finish after ModeAuto has disarmed
+    // and immediately armed a back-to-back turn. Never publish that stale
+    // plan into the new turn's replay queue.
+    WITH_SEMAPHORE(_sem);
+    if (_state != State::ENGAGED || _arm_generation != arm_generation) {
+        return false;
+    }
     WITH_SEMAPHORE(_plan_sem);
     _staged.n = PLAN_NODES;
     _staged.dt_ms = MAX(1, uint16_t(lrintf(T / float(PLAN_N) * 1000.0f)));
@@ -540,6 +550,7 @@ void AP_MPCSolver::stage_plan(const float *X, float T, const Snapshot &snap)
         _staged.acc_e[k] = _rec.sin_h * ax_c + _rec.cos_h * ay_c;
     }
     _staged_seq++;
+    return true;
 }
 
 // x_meas the harness way (plan-carried a/theta + psi branch at the nearest
@@ -623,6 +634,14 @@ void AP_MPCSolver::thread_track()
 
 void AP_MPCSolver::thread_cycle()
 {
+    uint32_t arm_generation;
+    {
+        WITH_SEMAPHORE(_sem);
+        if (_state != State::ENGAGED) {
+            return;
+        }
+        arm_generation = _arm_generation;
+    }
     Snapshot snap;
     if (!read_snapshot(snap)) {
         return;
@@ -648,23 +667,36 @@ void AP_MPCSolver::thread_cycle()
         return;
     }
 
-    if (event == CS_RH_EVENT_EXIT_FORCED) {
-        // TSTALL past the window exit: no solve ran; the mode must hand
-        // control back to its stock guidance NOW (SpiralDetector rule)
-        if (!_exit_forced) {
+    bool report_forced_exit = false;
+    {
+        WITH_SEMAPHORE(_sem);
+        /* ModeAuto can finish one turn and arm the next while this cycle is
+         * solving. Before the generation guard, the old cycle then wrote its
+         * nearly-expired T_rem into the new arm: at the second engage,
+         * t_rem() was immediately -5.336 s and AUTO skipped the whole turn.
+         * State alone is insufficient because the next turn can already be
+         * ENGAGED; bind every result to the arm generation that started it. */
+        if (_state != State::ENGAGED || _arm_generation != arm_generation) {
+            return;
+        }
+        if (event == CS_RH_EVENT_EXIT_FORCED) {
+            // TSTALL past the window exit: no solve ran; the mode must hand
+            // control back to its stock guidance NOW (SpiralDetector rule)
+            report_forced_exit = !_exit_forced;
             _exit_forced = true;
+        } else {
+            // t_rem() extrapolation base for the mode's exit decision
+            _accepted_T = T_rem_out;
+            _accept_ms = snap.time_ms;
+            _have_accepted = true;
+        }
+    }
+    if (event == CS_RH_EVENT_EXIT_FORCED) {
+        if (report_forced_exit) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "MPC: forced exit (T_rem %.2f)",
                           (double)T_rem_out);
         }
         return;
-    }
-
-    // t_rem() extrapolation base for the mode's exit decision
-    {
-        WITH_SEMAPHORE(_sem);
-        _accepted_T = T_rem_out;
-        _accept_ms = snap.time_ms;
-        _have_accepted = true;
     }
 
     // TEMP xi-shift diagnosis: per-cycle canonical telemetry for the first
@@ -726,8 +758,9 @@ void AP_MPCSolver::thread_cycle()
     // a recovery reseed — the harness's streaming rule: re-sending an
     // unchanged plan would re-base the replay clock -> hold at the start)
     if (accepted || _first_cycle || event == CS_RH_EVENT_RESEED) {
-        stage_plan(_X, T_plan, snap);
-        _first_cycle = false;
+        if (stage_plan(_X, T_plan, snap, arm_generation)) {
+            _first_cycle = false;
+        }
     } else {
         GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "MPC: reject (mask 0x%x)",
                       unsigned(cs_rh_last_reject(rh)));
