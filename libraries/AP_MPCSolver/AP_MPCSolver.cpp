@@ -444,6 +444,17 @@ void AP_MPCSolver::thread_rearm()
     if (rc == CS_OK) {
         rc = cs_rh_set_frame_d(rh, d);
     }
+    if (rc == CS_OK) {
+        // R5-proximity reference tracking (w=10 L2) — hold the onboard
+        // re-plan on the restretched R5 seed through the flat bulge<->time
+        // min-time manifold. Crop floor DISARMED while the second-turn
+        // rigid xi-shift is under diagnosis: the 2x2 translation fit showed
+        // the "collapse" is R5's exact shape displaced -1.5 m in xi
+        // (second-turn-specific, handedness-independent), so the crop
+        // symptoms were the shift, not solver greed. Floor machinery stays
+        // available via cs_rh_set_crop_bound once the shift is fixed.
+        rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
+    }
     if (rc != CS_OK) {
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "MPC: frame load failed (rc %d)", rc);
         WITH_SEMAPHORE(_sem);
@@ -654,6 +665,61 @@ void AP_MPCSolver::thread_cycle()
         _accepted_T = T_rem_out;
         _accept_ms = snap.time_ms;
         _have_accepted = true;
+    }
+
+    // TEMP xi-shift diagnosis: per-cycle canonical telemetry for the first
+    // 25 engaged cycles — measured (xi, eta), the plan's canonical bulge
+    // (max xi) and flare depth at eta=1.5 (interp), tau0, accept flag.
+    {
+        static uint8_t dbg_n;
+        if (_first_cycle) {
+            dbg_n = 0;
+        }
+        if (dbg_n < 25) {
+            dbg_n++;
+            float bmax = -99, xfl = 99;
+            for (uint8_t k = 0; k <= PLAN_N; k++) {
+                const float xk = _X[k * 6 + 2], ek = _X[k * 6 + 3];
+                if (xk > bmax) {
+                    bmax = xk;
+                }
+                if (k > 0) {
+                    const float e0 = _X[(k - 1) * 6 + 3];
+                    if ((e0 - 1.5f) * (ek - 1.5f) <= 0.0f &&
+                        fabsf(ek - e0) > 1.0e-6f) {
+                        const float t = (1.5f - e0) / (ek - e0);
+                        const float xi_i = _X[(k - 1) * 6 + 2]
+                            + t * (xk - _X[(k - 1) * 6 + 2]);
+                        if (xi_i < xfl) {
+                            xfl = xi_i;
+                        }
+                    }
+                }
+            }
+            // reference (Xref) flare depth at eta=1.5: if this creeps with
+            // tau0 the w=10 pull is the creep engine; if it stays R5-true
+            // while the plan flare creeps, the corridor side is
+            float rfl = 99;
+            for (uint8_t k = 1; k <= PLAN_N; k++) {
+                const float e0 = rh->Xref[(k - 1) * 6 + 3];
+                const float ek = rh->Xref[k * 6 + 3];
+                if ((e0 - 1.5f) * (ek - 1.5f) <= 0.0f &&
+                    fabsf(ek - e0) > 1.0e-6f) {
+                    const float t = (1.5f - e0) / (ek - e0);
+                    const float xi_i = rh->Xref[(k - 1) * 6 + 2]
+                        + t * (rh->Xref[k * 6 + 2]
+                               - rh->Xref[(k - 1) * 6 + 2]);
+                    if (xi_i < rfl) {
+                        rfl = xi_i;
+                    }
+                }
+            }
+            GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
+                          "MPCC %u xi%.2f eta%.2f b%.2f f%.2f rf%.2f t%.3f a%d",
+                          unsigned(dbg_n), (double)x_meas[2],
+                          (double)x_meas[3], (double)bmax, (double)xfl,
+                          (double)rfl, (double)rh->tau0, accepted);
+        }
     }
 
     // stage ONLY a genuinely new accepted plan (or the engage bootstrap /

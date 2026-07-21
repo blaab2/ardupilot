@@ -123,6 +123,27 @@ int cs_solver_set_row_offset(cs_solver *s, cs_real d_minus_14p1);
  * progress gate (cs_solver_set_gate tau0 >= 0). */
 int cs_solver_set_soft_corr(cs_solver *s, int on);
 
+/* R5-proximity reference tracking (ABI 7). Adds a Gauss-Newton state cost
+ * w * sum_k ||x_k - x_ref_k||^2 to every subsequent QP build (see the
+ * cs_condense.h w_ref/ref_mode comment): mode 1 = L2 (Hessian curvature ->
+ * lowers the kappa proxy of the flat bulge<->time mode + a pull toward the
+ * reference, the recommended damping of the stochastic turn-2 over-bulge);
+ * mode 2 = L1 surrogate (gradient only, no curvature -- the conditioning-null
+ * comparison); w = 0 or mode = 0 disables it (canonical problem bit-unchanged).
+ * x_ref (may be NULL to update only w/mode) is the reference R5 seed states,
+ * (N+1)*nx PHYSICAL units, restretched by the caller to the current progress
+ * (the rh wrapper / Python rh_step restretches the init seed each cycle).
+ * Copied in; not retained. */
+int cs_solver_set_ref(cs_solver *s, const cs_real *x_ref, cs_real w, int mode);
+/* R5-anchored one-sided soft CROP floor: xi_k >= min(0, env(eta_k)) - margin
+ * over the whole transfer, env = the reference path's minimum xi at the
+ * stage's row-transfer position eta_k (eta-aligned lookup on qp->x_ref).
+ * Holds the plan out of the inter-row crop no deeper than the restretched R5
+ * reference cuts, with no bulge push. Reads qp->x_ref, so the caller must
+ * keep it fresh (cs_solver_set_ref / cs_rh_step). on=0 restores the legacy
+ * vx crossing gate; margin >= 0. */
+int cs_solver_set_crop_bound(cs_solver *s, int on, cs_real margin);
+
 /* Largest M1.2 soft-state slack (corridor-block + box-upper) of the last
  * iterate — the shrinking-horizon residual corridor/box violation, in
  * physical units (0 = the plan is inside the gated corridor and boxes).

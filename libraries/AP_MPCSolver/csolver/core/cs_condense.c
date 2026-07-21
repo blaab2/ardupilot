@@ -91,6 +91,15 @@ int cs_condense_set_soft(cs_qp *qp, int on)
     return CS_OK;
 }
 
+int cs_condense_set_crop(cs_qp *qp, int on, cs_real margin)
+{
+    if (!qp || margin < (cs_real)0)
+        return CS_ERR_ARG;
+    qp->crop_bound = on ? 1 : 0;
+    qp->crop_margin = margin;
+    return CS_OK;
+}
+
 int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
 {
     int nx = CS_PD_NX, nu = CS_PD_NU, nh = CS_PD_NH;
@@ -155,6 +164,10 @@ int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
         arena, (size_t)(N + 1) * nx * (qp->nz_max - 2 * nx) * sizeof(cs_real));
     qp->e = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)(N + 1) * nx * sizeof(cs_real));
+    qp->x_ref = (cs_real *)cs_arena_alloc_default(
+        arena, (size_t)(N + 1) * nx * sizeof(cs_real));
+    qp->rref = (cs_real *)cs_arena_alloc_default(
+        arena, (size_t)nx * sizeof(cs_real));
     qp->Ak = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)nx * nx * sizeof(cs_real));
     qp->Bk = (cs_real *)cs_arena_alloc_default(
@@ -172,9 +185,14 @@ int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
     qp->jrow = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)nx * sizeof(cs_real));
     if (!qp->H || !qp->f || !qp->A || !qp->bl || !qp->bu || !qp->sense ||
-        !qp->E || !qp->e || !qp->Ak || !qp->Bk || !qp->bTk || !qp->xnext ||
-        !qp->hk || !qp->Jxk || !qp->Juk || !qp->jrow)
+        !qp->E || !qp->e || !qp->x_ref || !qp->rref || !qp->Ak || !qp->Bk ||
+        !qp->bTk || !qp->xnext || !qp->hk || !qp->Jxk || !qp->Juk ||
+        !qp->jrow)
         return CS_ERR_ARENA;
+    qp->w_ref = (cs_real)0;      /* reference tracking off (canonical); */
+    qp->ref_mode = 0;            /* x_ref filled by cs_solver_set_ref    */
+    qp->crop_bound = 0;          /* R5-anchored crop floor off (canonical) */
+    qp->crop_margin = (cs_real)0;
     /* default pattern = the M1 layout: entry fully pinned, nx terminal pins */
     return cs_condense_set_pattern(qp, none_free, all_pinned);
 }
@@ -238,7 +256,70 @@ static void fill_jerk_end_row(cs_qp *qp, int r, int k,
  * its gate bound shifts rigidly by row_off = d - 14.1 (the shifted problem
  * is eta >= reI(xi) + row_off, i.e. h[3] >= row_off). Approach/crossing
  * are row-1-relative and d-independent. row_off = 0 is bit-unchanged. */
-static void gate_bounds(const cs_qp *qp, int k, cs_real *lo, cs_real *hi)
+/* R5 crop envelope: the deepest (minimum) xi the reference path x_ref
+ * reaches at row-transfer position eta — the crop boundary "as R5 cuts it".
+ * Aligned by ETA, not node index: a plan that cuts the corner is AHEAD of
+ * the reference in eta, so at equal node index the reference is still on
+ * the approach (xi << 0) and a per-node bound never binds. The (xi, eta)
+ * path is restretch-invariant, so the envelope is stable as tau0 advances.
+ * Multivalued regions (eta flat at 0 / d on the rows, both flares) take the
+ * minimum xi over all crossings = the most permissive, matching "no deeper
+ * than R5 anywhere at this eta". Outside the reference's eta range, falls
+ * back to the eta-nearest node's xi. O(N) scan, N=30. */
+#define CS_GATE_FAR_MARGIN ((cs_real)0.05) /* = CS_RH_MARGIN: bare softening
+                                            * for stages beyond the vehicle */
+#define CS_GATE_VLOC ((cs_real)0.06)       /* ~2 nodes of tk: the pin's
+                                            * neighborhood for measured-
+                                            * violation relaxations */
+#define CS_CROP_ETA_DEAD ((cs_real)0.5) /* floor off within this of a row  */
+#define CS_CROP_VEH_WIN ((cs_real)0.3)  /* vehicle pin-accommodation window */
+#define CS_CROP_UP_MARGIN ((cs_real)1.0) /* soft bulge cap: ref bulge + this */
+
+/* EXACT segment interpolation, no eta window: the window (a 0.5 m min-
+ * neighborhood, added for the flat row segments) softened the steep entry
+ * flare by ~0.9 m — R5's xi(eta) rises 2.56 m over 1.6 m of eta there, and
+ * the flown flare rode the softened bound ~1 m deep / ~2 m eta-late
+ * (measured, PSCN target == actual). The flats' problem is instead handled
+ * by the CS_CROP_ETA_DEAD dead-zone in gate_bounds: within 0.5 m of either
+ * row, "off the row" is measurement noise, not crop, and the floor is off
+ * — which also covers the multivalued terminal-settle band. */
+static cs_real crop_env_xi(const cs_qp *qp, cs_real eta)
+{
+    const cs_real *xr = qp->x_ref;
+    const int nx = qp->nx;
+    cs_real fl = (cs_real)0, best = CS_BIG, xin = (cs_real)0;
+    int j, hit = 0;
+    for (j = 0; j <= qp->N; ++j) {
+        const cs_real ej = xr[(size_t)j * nx + 3];
+        const cs_real xj = xr[(size_t)j * nx + 2];
+        cs_real de = ej - eta;
+        if (de < (cs_real)0)
+            de = -de;
+        if (de < best) {
+            best = de;
+            xin = xj;
+        }
+        if (j < qp->N) {
+            const cs_real e1 = xr[(size_t)(j + 1) * nx + 3];
+            const cs_real elo = ej < e1 ? ej : e1;
+            const cs_real ehi = ej < e1 ? e1 : ej;
+            if (eta >= elo && eta <= ehi &&
+                ehi - elo > (cs_real)1e-9) {
+                const cs_real x1 = xr[(size_t)(j + 1) * nx + 2];
+                const cs_real xi =
+                    xj + (eta - ej) / (e1 - ej) * (x1 - xj);
+                if (!hit || xi < fl) {
+                    fl = xi;
+                    hit = 1;
+                }
+            }
+        }
+    }
+    return hit ? fl : xin;
+}
+
+static void gate_bounds(const cs_qp *qp, int k, cs_real eta_k,
+                        cs_real *lo, cs_real *hi)
 {
     lo[0] = -qp->relax;            hi[0] = (cs_real)(CS_PD_J_MAX * CS_PD_J_MAX);
     lo[1] = (cs_real)CS_PD_CHI_LO; hi[1] = (cs_real)CS_PD_CHI_HI;
@@ -258,13 +339,76 @@ static void gate_bounds(const cs_qp *qp, int k, cs_real *lo, cs_real *hi)
         const cs_real tk = qp->gate_tau0
             + ((cs_real)1 - qp->gate_tau0)
               * (cs_real)k / (cs_real)qp->N;
-        if (tk <= (cs_real)CS_PD_FRAC_OUT)
-            hi[2] = qp->gate_rlx_out;
-        if (tk >= (cs_real)CS_PD_FRAC_RET)
-            lo[3] = qp->row_off - qp->gate_rlx_ret;
-        if (tk > (cs_real)CS_PD_FRAC_OUT &&
-            tk < (cs_real)CS_PD_FRAC_RET)
+        /* LOCAL measured-violation relaxations (the corridor-ratchet fix):
+         * the v_out/v_ret relaxations exist ONLY to keep the hard x0 pin
+         * feasible when the VEHICLE violates its leg's envelope — applied
+         * to the whole leg they are a self-licensing loop: a +2 cm entry
+         * cross-track (every post-handback approach settles slightly
+         * row-high; a first turn's pristine leg rides row-low, v_out = 0)
+         * relaxes the outbound gate everywhere, the replan flares early,
+         * the replay flies it, the measured violation grows, and the loop
+         * ratchets ~7 cm/cycle into a rigid one-node (-1.5 m) field-side
+         * shift on EVERY non-first turn (3-turn fork + MPCC telemetry;
+         * seed-anchored tau0 alone did not break it). Stages beyond the
+         * vehicle's progress neighborhood keep the bare softening margin. */
+        const cs_real far = (cs_real)CS_GATE_FAR_MARGIN;
+        const cs_real near_v = tk - qp->gate_tau0 <= (cs_real)CS_GATE_VLOC
+            ? (cs_real)1 : (cs_real)0;
+        if (tk <= (cs_real)CS_PD_FRAC_OUT) {
+            hi[2] = near_v > (cs_real)0 ? qp->gate_rlx_out
+                : (qp->gate_rlx_out < far ? qp->gate_rlx_out : far);
+        }
+        if (tk >= (cs_real)CS_PD_FRAC_RET) {
+            const cs_real r = near_v > (cs_real)0 ? qp->gate_rlx_ret
+                : (qp->gate_rlx_ret < far ? qp->gate_rlx_ret : far);
+            lo[3] = qp->row_off - r;
+        }
+        if (qp->crop_bound) {
+          /* soft bulge cap (whole horizon, eta-independent): see the
+           * crop_xi_up build comment — damps the flat-manifold wander */
+          if (qp->crop_xi_up < hi[4])
+              hi[4] = qp->crop_xi_up;
+          if (eta_k > CS_CROP_ETA_DEAD &&
+              eta_k < qp->crop_eta_max - CS_CROP_ETA_DEAD) {
+            /* R5-anchored crop floor over the transfer (replaces the
+             * relaxable vx crossing gate): xi_k >= min(0, env(eta_k)) -
+             * crop_margin, env = the reference path's xi at the stage's
+             * CURRENT row-transfer position eta_k (crop_env_xi, exact
+             * interpolation). The row dead-zone (0.5 m of either row)
+             * excludes the flat row segments and the terminal settle,
+             * where eta is noise, not crop. Capped at 0 so it never pushes
+             * a bulge where R5 sits in the headland; follows R5's own
+             * flare depth near the rows; tight through the mid-transfer
+             * (floor ~ -crop_margin). The i==4 softening (shared c_cross
+             * slack) fires wherever this raises lo[4] above -gth, so the
+             * crop bound is elastic. */
+            cs_real fl = crop_env_xi(qp, eta_k);
+            cs_real dev = eta_k - qp->crop_v_eta;
+            if (fl > (cs_real)0)
+                fl = (cs_real)0;
+            fl -= qp->crop_margin;
+            /* local pin accommodation: stages near the VEHICLE's eta admit
+             * the measured xi (the hard x0 anchor must stay feasible when
+             * the vehicle is already in the crop). LOCAL by design — the
+             * old vx gate relaxed the whole crossing by the measured
+             * violation and let plans legally sit in the crop; here only
+             * the vehicle's eta neighborhood softens, the rest of the
+             * transfer holds the R5 line. NaN vehicle (free entry) fails
+             * the compare and disables it. */
+            if (dev < (cs_real)0)
+                dev = -dev;
+            if (dev <= CS_CROP_VEH_WIN &&
+                qp->crop_v_xi - qp->crop_margin < fl)
+                fl = qp->crop_v_xi - qp->crop_margin;
+            if (fl > lo[4])
+                lo[4] = fl;
+          }
+          /* dead-zone stages: no bound (crop mode fully replaces the
+           * legacy vx crossing gate — no fall-through) */
+        } else if (tk > (cs_real)CS_PD_FRAC_OUT &&
+                   tk < (cs_real)CS_PD_FRAC_RET) {
             lo[4] = (cs_real)CS_PD_XI_CROSS_MIN - qp->gate_rlx_xi;
+        }
     }
 }
 
@@ -279,6 +423,31 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
     int k, i, j, r, rc;
     for (i = 0; i < nf0; ++i)
         free0_flag[qp->free0[i]] = 1;
+    /* vehicle (xi, eta) for the crop floor's local pin accommodation
+     * (gate_bounds); NaN (free entry) disables it via failed compares */
+    qp->crop_v_xi = x0[2];
+    qp->crop_v_eta = x0[3];
+    /* reference eta max (crop dead-zone row test) and reference bulge
+     * (the soft xi UPPER cap): without the two-sided proximity pull the
+     * bulge<->time manifold is flat/undamped, and the exact crop floor
+     * tips early replans into 7-8 m wide arcs that the flight validator
+     * then rejects (REJ_XI bursts -> stale fallbacks). The cap bounds the
+     * wander INSIDE the QP — a cap, not a pull: it pushes nothing, plans
+     * at/below the reference bulge are untouched. */
+    if (qp->crop_bound) {
+        cs_real em = qp->x_ref[3], xm = qp->x_ref[2];
+        for (k = 1; k <= N; ++k) {
+            const cs_real e = qp->x_ref[(size_t)k * nx + 3];
+            const cs_real x = qp->x_ref[(size_t)k * nx + 2];
+            if (e > em)
+                em = e;
+            if (x > xm)
+                xm = x;
+        }
+        qp->crop_eta_max = em;
+        qp->crop_xi_up = (xm > (cs_real)0 ? xm : (cs_real)0)
+            + CS_CROP_UP_MARGIN;
+    }
 
     /* ---- 1. sweep: sensitivities, defects, E/e propagation ----
      * M2 staged state scaling (plan 4.4): E/e carry the state increments in
@@ -362,6 +531,29 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
     }
     qp->H[(size_t)iT * nz + iT] += Tref * Tref;                 /* 0.5 T^2 */
     qp->f[iT] += T * Tref;
+    /* R5-proximity: w_ref * sum_k ||x_k - x_ref_k||^2 (Gauss-Newton state
+     * cost). Same syrk/gemv machinery as the LM term, but the residual is the
+     * iterate-vs-reference deviation r~_k = (X_k - x_ref_k)/sx (scaled), so H
+     * gains curvature in the flat bulge<->time mode (mode 1) and f gains the
+     * pull toward the R5 reference (mode 1) or its sign (mode 2, the
+     * curvature-null L1 surrogate). w_ref = 0 / mode 0 -> QP bit-unchanged. */
+    if (qp->w_ref > (cs_real)0 && qp->ref_mode != 0) {
+        for (k = 0; k <= N; ++k) {
+            const cs_real *Ek = qp->E + (size_t)k * nx * nz0;
+            const cs_real *xrk = qp->x_ref + (size_t)k * nx;
+            for (i = 0; i < nx; ++i) {
+                const cs_real r =
+                    (X[(size_t)k * nx + i] - xrk[i]) / qp->sc.x[i];
+                qp->rref[i] = (qp->ref_mode == 2)
+                    ? (r > (cs_real)0 ? (cs_real)1
+                       : (r < (cs_real)0 ? (cs_real)-1 : (cs_real)0))
+                    : r;
+            }
+            if (qp->ref_mode == 1)      /* L2 only adds Hessian curvature  */
+                cs_syrk_w_acc(nz0, nx, qp->w_ref, qp->lm_w, Ek, qp->H, nz);
+            cs_gemv_tw_acc(nx, nz0, qp->w_ref, qp->lm_w, Ek, qp->rref, qp->f);
+        }
+    }
     for (i = 0; i < qp->ns; ++i) {
         const int c = nz0 + i;
         const int cor = (i >= 2 * npin);   /* corridor slack vs terminal pin */
@@ -410,7 +602,7 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
         for (j = 0; j < nx; ++j)
             if (free0_flag[j])
                 fm0 |= 1 << j;
-        gate_bounds(qp, 0, lo, hi);
+        gate_bounds(qp, 0, X[3], lo, hi);
         for (i = 0; i < nh; ++i) {
             cs_real Jxrow[6], Jurow[2];
             if (i > 0 && !(k_hdep[i] & fm0))
@@ -435,7 +627,7 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
         rc = cs_h_jac(Xk, U + (size_t)k * nu, qp->hk, qp->Jxk, qp->Juk);
         if (rc != CS_OK)
             return rc;
-        gate_bounds(qp, k, lo, hi);
+        gate_bounds(qp, k, Xk[3], lo, hi);
         for (i = 0; i < nh; ++i) {
             cs_real Jxrow[6], Jurow[2];
             for (j = 0; j < nx; ++j)
@@ -459,6 +651,14 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
                     row[c_ret] = (cs_real)1;
                 else if (i == 4 && lo[4] > -gth)
                     row[c_cross] = (cs_real)1;
+                /* crop bulge cap: UPPER side of the crossing row; shares
+                 * the outbound block slack (coeff -1: A z - s <= hi[4]) —
+                 * c_out is otherwise unused on non-outbound stages, and a
+                 * shared slack legally absorbs the block's worst residual
+                 * across rows (M1.2). May coexist with the lower-side
+                 * c_cross on the same row. */
+                if (i == 4 && hi[4] < gth)
+                    row[c_out] = (cs_real)-1;
             }
             ++r;
         }
@@ -501,7 +701,7 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
                           qp->hk, qp->Jxk, qp->Juk);
             if (rc != CS_OK)
                 return rc;
-            gate_bounds(qp, N, lo, hi);
+            gate_bounds(qp, N, (X + (size_t)N * nx)[3], lo, hi);
             for (i = 1; i < nh; ++i) {          /* x-only rows */
                 cs_real Jxrow[6];
                 if (!(k_hdep[i] & fmN))

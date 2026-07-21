@@ -169,6 +169,11 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
     rh->Ta = T_seed;
     rh->age = (cs_real)0;
     rh->age_valid = 0;
+    rh->ref_w = (cs_real)0;              /* R5-proximity off = canonical rh */
+    rh->ref_mode = 1;
+    rh->val_slack_max = VAL_SLACK_MAX;
+    rh->crop_bound = 0;                  /* R5-anchored crop floor off       */
+    rh->crop_margin = (cs_real)0;
     rh->tau0 = (cs_real)0;
     rh->c_deep = rh->c_stall = 0;
     rh->prev_trem = (cs_real)0;
@@ -199,6 +204,20 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
                                 CS_RH_MARGIN);
     if (rc == CS_OK)
         rc = cs_solver_set_seed(s, S, rh->Ua, &T_seed, 0);
+    /* Clear any R5-proximity reference left on the SOLVER by a previous turn's
+     * cs_rh_step. set_seed resets the iterate + QP warm start but NOT
+     * qp->w_ref/x_ref, and the caller's preconvergence iterates the solver
+     * DIRECTLY (bypassing cs_rh_step), so a stale reference from the prior turn
+     * would pull the fresh preconvergence off the new seed and stall it (the
+     * back-to-back second-turn collapse). rh_step re-installs the correct,
+     * progress-restretched reference once armed (ref_w > 0). */
+    if (rc == CS_OK)
+        rc = cs_solver_set_ref(s, (const cs_real *)0, (cs_real)0, 0);
+    /* likewise the crop floor: it reads the same qp->x_ref, so a stale
+     * solver-side arm would bound the fresh preconvergence against the
+     * PREVIOUS turn's reference. rh_step re-arms it per cycle. */
+    if (rc == CS_OK)
+        rc = cs_solver_set_crop_bound(s, 0, (cs_real)0);
     return rc;
 }
 
@@ -211,6 +230,26 @@ int cs_rh_set_frame_d(cs_rh *rh, cs_real d)
     if (rc != CS_OK)
         return rc;
     rh->d_off = d - CS_RH_D_CANON;
+    return CS_OK;
+}
+
+int cs_rh_set_ref_tracking(cs_rh *rh, cs_real w, int mode, cs_real slack_max)
+{
+    if (!rh || w < (cs_real)0 || mode < 0 || mode > 2)
+        return CS_ERR_ARG;
+    rh->ref_w = w;
+    rh->ref_mode = mode;
+    if (slack_max > (cs_real)0)
+        rh->val_slack_max = slack_max;
+    return CS_OK;
+}
+
+int cs_rh_set_crop_bound(cs_rh *rh, int on, cs_real margin)
+{
+    if (!rh || margin < (cs_real)0)
+        return CS_ERR_ARG;
+    rh->crop_bound = on ? 1 : 0;
+    rh->crop_margin = margin;
     return CS_OK;
 }
 
@@ -396,8 +435,30 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
     if (recov)
         k_eff = k_eff > K_RECOV ? k_eff : K_RECOV;
 
-    /* ---- 3. shrinking-horizon restretch (rh_step, fractional) ---- */
-    project_xy(rh->Xi_, nx, N, x_meas[2], x_meas[3], &tau_star, &dproj);
+    /* ---- 3. shrinking-horizon restretch (rh_step, fractional) ----
+     * ABSOLUTE progress along the immutable SEED path, not the iterate's
+     * own polyline. Iterate-anchored progress was self-referential: a plan
+     * that drifted one node early along the path measured the vehicle one
+     * node further, re-licensed itself through the restretch reseed, and
+     * the loop held a self-consistent solution exactly one node spacing
+     * (~1.5 m) field-side — on EVERY non-first turn (the 3-turn fork:
+     * first-turn approaches are pristine, post-handback approaches carry
+     * the small eta settling transient that kicks the loop into the
+     * shifted basin; neither the w=10 reference pull nor its removal
+     * changed it, because a node-slide along the same path is near-tangent
+     * to the pull's metric). The seed path is restretch-invariant and is
+     * what the spiral detector and the Xref pull already anchor to, so
+     * tau_abs is true row progress and the shifted equilibrium stops
+     * being self-consistent. The iterate restretch keeps its incremental
+     * form: tau_star = (tau_abs - tau0)/(1 - tau0); jitter behind
+     * (tau_star <= 0) skips the advance — monotonicity as before. */
+    {
+        cs_real tau_abs = (cs_real)0;
+        project_xy(rh->S, nx, N, x_meas[2], x_meas[3], &tau_abs, &dproj);
+        tau_star = (rh->tau0 < (cs_real)0.999)
+            ? (tau_abs - rh->tau0) / ((cs_real)1 - rh->tau0)
+            : (cs_real)0;
+    }
     if (tau_star > (cs_real)0
         && tau_star < (cs_real)(N - 2) / (cs_real)N) {
         cs_real Tn = Tit * ((cs_real)1 - tau_star);
@@ -428,6 +489,24 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
     }
     rc = cs_solver_set_gate(rh->s, rh->tau0, v_out + CS_RH_MARGIN,
                             v_ret + CS_RH_MARGIN, vx + CS_RH_MARGIN);
+    if (rc != CS_OK)
+        return rc;
+
+    /* ---- 4b. R5-proximity reference (turn-2 over-bulge fix) ---- */
+    /* restretch the init seed to the current progress tau0 (progress-aligned
+     * with the plan nodes, like the Python rh_step) and apply as the L2
+     * tracking reference; rh->Us is free scratch after the warm-start
+     * set_seed above. Off (ref_w=0) leaves the solver's ref weight at 0. */
+    if (rh->ref_w > (cs_real)0 || rh->crop_bound) {
+        /* the crop floor reads x_ref too, so restretch/install whenever
+         * EITHER the proximity pull (ref_w>0) OR the crop floor is armed;
+         * ref_w may be 0 (pure crop floor, no bulge push). */
+        restretch(rh->S, rh->Ua, N, nx, nu, rh->tau0, rh->Xref, rh->Us);
+        rc = cs_solver_set_ref(rh->s, rh->Xref, rh->ref_w, rh->ref_mode);
+        if (rc != CS_OK)
+            return rc;
+    }
+    rc = cs_solver_set_crop_bound(rh->s, rh->crop_bound, rh->crop_margin);
     if (rc != CS_OK)
         return rc;
 
@@ -495,7 +574,7 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
         }
         if (!(qp_status > 0))
             mask |= CS_RH_REJ_QP;
-        if (sl > VAL_SLACK_MAX)
+        if (sl > rh->val_slack_max)
             mask |= CS_RH_REJ_SLACK;
     }
     rh->last_reject = mask;

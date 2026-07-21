@@ -111,6 +111,54 @@ typedef struct {
      * bit-unchanged. */
     cs_real row_off;
 
+    /* R5-proximity reference tracking (turn-2 conditioning fix). Adds a
+     * Gauss-Newton state cost w_ref * sum_k ||x_k - x_ref_k||^2 to the QP,
+     * x_ref = the reference R5 seed restretched to the current progress:
+     *   H += w_ref * E~' diag(lm_w) E~   (curvature in the flat bulge<->time
+     *                                     mode -> raises the small diagonal,
+     *                                     lowers the kappa proxy)
+     *   f += w_ref * E~' diag(lm_w) r~,  r~_k = (X_k - x_ref_k)/sx  (the pull
+     *                                     back toward R5 that damps the
+     *                                     stochastic over-bulge)
+     * Same syrk/gemv structure as the LM term (which anchors the scaled
+     * defect); this anchors the deviation-from-reference instead. ref_mode:
+     * 0 off (default, canonical problem bit-unchanged), 1 L2 (H+f), 2 L1-
+     * surrogate (f += w_ref*E~'diag(lm_w) sign(r~) only, no curvature -- the
+     * conditioning-null comparison for the L1-vs-L2 sweep). x_ref/w_ref/
+     * ref_mode set via cs_solver_set_ref. */
+    cs_real w_ref;
+    int ref_mode;
+
+    /* R5-anchored CROP floor (one-sided, soft): xi_k >= min(0,
+     * env(eta_k)) - crop_margin over the whole transfer, env = the
+     * reference path's minimum xi at the stage's current row-transfer
+     * position eta_k (crop_env_xi — eta-aligned, NOT node-aligned: a
+     * cutting plan is ahead of the reference in eta, so a per-node bound
+     * never binds). Holds the plan out of the inter-row crop (the area
+     * between the straights and the corner line) no deeper than R5 cuts,
+     * WITHOUT pushing a bulge (capped at 0 where R5 sits in the headland).
+     * Loose near the rows where R5 itself flares. Softened by the shared
+     * c_cross slack wherever it lifts lo[4] above -gth. Replaces the
+     * relaxable vx crossing gate when on. Uses x_ref (the same restretched
+     * R5 seed as the w_ref proximity), set by cs_rh_step whenever
+     * crop_bound || w_ref>0. */
+    int crop_bound;
+    cs_real crop_margin;
+    cs_real crop_v_xi, crop_v_eta;  /* vehicle state at build (x0[2], x0[3]):
+                                     * stages within CS_CROP_VEH_WIN of the
+                                     * vehicle's eta admit the measured xi
+                                     * (hard-pin accommodation, LOCAL only —
+                                     * a global relaxation would re-open the
+                                     * whole crossing, the old vx bug) */
+    cs_real crop_eta_max;           /* ref eta max (build) for the row
+                                     * dead-zone: floor off within
+                                     * CS_CROP_ETA_DEAD of either row */
+    cs_real crop_xi_up;             /* soft xi upper cap (build): ref bulge
+                                     * + CS_CROP_UP_MARGIN — damps the flat
+                                     * bulge<->time manifold wander that the
+                                     * validator otherwise rejects (a cap,
+                                     * not a pull) */
+
     cs_scales sc;
     /* LM state-metric weights over the SCALED E rows (M2): lm_w[i] = sx_i^2
      * reproduces the physical-metric acados damping EXACTLY; lm_w[i] = 1 is
@@ -128,6 +176,8 @@ typedef struct {
     /* condensing state */
     cs_real *E;        /* (N+1) blocks of nx*nz0, col-major         */
     cs_real *e;        /* (N+1) * nx                                */
+    cs_real *x_ref;    /* (N+1)*nx R5 reference states (phys units) */
+    cs_real *rref;     /* nx scratch: scaled iterate-vs-ref residual */
 
     /* scratch */
     cs_real *Ak, *Bk, *bTk, *xnext, *hk, *Jxk, *Juk, *jrow;
@@ -154,6 +204,7 @@ int cs_condense_set_pattern(cs_qp *qp, const int *free0_flags,
  * (nsc = on ? N-1 : 0); mA is unchanged (slacks are columns, not rows).
  * Returns CS_ERR_ARG if the new nz exceeds the allocated worst case. */
 int cs_condense_set_soft(cs_qp *qp, int on);
+int cs_condense_set_crop(cs_qp *qp, int on, cs_real margin);
 
 /* Linearize at (X, U, T) with pins (x0, xN) and fill H/f/A/bl/bu/sense,
  * E/e, defect_max. Calls the cs_model layer (must be initialized). */

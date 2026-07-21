@@ -518,6 +518,24 @@ int cs_solver_set_soft_weights(cs_solver *s, cs_real zc, cs_real Zc)
     return CS_OK;
 }
 
+int cs_solver_set_ref(cs_solver *s, const cs_real *x_ref, cs_real w, int mode)
+{
+    if (!s || w < (cs_real)0 || mode < 0 || mode > 2)
+        return CS_ERR_ARG;
+    if (x_ref)
+        cs_copy(x_ref, s->qp.x_ref, (size_t)(s->N + 1) * s->nx);
+    s->qp.w_ref = w;
+    s->qp.ref_mode = mode;
+    return CS_OK;
+}
+
+int cs_solver_set_crop_bound(cs_solver *s, int on, cs_real margin)
+{
+    if (!s)
+        return CS_ERR_ARG;
+    return cs_condense_set_crop(&s->qp, on, margin);
+}
+
 int cs_solver_set_gate(cs_solver *s, cs_real tau0, cs_real rlx_out,
                        cs_real rlx_ret, cs_real rlx_xi)
 {

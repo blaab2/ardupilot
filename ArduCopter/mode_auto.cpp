@@ -1259,14 +1259,19 @@ void ModeAuto::mpc_turn_update()
         }
         const float t_rem = copter.mpc_solver.t_rem();
         if (!isnan(t_rem)) {
-            // Hand over when SETTLED on the return row (on the line, ~zero
-            // cross-row rate) so the resumed WPNav has no cross-track motion
-            // to project into the inter-row area — with a late t_rem backstop
-            // for the case the settle window is missed. A pure time threshold
-            // catches the settling oscillation at a random phase (measured:
-            // eta 13.5 overshoot -> 12.5 undershoot -> field dip up to 1.3 m).
-            if (copter.mpc_solver.settled_on_row(0.15f, 0.4f) ||
-                t_rem < MPC_TURN_EXIT_T_REM_S) {
+            // FLY THE PLAN OUT: hand over only at plan end, where the
+            // terminal has already flown the flare to completion — target on
+            // the row, target cross-rate and lateral accel ~zero — so the
+            // resumed WPNav leg continues the commanded state seamlessly.
+            // The former settle-at-apex gate (settled_on_row) fired at the
+            // VEHICLE's overshoot apex, which is mid-flare for the TARGET:
+            // the replay target was still 0.7 m above the row descending at
+            // ~0.8 m/s, so the handover stepped the position target down and
+            // the inherited target rate commanded a dive measured 0.9-1.4 m
+            // through the row into the crop (PSCE: target step 13.73->13.01,
+            // vehicle crossing at -2.0 m/s). The vehicle's own state at apex
+            // was fine (-0.15 m/s); the controller's target state was not.
+            if (t_rem < MPC_TURN_EXIT_T_REM_S) {
                 mpc_turn_finish(false);
             }
         } else if (millis() - mpc_turn_engage_ms > MPC_TURN_NO_PLAN_TIMEOUT_MS) {
