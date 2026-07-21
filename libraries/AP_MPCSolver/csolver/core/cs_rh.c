@@ -241,7 +241,19 @@ int cs_rh_set_ref_tracking(cs_rh *rh, cs_real w, int mode, cs_real slack_max)
     rh->ref_mode = mode;
     if (slack_max > (cs_real)0)
         rh->val_slack_max = slack_max;
-    return CS_OK;
+    /* Install this turn's reference NOW. The firmware preconverges through
+     * raw cs_solver_iterate() calls before the first cs_rh_step(), so merely
+     * storing ref_w leaves that phase reference-free (or, before the init
+     * clear above, exposed to the previous turn's restretched x_ref). Keep
+     * the objective continuous from ARMED through ENGAGED by arming the full
+     * seed at tau0=0, or the appropriately restretched seed if this setter is
+     * used later in a turn. cs_rh_step keeps it fresh thereafter. */
+    if (w > (cs_real)0 && mode != 0) {
+        restretch(rh->S, rh->Ua, rh->N, rh->nx, rh->nu, rh->tau0,
+                  rh->Xref, rh->Us);
+        return cs_solver_set_ref(rh->s, rh->Xref, w, mode);
+    }
+    return cs_solver_set_ref(rh->s, (const cs_real *)0, (cs_real)0, 0);
 }
 
 int cs_rh_set_crop_bound(cs_rh *rh, int on, cs_real margin)
