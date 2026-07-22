@@ -189,6 +189,16 @@ int cs_rh_set_frame_d(cs_rh *rh, cs_real d);
 int cs_rh_set_ref_tracking(cs_rh *rh, cs_real w, int mode, cs_real slack_max);
 int cs_rh_set_crop_bound(cs_rh *rh, int on, cs_real margin);
 
+/* READY-phase reference alignment: install the reference restretched to the
+ * VEHICLE's absolute progress along the seed path, allowing pre-path states
+ * (negative tau by exact backward extrapolation of the constant-cruise
+ * approach segment). Call before every live-pinned tracking solve (the
+ * firmware's thread_track): a tau0=0-anchored reference there is node-
+ * misaligned and teaches the iterate a premature braking profile. No-op
+ * when reference tracking is off. Engaged cycles keep their own per-cycle
+ * restretch in cs_rh_step (tau0 >= 0 by the engage gate). */
+int cs_rh_arm_ready_ref(cs_rh *rh, const cs_real x_meas[6]);
+
 /* The engage gate from the seed: enter the MPC turn at xi >= this value. */
 cs_real cs_rh_engage_xi(const cs_rh *rh);
 

@@ -622,6 +622,18 @@ void AP_MPCSolver::thread_track()
         return;
     }
     _last_track_ms = now;
+    // align the armed R5 reference to the VEHICLE's progress before the
+    // live-pinned solve: the arm-time reference is anchored at tau0=0 (the
+    // seed start, xi=-18) while this pin sits up to 12 m earlier — the
+    // per-index pull then drags every node toward a further-along, SLOWER
+    // reference state and the tracked iterate learns a premature braking
+    // profile (flown: both turns at ~3 m/s six metres before the corner).
+    // cs_rh_arm_ready_ref restretches with the vehicle's (possibly
+    // negative) tau via exact backward extrapolation of the cruise
+    // approach segment — reference node 0 sits AT the vehicle.
+    if (cs_rh_arm_ready_ref((cs_rh *)_rh, x_meas) != CS_OK) {
+        return;
+    }
     if (cs_solver_set_pins(_solver, x_meas, _track_xN) != CS_OK) {
         return;
     }
@@ -746,11 +758,23 @@ void AP_MPCSolver::thread_cycle()
                     }
                 }
             }
+            // e3 = the plan's node-3 eta (~0.3 s ahead = what the replay
+            // will command next): discriminates target-led vs vehicle-led
+            // in the approach eta drift (STATUSTEXT budget: drop rf/tau0)
             GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
-                          "MPCC %u xi%.2f eta%.2f b%.2f f%.2f rf%.2f t%.3f a%d",
+                          "MPCC %u xi%.2f eta%.3f e3:%.3f b%.2f f%.2f a%d",
                           unsigned(dbg_n), (double)x_meas[2],
-                          (double)x_meas[3], (double)bmax, (double)xfl,
-                          (double)rfl, (double)rh->tau0, accepted);
+                          (double)x_meas[3], (double)_X[3 * 6 + 3],
+                          (double)bmax, (double)xfl, accepted);
+            // MPCP: the FULL pinned state, so the flight's exact x_meas
+            // stream can be replayed through the host lib (residual-delta
+            // hunt: flight plans lead the flare ~7 m earlier than the host
+            // twin from nominal pins). Second line: STATUSTEXT ~50-char cap.
+            GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
+                          "MPCP %u v%.2f p%.3f a%.3f th%.3f dt%.3f",
+                          unsigned(dbg_n), (double)x_meas[0],
+                          (double)x_meas[1], (double)x_meas[4],
+                          (double)x_meas[5], (double)dt_s);
         }
     }
 

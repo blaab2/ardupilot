@@ -27,7 +27,7 @@
  * row-spacing shift (cs_solver_set_row_offset) + the cs_rh receding-horizon
  * wrapper layer (cs_rh.h). ABI 7 adds cs_solver_set_ref (R5-proximity
  * reference tracking). */
-#define CS_ABI_VERSION 8
+#define CS_ABI_VERSION 9
 
 int cs_abi_version(void);
 int cs_real_size(void);                      /* sizeof(cs_real): 8=f64, 4=f32 */

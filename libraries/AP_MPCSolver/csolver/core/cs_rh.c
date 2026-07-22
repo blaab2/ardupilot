@@ -36,9 +36,18 @@
 #define INNOV_GATE ((cs_real)1.0)
 #define K_INNOV 5
 #define K_RECOV 10
+/* READY-phase leg-gate relaxation (cs_rh_arm_ready_ref): large enough to
+ * make the corridor leg gates inert for the pre-path warm start, far below
+ * the gth slack trigger (relax/2 = 5e8) so no elastic machinery engages. */
+#define CS_RH_READY_RLX ((cs_real)50.0)
 
 /* np.interp over the uniform node grid linspace(0, 1, n+1); col strided
- * (stage-major state columns). Clamps outside [0, 1] like np.interp. */
+ * (stage-major state columns). Clamps outside [0, 1] like np.interp —
+ * pre-path (tq < 0) reference nodes are NOT segment-extrapolated: the seed
+ * decelerates from node 0 (braking starts AT the engage gate), so linear
+ * extrapolation would inflate the backward reference's speed; the READY
+ * extension (cs_rh_arm_ready_ref) instead holds the node-0 state and
+ * extends only xi linearly (cruise-hold along the row). */
 static cs_real interp_node(const cs_real *col, int stride, int n, cs_real tq)
 {
     cs_real pos = tq * (cs_real)n;
@@ -263,6 +272,80 @@ int cs_rh_set_crop_bound(cs_rh *rh, int on, cs_real margin)
     rh->crop_bound = on ? 1 : 0;
     rh->crop_margin = margin;
     return CS_OK;
+}
+
+int cs_rh_arm_ready_ref(cs_rh *rh, const cs_real x_meas[6])
+{
+    cs_real tau_v, dist;
+    if (!rh || !rh->s || !x_meas)
+        return CS_ERR_ARG;
+    if (rh->ref_w <= (cs_real)0 || rh->ref_mode == 0)
+        return CS_OK;
+    /* the vehicle's absolute progress along the seed path, ALLOWING
+     * pre-path states: the READY tracking phase pins x0 up to 12 m before
+     * the seed's first node, where a tau0=0-anchored reference is node-
+     * misaligned — the per-index pull then drags every plan node toward a
+     * further-along, SLOWER reference state and the tracked iterate learns
+     * a premature braking profile (flown: both turns at ~3 m/s six metres
+     * before the corner; doc/ready_ref_misalignment.pdf). The seed's entry
+     * segment is the constant-cruise approach straight, so the backward
+     * extension by first-segment extrapolation (negative tau through the
+     * extrapolating interp_node/interp_unode) is exact: reference node 0
+     * sits AT the vehicle, node-aligned with the tracked plan's span. */
+    if (x_meas[2] >= rh->S[2]) {
+        project_xy(rh->S, rh->nx, rh->N, x_meas[2], x_meas[3],
+                   &tau_v, &dist);
+    } else {
+        const cs_real dxi = rh->S[(size_t)rh->nx + 2] - rh->S[2];
+        if (!(dxi > (cs_real)1e-6) || !(x_meas[2] == x_meas[2]))
+            return CS_ERR_ARG;
+        tau_v = (x_meas[2] - rh->S[2]) / ((cs_real)rh->N * dxi);
+    }
+    if (tau_v < (cs_real)-0.5)
+        tau_v = (cs_real)-0.5;
+    if (tau_v > (cs_real)0.99)
+        tau_v = (cs_real)0.99;
+    restretch(rh->S, rh->Ua, rh->N, rh->nx, rh->nu, tau_v,
+              rh->Xref, rh->Us);
+    /* pre-path nodes (tq < 0, clamped to S[0] by the interp): hold the
+     * node-0 state (cruise on the row — the seed BRAKES from node 0, so
+     * extrapolating its first segment would inflate v backward) and extend
+     * only xi linearly with the first-segment slope; at tq = tau_v this
+     * lands exactly on the vehicle. */
+    if (tau_v < (cs_real)0) {
+        const cs_real dxi0 = (cs_real)rh->N
+            * (rh->S[(size_t)rh->nx + 2] - rh->S[2]);
+        int k;
+        for (k = 0; k <= rh->N; ++k) {
+            const cs_real tq = tau_v
+                + ((cs_real)1 - tau_v) * (cs_real)k / (cs_real)rh->N;
+            if (tq >= (cs_real)0)
+                break;
+            rh->Xref[(size_t)k * rh->nx + 2] = rh->S[2] + tq * dxi0;
+        }
+    }
+    /* Align the WHOLE tracked problem, not just the reference: the
+     * progress gates are index-anchored too (stage k's original progress
+     * tk = tau0 + (1-tau0)k/N assumes node 0 = the seed start), so with
+     * the pin up to 12 m earlier the corridor legs are enforced ~2-3
+     * nodes too soon and the tracked iterate gets squeezed into an early-
+     * braking shape REGARDLESS of the reference (host A/B: approach speed
+     * collapses to ~5-8 m/s with the pull on or off; the engage chaining
+     * then inherits that shape). The gate API's batch sentinel occupies
+     * tau0 < 0, so a negative-progress gate cannot be expressed; instead
+     * relax the leg gates to inert for the READY warm start — it is never
+     * flown, and the aligned w-pull holds it on the seed. The first
+     * engaged cs_rh_step restores real gating (it calls set_gate every
+     * cycle). */
+    {
+        const int rc = cs_solver_set_gate(rh->s, (cs_real)0,
+                                          (cs_real)CS_RH_READY_RLX,
+                                          (cs_real)CS_RH_READY_RLX,
+                                          (cs_real)CS_RH_READY_RLX);
+        if (rc != CS_OK)
+            return rc;
+    }
+    return cs_solver_set_ref(rh->s, rh->Xref, rh->ref_w, rh->ref_mode);
 }
 
 cs_real cs_rh_engage_xi(const cs_rh *rh)
