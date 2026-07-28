@@ -8,6 +8,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,9 +35,12 @@ static const float MPC_A_TRIM = 2.5060086f;  // g*tan(phi_trim) [m/s^2]
 static const float MPC_A_CAP = 5.6638061f;   // g*tan(30 deg) [m/s^2]
 static const float MPC_ENV_TOL = 0.01f;      // formulation ENV_TOL
 
-// receding-horizon cycle period (the Step-E harness re-solves per
-// LOCAL_POSITION_NED sample ~ 10 Hz)
-static const uint32_t MPC_CYCLE_MS = 100;
+// receding-horizon cycle period. The Step-E harness re-solved per
+// LOCAL_POSITION_NED sample (~10 Hz), but the replay tracks the accepted
+// plan between solves, so the cycle only needs to refresh faster than the
+// plan goes stale. 250 ms = what the H743 can actually sustain (measured
+// WCET: rh cycle avg 240.6 / max 255.8 ms at N=30, f32, -Os).
+static const uint32_t MPC_CYCLE_MS = 250;
 // seed preconvergence budget (harness: capped at 30 — longer budgets let the
 // flat u-reg objective drift the plan off R5; measured in SITL)
 static const uint8_t MPC_PRECONV_MAX_ITERS = 30;
@@ -75,6 +79,16 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 // base RTI iterations per rh cycle (the committed Step-E config is k=1;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
+
+// WCET bench build (M5): at boot, on the MPC thread, load the mid-band seed
+// and time ARMED-style solver iterations plus full ENGAGED rh cycles, then
+// re-broadcast the results (and the exact arena sizes) every 5 s — the
+// one-shot boot statustexts are emitted before a USB host can connect and
+// are lost. The dirtied solver state is irrelevant: arm_turn re-seeds via
+// thread_rearm. NEVER leave enabled for flight builds.
+#ifndef MPC_BENCH_WCET
+#define MPC_BENCH_WCET 0
+#endif
 
 const AP_Param::GroupInfo AP_MPCSolver::var_info[] = {
     // @Param: ENABLE
@@ -426,6 +440,93 @@ void AP_MPCSolver::thread_main()
         if (!_initialised) {
             continue;
         }
+#if MPC_BENCH_WCET
+        {
+            static bool bench_done;
+            static char bench_line[3][50];
+            static uint32_t bench_sent_ms;
+            if (!bench_done) {
+                bench_done = true;
+                cs_rh *rh = (cs_rh *)_rh;
+                uint8_t sel = 0;
+                for (uint8_t i = 1; i < CS_SEED_FAMILY_COUNT; i++) {
+                    if (fabsf(cs_seed_d[i] - 14.0f) <
+                        fabsf(cs_seed_d[sel] - 14.0f)) {
+                        sel = i;
+                    }
+                }
+                int rc = cs_rh_init(rh, _solver, cs_seed_X[sel],
+                                    cs_seed_T[sel], PLAN_N, MPC_K_ITERS);
+                if (rc == CS_OK) {
+                    rc = cs_rh_set_frame_d(rh, 14.0f);
+                }
+                if (rc == CS_OK) {
+                    rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
+                }
+                if (rc != CS_OK) {
+                    snprintf(bench_line[0], sizeof(bench_line[0]),
+                             "MPCB setup failed rc %d", rc);
+                } else {
+                    // phase 1: ARMED preconvergence iterations (cold->warm)
+                    uint32_t mn = UINT32_MAX, mx = 0, sum = 0;
+                    uint8_t n = 0;
+                    for (uint8_t i = 0; i < MPC_PRECONV_MAX_ITERS; i++) {
+                        const uint32_t t0 = AP_HAL::micros();
+                        if (cs_solver_iterate(_solver) != CS_OK) {
+                            break;
+                        }
+                        const uint32_t dt = AP_HAL::micros() - t0;
+                        mn = MIN(mn, dt); mx = MAX(mx, dt); sum += dt; n++;
+                    }
+                    snprintf(bench_line[0], sizeof(bench_line[0]),
+                             "MPCB it n%u mn%u av%u mx%u us", unsigned(n),
+                             unsigned(mn), unsigned(n ? sum / n : 0),
+                             unsigned(mx));
+                    // phase 2: ENGAGED rh cycles, flying the accepted plan
+                    // node-to-node as x_meas (perfect tracking; first call
+                    // dt=0 like thread_cycle)
+                    float T_cur = 0;
+                    float x_meas[6];
+                    cs_solver_get_iterate(_solver, _X, _U, &T_cur);
+                    memcpy(x_meas, &_X[0], sizeof(x_meas));
+                    const float dt_s = T_cur / float(PLAN_N);
+                    mn = UINT32_MAX; mx = 0; sum = 0; n = 0;
+                    uint8_t nacc = 0;
+                    for (uint8_t i = 0; i < 16; i++) {
+                        float T_plan = 0, T_rem_b = 0;
+                        int accepted = 0, event = CS_RH_EVENT_NONE;
+                        const uint32_t t0 = AP_HAL::micros();
+                        rc = cs_rh_step(rh, x_meas, (i == 0) ? 0.0f : dt_s,
+                                        _X, _U, &T_plan, &T_rem_b,
+                                        &accepted, &event);
+                        const uint32_t dt = AP_HAL::micros() - t0;
+                        if (rc != CS_OK) {
+                            break;
+                        }
+                        mn = MIN(mn, dt); mx = MAX(mx, dt); sum += dt; n++;
+                        nacc += (accepted != 0);
+                        memcpy(x_meas, &_X[6], sizeof(x_meas));
+                    }
+                    snprintf(bench_line[1], sizeof(bench_line[1]),
+                             "MPCB rh n%u a%u mn%u av%u mx%u us",
+                             unsigned(n), unsigned(nacc), unsigned(mn),
+                             unsigned(n ? sum / n : 0), unsigned(mx));
+                    snprintf(bench_line[2], sizeof(bench_line[2]),
+                             "MPCB arena %u rh %u B", unsigned(_arena_bytes),
+                             unsigned(cs_rh_sizeof()));
+                }
+            }
+            const uint32_t bench_now = AP_HAL::millis();
+            if (bench_now - bench_sent_ms >= 5000) {
+                bench_sent_ms = bench_now;
+                for (uint8_t i = 0; i < 3; i++) {
+                    if (bench_line[i][0] != '\0') {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s", bench_line[i]);
+                    }
+                }
+            }
+        }
+#endif
         if (_rearm_pending) {
             thread_rearm();
         }
