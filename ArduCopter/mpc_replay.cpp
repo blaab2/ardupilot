@@ -2,6 +2,31 @@
 
 #if MODE_GUIDED_ENABLED
 
+// DIAGNOSTIC: replay time dilation. 1.0f = normal. 2.0f flies the SAME
+// committed plan geometry at HALF speed: the timeline is sampled at
+// elapsed/SCALE, velocities scale by 1/SCALE and accelerations by
+// 1/SCALE^2 (chain rule); the drag-FF needs no change (it reads measured
+// velocity). Pair of this define lives in AP_MPCSolver.cpp t_rem() — the
+// exit countdown must tick at 1/SCALE or AUTO hands back mid-turn. Keep
+// both in sync. Affects EVERY replayed trajectory (incl. the MAVLink
+// path) — experiments only.
+#define MPC_REPLAY_TIME_SCALE 1.0f
+
+// TRUE tilt-rate (thrust-vector angular velocity) feedforward. 1 = derive the
+// plan's jerk by finite-differencing the sampled KINEMATIC plan acceleration
+// over a +0.1 s (real-time) window, map it to the angular velocity of the
+// commanded specific-force direction f = (ax, ay, -g), and feed that rate to
+// the attitude controller's roll/pitch command model so the shaped attitude
+// target tracks the moving thrust vector without input-TC lag (~0.3-0.5 m
+// cross-track measured without it). The tilt ANGLE target is unchanged — it
+// still comes only from PSC's thrust vector (PID corrections and drag-FF
+// included); ONLY the rate comes from the plan, so nothing is double-counted.
+// The rate is clamped to 1.5 rad/s and forced to zero in the Tier-2 hold
+// branch and for trajectories with fewer than 2 nodes. Works identically for
+// the MAVLink/offboard TrajStream path (same buffer, same run()).
+// 0 = bit-identical to the original input_thrust_vector_heading() hand-off.
+#define MPC_TILT_RATE_FF 0
+
 /*
  * MPCTrajReplay — implementation. This is the Step-E GUIDED TrajStream code
  * moved verbatim out of mode_guided.cpp (semantics preserved bit-for-bit;
@@ -97,6 +122,21 @@ void MPCTrajReplay::commit_pending()
                   plan.acc_n[i], plan.acc_e[i]);
     }
     _traj.pending_next = plan.n;
+#if HAL_LOGGING_ENABLED
+    // Capture the COMPLETE accepted trajectory every three seconds, rather
+    // than only GUIP's current replay setpoint. These node sets are the exact
+    // trajectory fan needed to see how successive replans move relative to
+    // R5 and the flown track.
+    if (_external_active && plan.anchor_ms >= _plan_snapshot_start_ms &&
+        plan.anchor_ms - _plan_snapshot_start_ms >= _plan_snapshot_next_ms) {
+        for (uint16_t i = 0; i < plan.n; i++) {
+            copter.Log_Write_MPC_Plan(_plan_snapshot_id, uint8_t(i),
+                                      plan.dt_ms, plan.pos_n[i], plan.pos_e[i]);
+        }
+        _plan_snapshot_id++;
+        _plan_snapshot_next_ms += 3000U;
+    }
+#endif
     // no guided auto-start: the mode driving the onboard solver (AUTO
     // MpcTurn) owns its own replay submode entry (start()/run()/stop())
     commit_assembled(plan.anchor_ms, false);
@@ -190,6 +230,11 @@ void MPCTrajReplay::start()
     // reset the Tier-2 station-keep latch
     _hold_active = false;
 
+    // accepted-plan trajectory-fan logging schedule (0, 3, 6, ... s)
+    _plan_snapshot_start_ms = millis();
+    _plan_snapshot_next_ms = 0;
+    _plan_snapshot_id = 0;
+
     // crab: hold current heading, do not turn the nose along the track
     Mode::auto_yaw.set_mode(Mode::AutoYaw::Mode::HOLD);
 
@@ -228,8 +273,16 @@ void MPCTrajReplay::run()
     const uint32_t now_ms = millis();
     const uint32_t age_ms = now_ms - _traj.commit_ms;
 
+#if MPC_TILT_RATE_FF
+    // thrust-vector angular velocity feedforward (NED, rad/s); stays zero in
+    // the Tier-2 hold branch and for degenerate (<2 node) trajectories
+    Vector3f tilt_rate_ff_ned_rads;
+#endif
+
     float posN, posE, velN, velE, accN, accE;
-    if (_traj.active_n == 0 || age_ms > _traj.duration_ms() + copter.mode_guided.get_timeout_ms()) {
+    if (_traj.active_n == 0 ||
+        age_ms > (uint32_t)(_traj.duration_ms() * MPC_REPLAY_TIME_SCALE) +
+                 copter.mode_guided.get_timeout_ms()) {
         // Tier-2 failsafe: no trajectory yet, or the plan finished replaying and
         // no fresh solution arrived within the timeout on top of the plan's own
         // duration (a valid long plan must never be cut mid-replay). Station-keep
@@ -247,14 +300,59 @@ void MPCTrajReplay::run()
         // Tier-1: sample the buffered trajectory at true elapsed time (holds the
         // final node past the end until a new trajectory arrives).
         _hold_active = false;
-        const float elapsed_s = age_ms * 0.001f;
+        const float elapsed_s = age_ms * 0.001f / MPC_REPLAY_TIME_SCALE;
         _traj.sample(elapsed_s, posN, posE, velN, velE, accN, accE);
         pos_ned_m.x = posN;
         pos_ned_m.y = posE;
-        vel_ned_ms.x = velN;
-        vel_ned_ms.y = velE;
-        accel_ned_mss.x = accN;
-        accel_ned_mss.y = accE;
+        vel_ned_ms.x = velN / MPC_REPLAY_TIME_SCALE;
+        vel_ned_ms.y = velE / MPC_REPLAY_TIME_SCALE;
+        accel_ned_mss.x = accN / (MPC_REPLAY_TIME_SCALE * MPC_REPLAY_TIME_SCALE);
+        accel_ned_mss.y = accE / (MPC_REPLAY_TIME_SCALE * MPC_REPLAY_TIME_SCALE);
+
+#if MPC_TILT_RATE_FF
+        if (_traj.active_n >= 2) {
+            // Jerk FF: finite-difference the SCALED commanded acceleration over
+            // a REAL +h window. The commanded accel at real age t is
+            // a_plan(t/S)/S^2, so (a_cmd(t+h) - a_cmd(t))/h = j_plan/S^3 — the
+            // correctly time-dilated jerk with no extra scale factor. Only the
+            // KINEMATIC plan accel enters here (not the drag-FF, not the PID).
+            // CENTRAL difference: the first flight of the forward-FD variant
+            // showed the ~h/2 phase LEAD as a ~0.3 m inside-shift of the whole
+            // turn (fits -0.4..-0.7 vs -0.05..-0.5 without FF, at 5 m/s flare
+            // speed) — the FF must carry zero phase to feed rate without
+            // moving the flare. sample() clamps before node 0, so the early
+            // half-window degrades to forward-FD only in the first 50 ms.
+            const float h_s = 0.1f;     // window in REAL time
+            float pN2, pE2, vN2, vE2, aN2, aE2, aN1, aE1;
+            _traj.sample(elapsed_s + 0.5f * h_s / MPC_REPLAY_TIME_SCALE,
+                         pN2, pE2, vN2, vE2, aN2, aE2);
+            _traj.sample(elapsed_s - 0.5f * h_s / MPC_REPLAY_TIME_SCALE,
+                         pN2, pE2, vN2, vE2, aN1, aE1);
+            const float inv_scale2 = 1.0f / (MPC_REPLAY_TIME_SCALE * MPC_REPLAY_TIME_SCALE);
+            const Vector3f jerk_ned_msss{
+                (aN2 - aN1) * inv_scale2 / h_s,
+                (aE2 - aE1) * inv_scale2 / h_s,
+                0.0f};
+
+            // Map jerk to the angular velocity of the commanded specific-force
+            // direction: f = (ax, ay, -g) (NED, matching what PSC's
+            // get_thrust_vector() builds from its accel target), b = f/|f|,
+            // db/dt = (I - b b^T) j / |f|, omega = b x db/dt. omega has no
+            // component along b — no spin about the thrust axis (yaw is
+            // commanded separately and held).
+            const Vector3f f_ned{accel_ned_mss.x, accel_ned_mss.y, -GRAVITY_MSS};
+            const float f_len = f_ned.length();     // >= g, never zero
+            const Vector3f b_ned = f_ned / f_len;
+            const Vector3f db_dt = (jerk_ned_msss - b_ned * (b_ned * jerk_ned_msss)) / f_len;
+            tilt_rate_ff_ned_rads = b_ned % db_dt;
+
+            // safety clamp on the feedforward magnitude
+            const float w_rads = tilt_rate_ff_ned_rads.length();
+            if (w_rads > 1.5f) {
+                tilt_rate_ff_ned_rads *= 1.5f / w_rads;
+            }
+        }
+#endif
     }
 
     // drag-aware lean map: refresh the thrust-side drag feed-forward from the
@@ -270,6 +368,16 @@ void MPCTrajReplay::run()
     // feed the controller RAW - no S-curve reshaping (this is the clean seam,
     // identical to how AC_WPNav feeds AC_PosControl)
     copter.pos_control->set_pos_vel_accel_NED_m(pos_ned_m, vel_ned_ms, accel_ned_mss);
+
+#if AP_MPCSOLVER_ENABLED
+    // plan-time pinning feed: the commanded target just fed to PSC, but only
+    // while actually replaying a trajectory (Tier-2 hold must NOT pin the
+    // solver to a station-keep target)
+    if (!_hold_active && _traj.active_n > 0) {
+        copter.mpc_solver.set_plan_pin_target(pos_ned_m.xy().tofloat(),
+                                              vel_ned_ms.xy(), now_ms);
+    }
+#endif
 
     // run position controllers (add only P (pos->vel) + PID (vel->accel) correction)
     copter.pos_control->NE_update_controller();
@@ -290,7 +398,34 @@ void MPCTrajReplay::run()
 #endif
 
     // call attitude controller with auto yaw (HOLD = crab)
+#if MPC_TILT_RATE_FF
+    {
+        const Vector3f thrust_vector = copter.pos_control->get_thrust_vector();
+        const AC_AttitudeControl::HeadingCommand heading = Mode::auto_yaw.get_heading();
+        if (heading.heading_mode == AC_AttitudeControl::HeadingMode::Rate_Only) {
+            // AutoYaw HOLD (set in start()) reports Rate_Only with zero rate, so
+            // input_thrust_vector_heading() would dispatch to
+            // input_thrust_vector_rate_heading_rads(thrust_vector, 0) — call the
+            // feedforward overload of that same entry point directly. Rotate the
+            // NED thrust-vector angular velocity into the body frame of the
+            // controller's attitude TARGET (the frame thrust_vector_rotation_angles
+            // expresses the roll/pitch error in, i.e. the frame the command-model
+            // rates live in; _attitude_target carries the held heading). The
+            // feedforward's body-z component is zeroed: heading is held, and the
+            // yaw command model keeps its own rate input (0 in HOLD).
+            Vector3f ang_vel_ff_body_rads =
+                copter.attitude_control->get_attitude_target_quat().inverse() * tilt_rate_ff_ned_rads;
+            ang_vel_ff_body_rads.z = 0.0f;
+            copter.attitude_control->input_thrust_vector_rate_heading_rads(
+                thrust_vector, heading.yaw_rate_rads, ang_vel_ff_body_rads, true);
+        } else {
+            // non-crab heading modes: original hand-off, no tilt-rate feedforward
+            copter.attitude_control->input_thrust_vector_heading(thrust_vector, heading);
+        }
+    }
+#else
     copter.attitude_control->input_thrust_vector_heading(copter.pos_control->get_thrust_vector(), Mode::auto_yaw.get_heading());
+#endif
 }
 
 // TrajBuffer::begin - start assembling a new pending trajectory

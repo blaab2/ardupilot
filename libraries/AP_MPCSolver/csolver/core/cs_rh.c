@@ -244,7 +244,7 @@ int cs_rh_set_frame_d(cs_rh *rh, cs_real d)
 
 int cs_rh_set_ref_tracking(cs_rh *rh, cs_real w, int mode, cs_real slack_max)
 {
-    if (!rh || w < (cs_real)0 || mode < 0 || mode > 2)
+    if (!rh || w < (cs_real)0 || mode < 0 || mode > 3)
         return CS_ERR_ARG;
     rh->ref_w = w;
     rh->ref_mode = mode;

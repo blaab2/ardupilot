@@ -520,7 +520,7 @@ int cs_solver_set_soft_weights(cs_solver *s, cs_real zc, cs_real Zc)
 
 int cs_solver_set_ref(cs_solver *s, const cs_real *x_ref, cs_real w, int mode)
 {
-    if (!s || w < (cs_real)0 || mode < 0 || mode > 2)
+    if (!s || w < (cs_real)0 || mode < 0 || mode > 3)
         return CS_ERR_ARG;
     if (x_ref)
         cs_copy(x_ref, s->qp.x_ref, (size_t)(s->N + 1) * s->nx);

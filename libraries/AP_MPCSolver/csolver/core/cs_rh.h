@@ -181,7 +181,10 @@ int cs_rh_set_frame_d(cs_rh *rh, cs_real d);
 
 /* Arm the R5-proximity reference tracking (turn-2 over-bulge fix). w = the L2
  * reference weight (0 disables, the canonical rh); mode 1 = L2 / 2 = L1
- * surrogate; slack_max = the runtime slack reject cap (<= 0 keeps the current
+ * surrogate / 3 = normal-only path tube (ABI 10: rank-1 signed-distance cost
+ * to the seed polyline in (xi, eta) — timing and tangential progress free,
+ * normal flare migration priced; immune to the along-path translation that
+ * modes 1/2 re-anchor away); slack_max = the runtime slack reject cap (<= 0 keeps the current
  * value). Installs the current turn's seed reference immediately so the raw
  * ARMED/READY cs_solver_iterate() preconvergence uses the same objective as
  * ENGAGED cs_rh_step(); cs_rh_step restretches it thereafter. Call after

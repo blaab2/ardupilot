@@ -2,6 +2,8 @@
 #include "cs_linalg.h"
 #include "cs_model.h"
 
+#include <math.h>
+
 #include "../model/generated/turn_r5_probdata.h"
 
 #define CS_BIG ((cs_real)1e20)   /* "no bound" for simple bounds / one-sided rows */
@@ -168,6 +170,8 @@ int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
         arena, (size_t)(N + 1) * nx * sizeof(cs_real));
     qp->rref = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)nx * sizeof(cs_real));
+    qp->vref = (cs_real *)cs_arena_alloc_default(
+        arena, (size_t)qp->nz_max * sizeof(cs_real));
     qp->Ak = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)nx * nx * sizeof(cs_real));
     qp->Bk = (cs_real *)cs_arena_alloc_default(
@@ -185,9 +189,9 @@ int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
     qp->jrow = (cs_real *)cs_arena_alloc_default(
         arena, (size_t)nx * sizeof(cs_real));
     if (!qp->H || !qp->f || !qp->A || !qp->bl || !qp->bu || !qp->sense ||
-        !qp->E || !qp->e || !qp->x_ref || !qp->rref || !qp->Ak || !qp->Bk ||
-        !qp->bTk || !qp->xnext || !qp->hk || !qp->Jxk || !qp->Juk ||
-        !qp->jrow)
+        !qp->E || !qp->e || !qp->x_ref || !qp->rref || !qp->vref ||
+        !qp->Ak || !qp->Bk || !qp->bTk || !qp->xnext || !qp->hk ||
+        !qp->Jxk || !qp->Juk || !qp->jrow)
         return CS_ERR_ARENA;
     qp->w_ref = (cs_real)0;      /* reference tracking off (canonical); */
     qp->ref_mode = 0;            /* x_ref filled by cs_solver_set_ref    */
@@ -274,6 +278,21 @@ static void fill_jerk_end_row(cs_qp *qp, int r, int k,
 #define CS_CROP_ETA_DEAD ((cs_real)0.5) /* floor off within this of a row  */
 #define CS_CROP_VEH_WIN ((cs_real)0.3)  /* vehicle pin-accommodation window */
 #define CS_CROP_UP_MARGIN ((cs_real)1.0) /* soft bulge cap: ref bulge + this */
+
+/* mode-3 normal tube dead radius: cm-noise, the 0.2-0.5 m mid-turn
+ * tracking offsets, and the apex projection flicker stay (mostly) out of
+ * the objective; only migration beyond it is priced, via the hinge
+ * 0.5*w*(|d_n|-r0)^2. Flight-tuned across three sentinel flights: full
+ * residual at w=30 storms the slack validator from ordinary tracking
+ * offsets (tube3t); capping the tube to the outbound stages instead frees
+ * the apex into the over-bulge branch of the flat bulge<->time manifold
+ * (tube3u, bulge 3.8 vs seed 1.98); splicing the index-matched pull onto
+ * the tail re-anchors TIMING by node index against the tube's tangential
+ * freedom and back-propagates as braking + a re-seeded field-side shift
+ * (tube3v). One geometric hinge over the whole horizon is the composition
+ * that works: flat-manifold migration (metres) is decided by the hinge,
+ * tracking noise is not. */
+#define CS_REF_TUBE_R0 ((cs_real)0.25)
 
 /* EXACT segment interpolation, no eta window: the window (a 0.5 m min-
  * neighborhood, added for the flat row segments) softened the steep entry
@@ -537,7 +556,8 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
      * gains curvature in the flat bulge<->time mode (mode 1) and f gains the
      * pull toward the R5 reference (mode 1) or its sign (mode 2, the
      * curvature-null L1 surrogate). w_ref = 0 / mode 0 -> QP bit-unchanged. */
-    if (qp->w_ref > (cs_real)0 && qp->ref_mode != 0) {
+    if (qp->w_ref > (cs_real)0 &&
+        (qp->ref_mode == 1 || qp->ref_mode == 2)) {
         for (k = 0; k <= N; ++k) {
             const cs_real *Ek = qp->E + (size_t)k * nx * nz0;
             const cs_real *xrk = qp->x_ref + (size_t)k * nx;
@@ -552,6 +572,91 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
             if (qp->ref_mode == 1)      /* L2 only adds Hessian curvature  */
                 cs_syrk_w_acc(nz0, nx, qp->w_ref, qp->lm_w, Ek, qp->H, nz);
             cs_gemv_tw_acc(nx, nz0, qp->w_ref, qp->lm_w, Ek, qp->rref, qp->f);
+        }
+    }
+    /* mode 3: NORMAL-only path tube. Per node, project (xi_k, eta_k) onto
+     * the x_ref (xi, eta) polyline and penalize 0.5*w_ref*(|d_n|-r0)^2
+     * beyond the CS_REF_TUBE_R0 dead radius, d_n = the SIGNED distance
+     * along the local path normal (rank-1 Gauss-Newton in position space;
+     * v, psi, a, th, T untouched). The index-matched modes above re-anchor
+     * with a rigid along-path shift (tau0 re-projection slides the
+     * reference with the vehicle -> the flare-ratchet's xi translation is
+     * a null direction of their pull); the tube residual is geometric, so
+     * tangential progress and timing stay free while normal flare
+     * migration is priced in metres. Vertex-clamped projections keep the
+     * SEGMENT normal, so overshooting the path's END tangentially is also
+     * free (n'(p-c) discards the tangential part). sqrt-free: the
+     * unnormalized segment normal (-dy, dx) is folded into alpha = w/L2.
+     * Applied over the WHOLE horizon — see the CS_REF_TUBE_R0 comment for
+     * why the dead-radius hinge (not a progress cap, not an index-pull
+     * splice) is the composition that survived the sentinel flights. */
+    if (qp->w_ref > (cs_real)0 && qp->ref_mode == 3) {
+        for (k = 0; k <= N; ++k) {
+            {
+            const cs_real *Ek = qp->E + (size_t)k * nx * nz0;
+            const cs_real px = X[(size_t)k * nx + 2];
+            const cs_real py = X[(size_t)k * nx + 3];
+            cs_real best_d2 = (cs_real)0, bnx = (cs_real)0,
+                    bny = (cs_real)0, br = (cs_real)0, bL2 = (cs_real)0;
+            int found = 0, j;
+            for (j = 0; j < N; ++j) {
+                const cs_real ax = qp->x_ref[(size_t)j * nx + 2];
+                const cs_real ay = qp->x_ref[(size_t)j * nx + 3];
+                const cs_real dxs = qp->x_ref[(size_t)(j + 1) * nx + 2] - ax;
+                const cs_real dys = qp->x_ref[(size_t)(j + 1) * nx + 3] - ay;
+                const cs_real L2 = dxs * dxs + dys * dys;
+                cs_real t, cx, cy, ex, ey, d2;
+                if (!(L2 > (cs_real)1e-9))       /* degenerate segment */
+                    continue;
+                t = ((px - ax) * dxs + (py - ay) * dys) / L2;
+                if (t < (cs_real)0)
+                    t = (cs_real)0;
+                else if (t > (cs_real)1)
+                    t = (cs_real)1;
+                cx = ax + t * dxs;
+                cy = ay + t * dys;
+                ex = px - cx;
+                ey = py - cy;
+                d2 = ex * ex + ey * ey;
+                if (!found || d2 < best_d2) {
+                    found = 1;
+                    best_d2 = d2;
+                    bnx = -dys;              /* unnormalized normal */
+                    bny = dxs;
+                    br = bnx * ex + bny * ey;   /* = L * d_n (signed) */
+                    bL2 = L2;
+                }
+            }
+            if (found &&
+                best_d2 > (cs_real)(CS_REF_TUBE_R0 * CS_REF_TUBE_R0)) {
+                /* hinge beyond the dead radius: br holds L*d_n, so the
+                 * shrunk residual L*(|d_n|-r0)*sign(d_n) = br*(1-r0/|d_n|);
+                 * the Gauss-Newton curvature of 0.5w(|d|-r0)^2 is w — the
+                 * full rank-1 H stays. */
+                const cs_real dn = (cs_real)sqrt((double)best_d2);
+                const cs_real shr =
+                    (cs_real)1 - (cs_real)CS_REF_TUBE_R0 / dn;
+                const cs_real alpha = qp->w_ref / bL2;
+                const cs_real s2 = qp->sc.x[2], s3 = qp->sc.x[3];
+                cs_real *v = qp->vref;
+                int j1, j2;
+                for (j = 0; j < nz0; ++j)   /* physical d(n~'p)/dz row */
+                    v[j] = bnx * s2 * Ek[(size_t)j * nx + 2]
+                         + bny * s3 * Ek[(size_t)j * nx + 3];
+                for (j2 = 0; j2 < nz0; ++j2) {
+                    const cs_real a2 = alpha * v[j2];
+                    if (a2 != (cs_real)0) {
+                        for (j1 = 0; j1 <= j2; ++j1) {
+                            const cs_real hv = a2 * v[j1];
+                            qp->H[(size_t)j2 * nz + j1] += hv;
+                            if (j1 != j2)
+                                qp->H[(size_t)j1 * nz + j2] += hv;
+                        }
+                    }
+                    qp->f[j2] += a2 * (br * shr);
+                }
+            }
+            }
         }
     }
     for (i = 0; i < qp->ns; ++i) {

@@ -921,6 +921,7 @@ private:
     void Log_Write_Vehicle_Startup_Messages();
     void Log_Write_Rate_Thread_Dt(float dt, float dtAvg, float dtMax, float dtMin);
     void Log_Write_MPC_Turn(uint8_t event, uint16_t entry_idx, uint16_t exit_idx, float d, bool mirror, float t_rem, float xi);
+    void Log_Write_MPC_Plan(uint8_t snapshot, uint8_t node, uint16_t dt_ms, float pos_n, float pos_e);
 #endif  // HAL_LOGGING_ENABLED
 
     // mode.cpp

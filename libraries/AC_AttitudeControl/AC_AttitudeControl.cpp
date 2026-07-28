@@ -831,6 +831,14 @@ void AC_AttitudeControl::input_rate_step_bf_roll_pitch_yaw_rads(float roll_rate_
 // Optional yaw slew limiting constrains the heading rate input.
 void AC_AttitudeControl::input_thrust_vector_rate_heading_rads(const Vector3f& thrust_vector, float heading_rate_rads, bool slew_yaw)
 {
+    // zero tilt-rate feedforward: behaviourally identical to the pre-feedforward implementation
+    input_thrust_vector_rate_heading_rads(thrust_vector, heading_rate_rads, Vector3f{}, slew_yaw);
+}
+
+// Same as above, plus a body-frame tilt-rate feedforward (rad/s) for roll/pitch — see header.
+// ang_vel_ff_body_rads.z is ignored: yaw is commanded by heading_rate_rads alone.
+void AC_AttitudeControl::input_thrust_vector_rate_heading_rads(const Vector3f& thrust_vector, float heading_rate_rads, const Vector3f& ang_vel_ff_body_rads, bool slew_yaw)
+{
     float yaw_rate_max_rads = radians(_ang_vel_yaw_max_degs);
     if (slew_yaw) {
         // Replace global yaw rate limit with the slew rate limit (0 disables limiting).
@@ -855,9 +863,11 @@ void AC_AttitudeControl::input_thrust_vector_rate_heading_rads(const Vector3f& t
 
     if (_rate_bf_ff_enabled) {
         // Shape roll/pitch attitude error into body-frame angular velocity/acceleration targets,
-        // applying configured rate/acceleration limits and input time constant.
-        attitude_command_model(attitude_error.x, 0.0, _ang_vel_target_rads.x, _ang_accel_target_rads.x, radians(_ang_vel_roll_max_degs), get_accel_roll_max_radss(), _input_tc, _dt_s);
-        attitude_command_model(attitude_error.y, 0.0, _ang_vel_target_rads.y, _ang_accel_target_rads.y, radians(_ang_vel_pitch_max_degs), get_accel_pitch_max_radss(), _input_tc, _dt_s);
+        // applying configured rate/acceleration limits and input time constant. The tilt-rate
+        // feedforward is the desired angular velocity the shaped target converges to (zero
+        // without a feedforward — the original behaviour).
+        attitude_command_model(attitude_error.x, ang_vel_ff_body_rads.x, _ang_vel_target_rads.x, _ang_accel_target_rads.x, radians(_ang_vel_roll_max_degs), get_accel_roll_max_radss(), _input_tc, _dt_s);
+        attitude_command_model(attitude_error.y, ang_vel_ff_body_rads.y, _ang_vel_target_rads.y, _ang_accel_target_rads.y, radians(_ang_vel_pitch_max_degs), get_accel_pitch_max_radss(), _input_tc, _dt_s);
 
         // Shape yaw rate input into yaw angular velocity/acceleration targets, applying yaw limits and time constant.
         attitude_command_model(0.0, heading_rate_rads, _ang_vel_target_rads.z, _ang_accel_target_rads.z, yaw_rate_max_rads, get_accel_yaw_max_radss(), _rate_y_tc, _dt_s);

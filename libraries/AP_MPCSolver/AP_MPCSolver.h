@@ -128,6 +128,14 @@ public:
     void update();
     // consume a newly staged accepted plan (false if none since last call)
     bool take_plan(Plan &out);
+    // replay-side feed for plan-time pinning (MPC_PLAN_TIME_PIN): the
+    // replay's CURRENT commanded NE position/velocity target and its
+    // vehicle-clock timestamp. Called from MPCTrajReplay::run() every
+    // Tier-1 loop; consumed by the engaged solve to pin x0 at the plan's
+    // predicted state instead of the measured one (freshness + divergence
+    // gated in thread_cycle).
+    void set_plan_pin_target(const Vector2f &pos_ne_m,
+                             const Vector2f &vel_ne_ms, uint32_t time_ms);
 
     // turn-detector parameters (read by Agent C's ModeAuto scanner)
     float turn_ang_deg() const { return _turn_ang_deg; }
@@ -210,6 +218,10 @@ private:
     float _U[PLAN_N * 2];
     uint32_t _next_cycle_ms;
     uint32_t _last_cycle_snap_ms;   // snapshot time of the previous rh cycle
+    // plan-time pin feed (set_plan_pin_target; guarded by _sem)
+    Vector2f _pin_tgt_pos_ne_m;
+    Vector2f _pin_tgt_vel_ne_ms;
+    uint32_t _pin_tgt_ms;
     bool _first_cycle;          // engage bootstrap: stage the first plan
                                 // regardless of accept (harness `sent_traj`)
     uint8_t _pre_iters;         // preconverge bookkeeping

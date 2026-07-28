@@ -26,8 +26,8 @@
  * 5 = M1.4/M1.5 (soft weights, eta box, T_MIN 0.2); 6 = G0.2 runtime
  * row-spacing shift (cs_solver_set_row_offset) + the cs_rh receding-horizon
  * wrapper layer (cs_rh.h). ABI 7 adds cs_solver_set_ref (R5-proximity
- * reference tracking). */
-#define CS_ABI_VERSION 9
+ * reference tracking). ABI 10 adds ref mode 3 (normal-only path tube). */
+#define CS_ABI_VERSION 10
 
 int cs_abi_version(void);
 int cs_real_size(void);                      /* sizeof(cs_real): 8=f64, 4=f32 */

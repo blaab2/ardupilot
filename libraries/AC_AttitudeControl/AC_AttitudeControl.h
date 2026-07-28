@@ -283,6 +283,16 @@ public:
     // Optional yaw slew limiting constrains the heading rate input.
     virtual void input_thrust_vector_rate_heading_rads(const Vector3f& thrust_vector, float heading_rate_rads, bool slew_yaw = true);
 
+    // Same as above, plus a body-frame tilt-rate feedforward (rad/s, expressed in the
+    // attitude-TARGET body frame). ang_vel_ff_body_rads.x/.y enter the roll/pitch attitude
+    // command model as the desired angular velocity the shaped target converges to (the same
+    // path heading_rate_rads uses for yaw); .z is IGNORED — yaw is commanded by
+    // heading_rate_rads alone. With ang_vel_ff_body_rads zero this is behaviourally identical
+    // to the overload above (which delegates here). Additive extension for the MPC trajectory
+    // replay: a jerk-bounded plan knows the thrust-vector angular velocity in advance, and
+    // feeding it forward removes the input-TC tracking lag on a moving thrust-vector target.
+    void input_thrust_vector_rate_heading_rads(const Vector3f& thrust_vector, float heading_rate_rads, const Vector3f& ang_vel_ff_body_rads, bool slew_yaw);
+
     // Sets the desired thrust vector, heading angle (radians), and heading rate input (radians/s).
     // Used when thrust direction (tilt) is commanded independently from yaw/heading.
     // Heading rate is constrained using the configured yaw slew rate limit (0 disables limiting).

@@ -43,6 +43,35 @@ static const uint8_t MPC_PRECONV_MAX_ITERS = 30;
 static const float MPC_PRECONV_TOL = 1.0e-4f;
 static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 
+// PLAN-TIME PINNING: pin each engaged re-solve at the REPLAY'S CURRENT
+// COMMANDED state (position/velocity) instead of the measured one, when the
+// command is fresh (<= 300 ms) and the vehicle is within the divergence
+// gate (2.0 m). Rationale (frozen-plan experiments, 07-24): the 10 Hz loop
+// re-anchors every plan at the lag-carrying measured state, converting
+// ordinary tracking lag into commanded slow-down (loop tempo gain < 1) —
+// the mechanism behind the non-first-turn shift/crop-cut. Pinning at the
+// commanded state gives the loop feedback in SPACE (divergence beyond the
+// gate re-anchors at the measured state — wind-class disturbances still
+// correct) without re-anchoring in TIME, and a plan solved from the
+// commanded state re-bases the replay timeline WITHOUT a jump (clock
+// continuity for free). a/chi were already plan-derived in build_x_meas;
+// only pos/vel change source. NOTE: while plan-pinned, the spiral/TSTALL
+// detector watches the commanded state, weakening forced-exit protection —
+// evaluate before real flights.
+#define MPC_PLAN_TIME_PIN 1
+#define MPC_PLAN_PIN_MAX_AGE_MS 300
+#define MPC_PLAN_PIN_MAX_DIV_M 2.0f
+
+// DIAGNOSTIC: freeze the plan one engaged cycle after engage — the first
+// cycle stages the bootstrap/accepted plan (its READY-converged iterate,
+// live-pinned at the engage state), then ALL further cycling stops and the
+// replay flies that single plan open-loop for the whole turn. t_rem() stays
+// valid (wall-clock extrapolation from the first accept). Separates the
+// per-cycle replan loop from execution/entry-state as the corruptor of
+// non-first turns. Spiral/forced-exit protection is OFF while frozen —
+// SITL experiments only.
+#define MPC_FREEZE_PLAN 0
+
 // base RTI iterations per rh cycle (the committed Step-E config is k=1;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
@@ -111,6 +140,7 @@ AP_MPCSolver::AP_MPCSolver() :
     _taken_seq(0),
     _next_cycle_ms(0),
     _last_cycle_snap_ms(0),
+    _pin_tgt_ms(0),
     _first_cycle(false),
     _pre_iters(0),
     _pre_step(0)
@@ -235,11 +265,15 @@ void AP_MPCSolver::disarm()
 
 float AP_MPCSolver::t_rem() const
 {
+    // keep in sync with MPC_REPLAY_TIME_SCALE in mpc_replay.cpp: the replay
+    // dilates the plan timeline by SCALE, so plan-time remaining ticks at
+    // 1/SCALE of wall clock (diagnostic; 1.0f = normal).
+    const float scale = 1.0f;
     WITH_SEMAPHORE(const_cast<HAL_Semaphore&>(_sem));
     if (_state != State::ENGAGED || !_have_accepted) {
         return nanf("");
     }
-    return _accepted_T - (AP_HAL::millis() - _accept_ms) * 1.0e-3f;
+    return _accepted_T - (AP_HAL::millis() - _accept_ms) * 1.0e-3f / scale;
 }
 
 bool AP_MPCSolver::exit_forced() const
@@ -339,6 +373,16 @@ bool AP_MPCSolver::read_snapshot(Snapshot &out) const
         }
     }
     return false;
+}
+
+void AP_MPCSolver::set_plan_pin_target(const Vector2f &pos_ne_m,
+                                       const Vector2f &vel_ne_ms,
+                                       uint32_t time_ms)
+{
+    WITH_SEMAPHORE(_sem);
+    _pin_tgt_pos_ne_m = pos_ne_m;
+    _pin_tgt_vel_ne_ms = vel_ne_ms;
+    _pin_tgt_ms = time_ms;
 }
 
 bool AP_MPCSolver::take_plan(Plan &out)
@@ -447,14 +491,13 @@ void AP_MPCSolver::thread_rearm()
         rc = cs_rh_set_frame_d(rh, d);
     }
     if (rc == CS_OK) {
-        // R5-proximity reference tracking (w=10 L2) — hold the onboard
-        // re-plan on the restretched R5 seed through the flat bulge<->time
-        // min-time manifold. Crop floor DISARMED while the second-turn
-        // rigid xi-shift is under diagnosis: the 2x2 translation fit showed
-        // the "collapse" is R5's exact shape displaced -1.5 m in xi
-        // (second-turn-specific, handedness-independent), so the crop
-        // symptoms were the shift, not solver greed. Floor machinery stays
-        // available via cs_rh_set_crop_bound once the shift is fixed.
+        // BASELINE config for the MPC_FREEZE_PLAN diagnostic: index-matched
+        // L2 pull w=10 (mode 1), as committed at 104d09a — the frozen-plan
+        // experiment isolates the replan loop, so the reference config is
+        // the baseline it is compared against. Tube alternative (ABI 10
+        // mode 3, w=30, hinge r0=0.25): `cs_rh_set_ref_tracking(rh, 30.0f,
+        // 3, 1.5f)` — flight ledger for both is in the memory notes. Crop
+        // floor still DISARMED (machinery via cs_rh_set_crop_bound).
         rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
     }
     if (rc != CS_OK) {
@@ -652,12 +695,45 @@ void AP_MPCSolver::thread_cycle()
         if (_state != State::ENGAGED) {
             return;
         }
+#if MPC_FREEZE_PLAN
+        if (!_first_cycle && _have_accepted) {
+            return;     // plan frozen: first engaged cycle staged + accepted
+        }
+#endif
         arm_generation = _arm_generation;
     }
     Snapshot snap;
     if (!read_snapshot(snap)) {
         return;
     }
+#if MPC_PLAN_TIME_PIN
+    {
+        // pin at the replay's commanded state when fresh and close (see the
+        // MPC_PLAN_TIME_PIN comment); otherwise fall through to the measured
+        // snapshot (event-triggered re-anchor)
+        Vector2f tp, tv;
+        uint32_t tms;
+        {
+            WITH_SEMAPHORE(_sem);
+            tp = _pin_tgt_pos_ne_m;
+            tv = _pin_tgt_vel_ne_ms;
+            tms = _pin_tgt_ms;
+        }
+        if (tms != 0 && snap.time_ms - tms <= MPC_PLAN_PIN_MAX_AGE_MS) {
+            const float div = Vector2f(snap.pos_n - tp.x,
+                                       snap.pos_e - tp.y).length();
+            if (div <= MPC_PLAN_PIN_MAX_DIV_M) {
+                snap.pos_n = tp.x;
+                snap.pos_e = tp.y;
+                snap.vel_n = tv.x;
+                snap.vel_e = tv.y;
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
+                              "MPC: pin re-anchor (d %.1f)", (double)div);
+            }
+        }
+    }
+#endif
     cs_rh *rh = (cs_rh *)_rh;
     float x_meas[6], xi_unused = 0;
     if (!build_x_meas(snap, x_meas, xi_unused)) {

@@ -142,6 +142,12 @@ private:
     // rate limiter for GUIP dataflash logging of the replayed target
     uint32_t _last_log_ms {0};
 
+    // Accepted-plan diagnostic snapshots: start()/each AUTO turn resets the
+    // schedule; commit_pending logs all plan nodes at 0, 3, 6, ... seconds.
+    uint32_t _plan_snapshot_start_ms {0};
+    uint32_t _plan_snapshot_next_ms {0};
+    uint8_t _plan_snapshot_id {0};
+
     // set by start()/stop(): a non-GUIDED mode (AUTO MpcTurn) is driving the replay
     bool _external_active {false};
 

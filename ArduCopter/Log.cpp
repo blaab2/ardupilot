@@ -369,6 +369,19 @@ struct PACKED log_MPC_Turn {
     float xi;               // canonical along-row position [m] (NaN if n/a)
 };
 
+// One node of a periodically sampled accepted AUTO MpcTurn plan. All nodes
+// sharing snapshot form the complete desired trajectory that was current at
+// that instant; dt_ms is its uniform node spacing.
+struct PACKED log_MPC_Plan {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t snapshot;
+    uint8_t node;
+    uint16_t dt_ms;
+    float pos_n;
+    float pos_e;
+};
+
 // Write a Guided mode position target
 // pos_target_ned_m is lat, lon, alt OR offset from ekf origin in m
 // terrain should be 0 if pos_target_ned_m.z is alt-above-ekf-origin, 1 if alt-above-terrain
@@ -429,6 +442,21 @@ void Copter::Log_Write_MPC_Turn(uint8_t event, uint16_t entry_idx, uint16_t exit
         mirror          : (uint8_t)(mirror ? 1 : 0),
         t_rem           : t_rem,
         xi              : xi
+    };
+    logger.WriteBlock(&pkt, sizeof(pkt));
+}
+
+// Write one node of an accepted MPC plan snapshot.
+void Copter::Log_Write_MPC_Plan(uint8_t snapshot, uint8_t node, uint16_t dt_ms, float pos_n, float pos_e)
+{
+    const log_MPC_Plan pkt {
+        LOG_PACKET_HEADER_INIT(LOG_MPC_PLAN_MSG),
+        time_us         : AP_HAL::micros64(),
+        snapshot        : snapshot,
+        node            : node,
+        dt_ms           : dt_ms,
+        pos_n           : pos_n,
+        pos_e           : pos_e
     };
     logger.WriteBlock(&pkt, sizeof(pkt));
 }
@@ -615,6 +643,18 @@ const struct LogStructure Copter::log_structure[] = {
 
     { LOG_MPC_TURN_MSG, sizeof(log_MPC_Turn),
       "MPCT", "QBHHfBff", "TimeUS,Ev,EIdx,XIdx,D,Mir,TRem,Xi", "s---m-sm", "F---0-00" , true },
+
+// @LoggerMessage: MPLN
+// @Description: One node of a periodically sampled accepted AUTO MpcTurn plan
+// @Field: TimeUS: Time since system startup
+// @Field: Snap: Snapshot number within the current turn
+// @Field: Node: Plan node index
+// @Field: Dt: Uniform plan node spacing
+// @Field: pN: Desired north position
+// @Field: pE: Desired east position
+
+        { LOG_MPC_PLAN_MSG, sizeof(log_MPC_Plan),
+            "MPLN", "QBBHff", "TimeUS,Snap,Node,Dt,pN,pE", "s--smm", "F--000" , true },
 
 };
 

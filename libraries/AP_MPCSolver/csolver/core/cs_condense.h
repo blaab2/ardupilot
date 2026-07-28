@@ -124,7 +124,13 @@ typedef struct {
      * defect); this anchors the deviation-from-reference instead. ref_mode:
      * 0 off (default, canonical problem bit-unchanged), 1 L2 (H+f), 2 L1-
      * surrogate (f += w_ref*E~'diag(lm_w) sign(r~) only, no curvature -- the
-     * conditioning-null comparison for the L1-vs-L2 sweep). x_ref/w_ref/
+     * conditioning-null comparison for the L1-vs-L2 sweep), 3 NORMAL-only
+     * path tube (ABI 10): per node, the signed distance from (xi_k, eta_k)
+     * to the nearest point of the x_ref (xi, eta) POLYLINE, penalized L2
+     * rank-1 along the local path normal only. Unlike modes 1/2 the residual
+     * cannot be re-anchored away by a rigid along-path translation (the
+     * flare-ratchet null direction): tangential progress and timing stay
+     * free, normal migration of the flare is priced in metres. x_ref/w_ref/
      * ref_mode set via cs_solver_set_ref. */
     cs_real w_ref;
     int ref_mode;
@@ -178,6 +184,7 @@ typedef struct {
     cs_real *e;        /* (N+1) * nx                                */
     cs_real *x_ref;    /* (N+1)*nx R5 reference states (phys units) */
     cs_real *rref;     /* nx scratch: scaled iterate-vs-ref residual */
+    cs_real *vref;     /* nz_max scratch: mode-3 normal-row Jacobian */
 
     /* scratch */
     cs_real *Ak, *Bk, *bTk, *xnext, *hk, *Jxk, *Juk, *jrow;
