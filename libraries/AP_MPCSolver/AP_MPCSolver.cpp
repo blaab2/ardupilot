@@ -624,24 +624,62 @@ void AP_MPCSolver::thread_main()
                 _next_cycle_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: engaged");
                 // ENGAGE-STAGE (re-anchor diagnosis, CUBE-BENCH-NOTES):
-                // stage the READY-converged iterate as a flyable plan NOW,
-                // anchored at the last READY-tracking pin's snapshot time
-                // (latency comp aligns the timeline). On target the first
-                // engaged solve can take >1 s; waiting for it (the old
-                // first-commit bootstrap) let the bridge expire into the
-                // Tier-2 zero-velocity hold and re-created the engage
-                // transient at speed. Staging here also feeds plan-time
-                // pinning from cycle one, so the first solve sees a small
-                // innovation instead of an escalation trigger.
+                // stage the READY-converged iterate as a flyable plan NOW.
+                // On target the first engaged solve can take >1 s; waiting
+                // for it (the old first-commit bootstrap) let the bridge
+                // expire into the Tier-2 zero-velocity hold and re-created
+                // the engage transient at speed. Staging also feeds
+                // plan-time pinning from cycle one, so the first solve
+                // sees a small innovation instead of an escalation trigger.
+                //
+                // ANCHOR BY PROJECTION, not by timestamps: the anchor's
+                // only job is to make the replay sample the plan AT the
+                // vehicle. Timestamp guesses encode assumptions about
+                // where the READY iterate's node 0 sits, and both guesses
+                // tried were wrong on target (pin-time anchoring sampled
+                // 1.1 s AHEAD - a measured 9.5 m command spike - because
+                // the iterate stays on the seed frame at the engage gate).
+                // Project the live snapshot onto the plan's canonical
+                // polyline instead and back the anchor off by tau* T.
                 float T_cur = 0;
+                Snapshot snap_now;
                 if (cs_solver_get_iterate(_solver, _X, _U, &T_cur) == CS_OK &&
-                    T_cur > 0.5f) {
+                    T_cur > 0.5f && read_snapshot(snap_now)) {
                     bool sane = true;
                     for (uint16_t k = 0; k <= PLAN_N && sane; k++) {
                         const float v = _X[k * 6 + 0];
                         const float eta = _X[k * 6 + 3];
                         sane = isfinite(v) && v >= 0.0f && v < 20.0f &&
                                isfinite(eta) && fabsf(eta) < 40.0f;
+                    }
+                    // project the vehicle's canonical position onto the
+                    // plan polyline (fractional node index -> tau*)
+                    float vv, ppsi, pxi, peta;
+                    world_to_canonical(snap_now, vv, ppsi, pxi, peta);
+                    float best_d2 = FLT_MAX, tau_star = 0.0f;
+                    for (uint16_t k = 0; k < PLAN_N; k++) {
+                        const float ax = _X[k * 6 + 2], ay = _X[k * 6 + 3];
+                        const float bx = _X[(k + 1) * 6 + 2];
+                        const float by = _X[(k + 1) * 6 + 3];
+                        const float dx = bx - ax, dy = by - ay;
+                        const float L2 = MAX(dx * dx + dy * dy, 1.0e-9f);
+                        const float sseg = constrain_float(
+                            ((pxi - ax) * dx + (peta - ay) * dy) / L2,
+                            0.0f, 1.0f);
+                        const float ex = pxi - (ax + sseg * dx);
+                        const float ey = peta - (ay + sseg * dy);
+                        const float d2 = ex * ex + ey * ey;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            tau_star = (float(k) + sseg) / float(PLAN_N);
+                        }
+                    }
+                    tau_star = constrain_float(tau_star, 0.0f, 0.9f);
+                    // if the vehicle is not actually near the READY plan,
+                    // staging it would command a jump - decline and let
+                    // the bridge + first-cycle bootstrap handle engage
+                    if (best_d2 > 9.0f) {
+                        sane = false;
                     }
                     uint32_t gen;
                     {
@@ -650,8 +688,8 @@ void AP_MPCSolver::thread_main()
                     }
                     Snapshot anchor;
                     memset(&anchor, 0, sizeof(anchor));
-                    anchor.time_ms = (_track_snap_ms != 0) ? _track_snap_ms
-                                                           : now;
+                    anchor.time_ms = snap_now.time_ms -
+                        uint32_t(tau_star * T_cur * 1000.0f);
                     if (sane && stage_plan(_X, T_cur, anchor, gen)) {
                         _first_cycle = false;   // this IS the bootstrap
                         {
@@ -661,9 +699,10 @@ void AP_MPCSolver::thread_main()
                             _have_accepted = true;
                         }
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "MPC: engage-staged (T %.1f age %u)",
-                                      (double)T_cur,
-                                      unsigned(now - anchor.time_ms));
+                                      "MPC: engage-staged (T %.1f tau %.2f "
+                                      "d %.1f)", (double)T_cur,
+                                      (double)tau_star,
+                                      (double)sqrtf(best_d2));
                     }
                 }
             }
