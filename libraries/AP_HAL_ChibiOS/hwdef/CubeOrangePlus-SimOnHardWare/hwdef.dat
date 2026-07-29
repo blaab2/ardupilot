@@ -13,3 +13,9 @@ define CHIBIOS_SHORT_BOARD_NAME "CubeOrange+SimOnHW"
 define AP_BOOTLOADER_FLASHING_ENABLED 0
 
 AUTOBUILD_TARGETS Copter
+
+# embedded SN77 vehicle model: physics parity with the host-SITL harness
+# (scripts/sitl_validation/SN77.json is the source of truth; SIM_Frame
+# loads @ROMFS/models/<json> when the frame string carries ":<json>")
+ROMFS models/SN77.json libraries/AP_HAL_ChibiOS/hwdef/CubeOrangePlus-SimOnHardWare/SN77.json
+define AP_SIM_FRAME_STRING "+:SN77.json"

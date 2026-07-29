@@ -476,15 +476,16 @@ void Frame::load_frame_params(const char *model_json)
     if (AP::FS().stat(model_json, &st) == 0) {
         fname = strdup(model_json);
     } else {
+        // fall back to the ROMFS-embedded copy (sim-on-hardware: no cwd,
+        // usually no SD). Upstream checked and loaded model_json here
+        // instead of the constructed fname, so the fallback could never
+        // succeed and boot-looped the board via panic.
         IGNORE_RETURN(asprintf(&fname, "@ROMFS/models/%s", model_json));
-        if (AP::FS().stat(model_json, &st) != 0) {
+        if (fname == nullptr || AP::FS().stat(fname, &st) != 0) {
             AP_HAL::panic("%s failed to load", model_json);
         }
     }
-    if (fname == nullptr) {
-        AP_HAL::panic("%s failed to load", model_json);
-    }
-    AP_JSON::value *obj = AP_JSON::load_json(model_json);
+    AP_JSON::value *obj = AP_JSON::load_json(fname);
     if (obj == nullptr) {
         AP_HAL::panic("%s failed to load", model_json);
     }

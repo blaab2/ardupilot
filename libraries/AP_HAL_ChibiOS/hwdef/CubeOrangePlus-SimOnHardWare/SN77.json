@@ -1,0 +1,27 @@
+# SN77 SITL multicopter model (SIM_Frame). Drag calibrated to SN77's identified operating point
+# (refSpd/refAngle → k/m=0.0180, cruise ~11.8 m/s at 14.33° lean) and hoverThrOut=0.205 = the real
+# SN77 hover throttle (T/W max ~4.9, matching the vehicle's thrust margin — was 0.30 = SN67-ish).
+{
+    "mass" : 6.55,
+    "diagonal_size" : 1.1,
+    "refSpd" : 11.8,
+    "refAngle" : 14.33,
+    "refVoltage" : 24.0,
+    "refCurrent" : 21.6,
+    "refAlt" : 270,
+    "refTempC" : 25,
+    "refBatRes" : 0.008,
+    "maxVoltage" : 25.2,
+    "battCapacityAh" : 10.0,
+    "propExpo" : 0.68,
+    "refRotRate" : 120,
+    "hoverThrOut" : 0.205,
+    "pwmMin" : 1000,
+    "pwmMax" : 2000,
+    "spin_min" : 0.15,
+    "spin_max" : 1.0,
+    "slew_max" : 0,
+    "disc_area" : 1.207,
+    "mdrag_coef" : 0.2,
+    "num_motors" : 4
+}
