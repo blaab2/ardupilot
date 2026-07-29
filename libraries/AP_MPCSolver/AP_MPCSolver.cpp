@@ -80,14 +80,26 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
 
-// WCET bench build (M5): at boot, on the MPC thread, load the mid-band seed
-// and time ARMED-style solver iterations plus full ENGAGED rh cycles, then
-// re-broadcast the results (and the exact arena sizes) every 5 s — the
-// one-shot boot statustexts are emitted before a USB host can connect and
-// are lost. The dirtied solver state is irrelevant: arm_turn re-seeds via
-// thread_rearm. NEVER leave enabled for flight builds.
+// WCET bench build (M5, v2): at boot, on the MPC thread, run ARMED-style
+// preconvergence then replay the RECORDED flight cycle sequence
+// (mpc_bench_seq.h — a real turn's per-cycle x_meas/dt from the MPCC/MPCP
+// telemetry, so cycle times cover a realistic work profile) plus a few
+// large-innovation STRESS cycles driving the escalation/reject/recovery
+// paths a nominal flight never exercises. EVERY sample is retained and
+// dumped as chunked MPCB2 statustexts, re-broadcast every 10 s (one-shot
+// boot statustexts are emitted before a USB host can connect and are
+// lost). Capture host-side with scripts/mpc/experiments/cube_bench_v2.py
+// (multi-boot). The dirtied solver state is irrelevant: arm_turn re-seeds
+// via thread_rearm. NEVER leave enabled for flight builds.
 #ifndef MPC_BENCH_WCET
 #define MPC_BENCH_WCET 0
+#endif
+#if MPC_BENCH_WCET
+#include "mpc_bench_seq.h"
+// stress cycles appended after the recorded sequence: growing canonical
+// innovation from the last recorded state (the flight sequence is
+// all-accepted; these force the expensive fallback/recovery machinery)
+#define MPC_BENCH_STRESS_N 5
 #endif
 
 const AP_Param::GroupInfo AP_MPCSolver::var_info[] = {
@@ -442,87 +454,137 @@ void AP_MPCSolver::thread_main()
         }
 #if MPC_BENCH_WCET
         {
-            static bool bench_done;
-            static char bench_line[3][50];
+            // v2 bench (see the gate comment at the top of this file):
+            // per-sample retention, recorded flight sequence, stress tail.
+            // INCREMENTAL: one setup step / one iterate / one cycle per
+            // thread pass, so the paced dump below keeps streaming even if
+            // a solver call hangs - everything recorded so far still gets
+            // out, and the header's counts identify the hanging call.
+            static uint8_t bench_phase;      // 0 setup, 1 pre, 2 cyc,
+                                             // 3 done, 4 failed
+            static uint8_t n_pre, n_cyc;
+            static uint32_t t_pre[MPC_PRECONV_MAX_ITERS];
+            static uint32_t t_cyc[BENCH_SEQ_N + MPC_BENCH_STRESS_N];
+            // per-cycle code: bit0 accepted, bits1.. event (CS_RH_EVENT_*);
+            // 0xE = cs_rh_step returned an error on this cycle
+            static uint8_t c_cyc[BENCH_SEQ_N + MPC_BENCH_STRESS_N];
             static uint32_t bench_sent_ms;
-            if (!bench_done) {
-                bench_done = true;
-                cs_rh *rh = (cs_rh *)_rh;
+            cs_rh *rh = (cs_rh *)_rh;
+            if (bench_phase == 0) {
                 uint8_t sel = 0;
                 for (uint8_t i = 1; i < CS_SEED_FAMILY_COUNT; i++) {
-                    if (fabsf(cs_seed_d[i] - 14.0f) <
-                        fabsf(cs_seed_d[sel] - 14.0f)) {
+                    if (fabsf(cs_seed_d[i] - BENCH_SEQ_D) <
+                        fabsf(cs_seed_d[sel] - BENCH_SEQ_D)) {
                         sel = i;
                     }
                 }
                 int rc = cs_rh_init(rh, _solver, cs_seed_X[sel],
                                     cs_seed_T[sel], PLAN_N, MPC_K_ITERS);
                 if (rc == CS_OK) {
-                    rc = cs_rh_set_frame_d(rh, 14.0f);
+                    rc = cs_rh_set_frame_d(rh, BENCH_SEQ_D);
                 }
                 if (rc == CS_OK) {
                     rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
                 }
-                if (rc != CS_OK) {
-                    snprintf(bench_line[0], sizeof(bench_line[0]),
-                             "MPCB setup failed rc %d", rc);
+                bench_phase = (rc == CS_OK) ? 1 : 4;
+            } else if (bench_phase == 1) {
+                // ARMED preconvergence, one iterate per pass (sample 0 is
+                // the cold cache - kept, it is a real boot cost)
+                const uint32_t t0 = AP_HAL::micros();
+                if (cs_solver_iterate(_solver) != CS_OK) {
+                    bench_phase = 4;
                 } else {
-                    // phase 1: ARMED preconvergence iterations (cold->warm)
-                    uint32_t mn = UINT32_MAX, mx = 0, sum = 0;
-                    uint8_t n = 0;
-                    for (uint8_t i = 0; i < MPC_PRECONV_MAX_ITERS; i++) {
-                        const uint32_t t0 = AP_HAL::micros();
-                        if (cs_solver_iterate(_solver) != CS_OK) {
-                            break;
-                        }
-                        const uint32_t dt = AP_HAL::micros() - t0;
-                        mn = MIN(mn, dt); mx = MAX(mx, dt); sum += dt; n++;
+                    t_pre[n_pre++] = AP_HAL::micros() - t0;
+                    if (n_pre >= MPC_PRECONV_MAX_ITERS) {
+                        bench_phase = 2;
                     }
-                    snprintf(bench_line[0], sizeof(bench_line[0]),
-                             "MPCB it n%u mn%u av%u mx%u us", unsigned(n),
-                             unsigned(mn), unsigned(n ? sum / n : 0),
-                             unsigned(mx));
-                    // phase 2: ENGAGED rh cycles, flying the accepted plan
-                    // node-to-node as x_meas (perfect tracking; first call
-                    // dt=0 like thread_cycle)
-                    float T_cur = 0;
-                    float x_meas[6];
-                    cs_solver_get_iterate(_solver, _X, _U, &T_cur);
-                    memcpy(x_meas, &_X[0], sizeof(x_meas));
-                    const float dt_s = T_cur / float(PLAN_N);
-                    mn = UINT32_MAX; mx = 0; sum = 0; n = 0;
-                    uint8_t nacc = 0;
-                    for (uint8_t i = 0; i < 16; i++) {
-                        float T_plan = 0, T_rem_b = 0;
-                        int accepted = 0, event = CS_RH_EVENT_NONE;
-                        const uint32_t t0 = AP_HAL::micros();
-                        rc = cs_rh_step(rh, x_meas, (i == 0) ? 0.0f : dt_s,
-                                        _X, _U, &T_plan, &T_rem_b,
-                                        &accepted, &event);
-                        const uint32_t dt = AP_HAL::micros() - t0;
-                        if (rc != CS_OK) {
-                            break;
-                        }
-                        mn = MIN(mn, dt); mx = MAX(mx, dt); sum += dt; n++;
-                        nacc += (accepted != 0);
-                        memcpy(x_meas, &_X[6], sizeof(x_meas));
-                    }
-                    snprintf(bench_line[1], sizeof(bench_line[1]),
-                             "MPCB rh n%u a%u mn%u av%u mx%u us",
-                             unsigned(n), unsigned(nacc), unsigned(mn),
-                             unsigned(n ? sum / n : 0), unsigned(mx));
-                    snprintf(bench_line[2], sizeof(bench_line[2]),
-                             "MPCB arena %u rh %u B", unsigned(_arena_bytes),
-                             unsigned(cs_rh_sizeof()));
+                }
+            } else if (bench_phase == 2) {
+                // one recorded-sequence or stress cycle per pass
+                const uint8_t k = n_cyc;
+                float x_meas[6];
+                float dt_s;
+                if (k < BENCH_SEQ_N) {
+                    memcpy(x_meas, bench_seq_xmeas[k], sizeof(x_meas));
+                    dt_s = bench_seq_dt[k];
+                } else {
+                    // stress tail: growing canonical innovation from the
+                    // last recorded state (clamps mirror build_x_meas)
+                    const uint8_t j = k - BENCH_SEQ_N + 1;
+                    memcpy(x_meas, bench_seq_xmeas[BENCH_SEQ_N - 1],
+                           sizeof(x_meas));
+                    x_meas[0] = constrain_float(x_meas[0] - 0.5f * j,
+                                                MPC_V_MIN + 1.0e-3f,
+                                                MPC_V_INF - 5.0e-3f);
+                    x_meas[2] -= 0.8f * j;                  // xi back
+                    x_meas[3] = MAX(x_meas[3] +
+                                    ((j & 1) ? 0.6f : -0.6f) * j,
+                                    -5.0f);                 // eta zigzag
+                    dt_s = 0.25f;
+                }
+                float T_plan = 0, T_rem_b = 0;
+                int accepted = 0, event = CS_RH_EVENT_NONE;
+                const uint32_t t0 = AP_HAL::micros();
+                const int rc = cs_rh_step(rh, x_meas,
+                                          (k == 0) ? 0.0f : dt_s,
+                                          _X, _U, &T_plan, &T_rem_b,
+                                          &accepted, &event);
+                t_cyc[n_cyc] = AP_HAL::micros() - t0;
+                c_cyc[n_cyc] = (rc != CS_OK)
+                    ? 0xE
+                    : uint8_t((accepted ? 1 : 0) |
+                              (unsigned(event) << 1));
+                n_cyc++;
+                if (n_cyc >= BENCH_SEQ_N + MPC_BENCH_STRESS_N) {
+                    bench_phase = 3;
                 }
             }
+            // paced round-robin dump: ONE line per 300 ms tick (a burst
+            // overflows the GCS statustext queue), cycling header -> pre
+            // chunks -> cyc chunks -> code string; runs from the first
+            // pass on, so partial data streams even mid-bench
             const uint32_t bench_now = AP_HAL::millis();
-            if (bench_now - bench_sent_ms >= 5000) {
+            if (bench_now - bench_sent_ms >= 300) {
                 bench_sent_ms = bench_now;
-                for (uint8_t i = 0; i < 3; i++) {
-                    if (bench_line[i][0] != '\0') {
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s", bench_line[i]);
+                static uint8_t dump_idx;
+                char line[50];
+                if (bench_phase == 4) {
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPCB2 failed");
+                } else {
+                    const uint8_t n_pl = (n_pre + 3) / 4;
+                    const uint8_t n_cl = (n_cyc + 3) / 4;
+                    const uint8_t n_lines = 1 + n_pl + n_cl + 1;
+                    const uint8_t li = dump_idx++ % n_lines;
+                    if (li == 0) {
+                        snprintf(line, sizeof(line),
+                                 "MPCB2 h f%u p%u c%u d%.1f a%u r%u",
+                                 unsigned(bench_phase), unsigned(n_pre),
+                                 unsigned(n_cyc), (double)BENCH_SEQ_D,
+                                 unsigned(_arena_bytes),
+                                 unsigned(cs_rh_sizeof()));
+                    } else if (li <= n_pl + n_cl) {
+                        const bool is_pre = li <= n_pl;
+                        const uint8_t base = (is_pre ? (li - 1)
+                                                     : (li - 1 - n_pl)) * 4;
+                        const uint8_t n = is_pre ? n_pre : n_cyc;
+                        const uint32_t *ts = is_pre ? t_pre : t_cyc;
+                        int len = snprintf(line, sizeof(line),
+                                           "MPCB2 %c%02u",
+                                           is_pre ? 'p' : 'c',
+                                           unsigned(base));
+                        for (uint8_t i = base; i < MIN(base + 4, n); i++) {
+                            len += snprintf(line + len, sizeof(line) - len,
+                                            " %u", unsigned(ts[i]));
+                        }
+                    } else {
+                        int len = snprintf(line, sizeof(line), "MPCB2 e ");
+                        for (uint8_t i = 0; i < n_cyc; i++) {
+                            len += snprintf(line + len, sizeof(line) - len,
+                                            "%X", unsigned(c_cyc[i]));
+                        }
+                        (void)len;
                     }
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "%s", line);
                 }
             }
         }
