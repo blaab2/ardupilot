@@ -27,6 +27,14 @@
 // 0 = bit-identical to the original input_thrust_vector_heading() hand-off.
 #define MPC_TILT_RATE_FF 0
 
+// Engage-handover bridge lifetime: how long start() continues the pre-engage
+// desired state (constant velocity) while waiting for the first plan commit
+// before conceding to the Tier-2 station-keep hold. The first engaged cycle
+// solves immediately; on the flight target one rh cycle is ~250 ms, so 800 ms
+// covers a cycle re-pace plus commit latency with margin while still bounding
+// how far an undelivered plan can let the vehicle coast (~9 m at cruise).
+#define MPC_BRIDGE_TIMEOUT_MS 800
+
 /*
  * MPCTrajReplay — implementation. This is the Step-E GUIDED TrajStream code
  * moved verbatim out of mode_guided.cpp (semantics preserved bit-for-bit;
@@ -199,6 +207,19 @@ bool MPCTrajReplay::replay_active() const
 // trajectory RAW (no S-curve)
 void MPCTrajReplay::start()
 {
+    // Engage-handover bridge: capture the CURRENT desired state — what the
+    // previous stage (WPNav on the AUTO path) commanded last loop — before
+    // the controller inits below re-seed the targets from the estimate.
+    // run() continues this state until the first plan commit, and the accel
+    // FF blend below slews from this accel into the plan's.
+    _bridge_pos_ne_m = copter.pos_control->get_pos_desired_NED_m().xy();
+    _bridge_vel_ne_ms = copter.pos_control->get_vel_desired_NED_ms().xy();
+    _bridge_accel_ne_mss = copter.pos_control->get_accel_desired_NED_mss().xy();
+    _bridge_active = true;
+    _bridge_start_ms = millis();
+    _blend_active = true;
+    _blend_accel_ne_mss = _bridge_accel_ne_mss;
+
     // size the horizontal speed/accel envelope to cover the MPC plan
     // (>=12 m/s, accel >= g*tan(35deg) ~ 6.9 m/s/s) so the raw feed is not clamped
     const float ne_speed_ms = MAX(copter.wp_nav->get_default_speed_NE_ms(), 12.0f);
@@ -246,6 +267,8 @@ void MPCTrajReplay::start()
 void MPCTrajReplay::stop()
 {
     _external_active = false;
+    _bridge_active = false;
+    _blend_active = false;
 }
 
 // replay controller — call from the owning mode's run() at the main loop
@@ -280,15 +303,34 @@ void MPCTrajReplay::run()
 #endif
 
     float posN, posE, velN, velE, accN, accE;
+    bool bridging = false;
     if (_traj.active_n == 0 ||
         age_ms > (uint32_t)(_traj.duration_ms() * MPC_REPLAY_TIME_SCALE) +
                  copter.mode_guided.get_timeout_ms()) {
+        // no FRESH trajectory: either nothing committed since start() (the
+        // engage gap) or a mid-flight staleness failsafe
+        if (_bridge_active &&
+            now_ms - _bridge_start_ms < MPC_BRIDGE_TIMEOUT_MS) {
+            // engage-handover bridge: continue the pre-engage desired state
+            // (constant velocity, held accel FF) until the first plan commit.
+            // The zero-velocity hold this replaces fed the PID an ~11 m/s
+            // phantom velocity error for the pre-commit tick(s) — the engage
+            // attitude-snap transient (~150 deg/s commanded).
+            bridging = true;
+            const float dt_s = (now_ms - _bridge_start_ms) * 0.001f;
+            pos_ned_m.xy() = _bridge_pos_ne_m +
+                             (_bridge_vel_ne_ms * dt_s).topostype();
+            vel_ned_ms.xy() = _bridge_vel_ne_ms;
+            accel_ned_mss.xy() = _bridge_accel_ne_mss;
+            _blend_accel_ne_mss = _bridge_accel_ne_mss;  // keep blend seeded
+        } else {
         // Tier-2 failsafe: no trajectory yet, or the plan finished replaying and
         // no fresh solution arrived within the timeout on top of the plan's own
         // duration (a valid long plan must never be cut mid-replay). Station-keep
         // at the position captured when the hold engaged - re-pinning to the live
         // estimate every loop would drift with the estimate instead of holding.
         // Stay in-submode so a fresh trajectory resumes replay instantly.
+        _bridge_active = false;
         if (!_hold_active) {
             _hold_active = true;
             _hold_pos_ne_m = copter.pos_control->get_pos_estimate_NED_m().xy();
@@ -296,7 +338,9 @@ void MPCTrajReplay::run()
         pos_ned_m.xy() = _hold_pos_ne_m;
         vel_ned_ms.zero();
         accel_ned_mss.zero();
+        }
     } else {
+        _bridge_active = false;     // a fresh plan is replaying
         // Tier-1: sample the buffered trajectory at true elapsed time (holds the
         // final node past the end until a new trajectory arrives).
         _hold_active = false;
@@ -355,6 +399,26 @@ void MPCTrajReplay::run()
 #endif
     }
 
+    // engage-handover accel-FF jerk blend: the WPNav->plan source switch
+    // steps the kinematic accel FF discontinuously (the plan's jerk bound
+    // governs only WITHIN a plan; at engage the plan already wants ~3 m/s^2
+    // of braking). Slew the commanded FF toward the sampled target at PSC's
+    // own shaping jerk (PSC_JERK_XY — the same bound the plan honors) until
+    // caught up, then feed raw again. Drag-FF and P/PID are untouched.
+    if (_blend_active && !bridging) {
+        const Vector2f tgt_accel_ne_mss = accel_ned_mss.xy();
+        Vector2f delta = tgt_accel_ne_mss - _blend_accel_ne_mss;
+        const float step = copter.pos_control->get_shaping_jerk_NE_msss() *
+                           copter.pos_control->get_dt_s();
+        const float dist = delta.length();
+        if (dist <= step || !is_positive(step)) {
+            _blend_active = false;      // caught up: raw plan FF from here
+        } else {
+            _blend_accel_ne_mss += delta * (step / dist);
+            accel_ned_mss.xy() = _blend_accel_ne_mss;
+        }
+    }
+
     // drag-aware lean map: refresh the thrust-side drag feed-forward from the
     // measured velocity (k/m from the committed trajectory; 0 disables). The
     // streamed accelerations stay kinematic (= velocity-reference derivative);
@@ -371,9 +435,11 @@ void MPCTrajReplay::run()
 
 #if AP_MPCSOLVER_ENABLED
     // plan-time pinning feed: the commanded target just fed to PSC, but only
-    // while actually replaying a trajectory (Tier-2 hold must NOT pin the
-    // solver to a station-keep target)
-    if (!_hold_active && _traj.active_n > 0) {
+    // while actually replaying a trajectory or bridging the engage gap (the
+    // bridge target is the moving commanded state, so the FIRST engaged
+    // solve pins at it — entry continuity at the source; Tier-2 hold must
+    // still NOT pin the solver to a station-keep target)
+    if (!_hold_active && (_traj.active_n > 0 || bridging)) {
         copter.mpc_solver.set_plan_pin_target(pos_ned_m.xy().tofloat(),
                                               vel_ned_ms.xy(), now_ms);
     }

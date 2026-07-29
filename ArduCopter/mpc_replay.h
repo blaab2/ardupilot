@@ -139,6 +139,25 @@ private:
     bool _hold_active {false};
     Vector2p _hold_pos_ne_m;
 
+    // Engage-handover bridge: the pre-start() desired state (captured BEFORE
+    // the controller init re-seeds the targets from the estimate) is
+    // continued at constant velocity until the first plan commit, instead of
+    // the zero-velocity Tier-2 hold that kicked the velocity PID with the
+    // full cruise speed for the pre-commit tick(s). Expires into the normal
+    // Tier-2 hold if no plan arrives in time.
+    bool _bridge_active {false};
+    uint32_t _bridge_start_ms {0};
+    Vector2p _bridge_pos_ne_m;
+    Vector2f _bridge_vel_ne_ms;
+    Vector2f _bridge_accel_ne_mss;
+
+    // Engage-handover accel-FF jerk blend: the WPNav->plan source switch
+    // steps the kinematic accel FF discontinuously (the plan's jerk bound
+    // governs only within a plan); the commanded FF slews toward the sampled
+    // target at PSC's shaping jerk until caught up, then feeds raw again
+    bool _blend_active {false};
+    Vector2f _blend_accel_ne_mss;
+
     // rate limiter for GUIP dataflash logging of the replayed target
     uint32_t _last_log_ms {0};
 
