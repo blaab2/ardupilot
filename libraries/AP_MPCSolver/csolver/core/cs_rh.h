@@ -21,10 +21,10 @@
  *  1. SpiralDetector update from the measured state, BEFORE the solve
  *     (recovery must solve from the reference-family seed, not the degraded
  *     iterate):
- *       DEEP    reference-speed deficit > 1.5 m/s for 3 consecutive cycles,
+ *       DEEP    reference-speed deficit > 1.5 m/s sustained 0.75 s,
  *               progress tau in (0.05, 0.97)  -> reseed from the init seed
  *               restretched to tau (event CS_RH_EVENT_RESEED)
- *       TSTALL  accepted-plan T_rem drop < 0.03 s for 8 consecutive cycles,
+ *       TSTALL  accepted-plan T_rem drop < 0.03 s sustained 2.0 s,
  *               T_rem <= 1.5, tau >= 0.6      -> the vehicle is at/past the
  *               window exit: report CS_RH_EVENT_EXIT_FORCED and DO NOT
  *               solve — the caller performs the handback (both rules force
@@ -114,7 +114,7 @@ typedef struct {
     cs_real tau0;                /* cumulative shrinking-horizon progress  */
 
     /* SpiralDetector state */
-    int c_deep, c_stall;
+    cs_real c_deep_s, c_stall_s;   /* time-based protection windows */
     cs_real prev_trem;
     int prev_trem_valid;
     int recoveries;
@@ -149,6 +149,8 @@ typedef struct {
      * default (crop_bound=0) => canonical rh, rh_parity bit-unchanged. */
     int crop_bound;
     cs_real crop_margin;
+
+    int last_keff;               /* iterations run by the last step    */
 
     /* scratch (restretch / iterate readback) */
     cs_real Xs[(CS_RH_NMAX + 1) * 6];
@@ -223,6 +225,7 @@ int cs_rh_events(const cs_rh *rh, cs_rh_event *out, int max_events, int *n);
 
 cs_real cs_rh_progress(const cs_rh *rh);     /* cumulative tau0            */
 int cs_rh_last_reject(const cs_rh *rh);      /* CS_RH_REJ_* mask (0 = ok)  */
+int cs_rh_last_keff(const cs_rh *rh);        /* iterations run last step   */
 size_t cs_rh_sizeof(void);                   /* sizeof(cs_rh) for bindings */
 
 #endif /* CS_RH_H */

@@ -125,7 +125,8 @@ private:
     // replay clock to base_ms (with plausibility fallback to now), publish,
     // log the anchor node. auto_start_guided: enter GUIDED SubMode::TrajStream
     // if not already there (MAVLink path only). Returns false if fence-rejected.
-    bool commit_assembled(uint32_t time_boot_ms, bool auto_start_guided);
+    bool commit_assembled(uint32_t time_boot_ms, bool auto_start_guided,
+                          bool trusted_anchor);
 
     // true while the replay controller is the active controller (fence-check
     // altitude source selection: entry alt vs current estimate)

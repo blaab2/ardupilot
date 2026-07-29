@@ -29,11 +29,13 @@
 
 // Engage-handover bridge lifetime: how long start() continues the pre-engage
 // desired state (constant velocity) while waiting for the first plan commit
-// before conceding to the Tier-2 station-keep hold. The first engaged cycle
-// solves immediately; on the flight target one rh cycle is ~250 ms, so 800 ms
-// covers a cycle re-pace plus commit latency with margin while still bounding
-// how far an undelivered plan can let the vehicle coast (~9 m at cruise).
-#define MPC_BRIDGE_TIMEOUT_MS 800
+// before conceding to the Tier-2 station-keep hold. With ENGAGE-STAGING a
+// plan is committed within one main-loop tick and this is a pure fallback;
+// it is sized to outlive even a worst-case escalated first solve (measured
+// 1.1-1.7 s at the old K_INNOV=5 - the 800 ms first cut LOST that race and
+// re-created the zero-velocity engage transient at speed; re-anchor
+// diagnosis, CUBE-BENCH-NOTES). Coast bound at cruise: ~24 m.
+#define MPC_BRIDGE_TIMEOUT_MS 2000
 
 /*
  * MPCTrajReplay — implementation. This is the Step-E GUIDED TrajStream code
@@ -91,7 +93,7 @@ bool MPCTrajReplay::handle_chunk(uint16_t traj_id, uint16_t num_points, uint16_t
 
     // commit when every node up to the final one has been stored
     if (_traj.pending_next == _traj.pending_n) {
-        return commit_assembled(time_boot_ms, true);
+        return commit_assembled(time_boot_ms, true, false);
     }
 
     return false;
@@ -147,12 +149,12 @@ void MPCTrajReplay::commit_pending()
 #endif
     // no guided auto-start: the mode driving the onboard solver (AUTO
     // MpcTurn) owns its own replay submode entry (start()/run()/stop())
-    commit_assembled(plan.anchor_ms, false);
+    commit_assembled(plan.anchor_ms, false, true);
 #endif
 }
 
 // shared commit tail of both ingress paths (see mpc_replay.h)
-bool MPCTrajReplay::commit_assembled(uint32_t time_boot_ms, bool auto_start_guided)
+bool MPCTrajReplay::commit_assembled(uint32_t time_boot_ms, bool auto_start_guided, bool trusted_anchor)
 {
 #if AP_FENCE_ENABLED
     // parity with the stock guided setters: reject a plan that leaves the fence
@@ -173,7 +175,17 @@ bool MPCTrajReplay::commit_assembled(uint32_t time_boot_ms, bool auto_start_guid
     // solve+transport latency; fall back to arrival time if absent/implausible
     const uint32_t now_ms = millis();
     uint32_t base_ms = time_boot_ms;
-    if (base_ms == 0 || base_ms > now_ms || now_ms - base_ms > 1000) {
+    // Anchor plausibility: the MAVLink path's anchor crosses a transport
+    // link (1 s bound); the ONBOARD path's anchor is the solver's own
+    // snapshot on the same clock and is legitimately old - the
+    // engage-staged READY plan carries its last tracking pin's time
+    // (measured 1.0-1.4 s on target). Discarding such an anchor replays
+    // the plan from node 0 = anchor-age x speed behind the vehicle
+    // (measured: a 12 m commanded jump, sohw3t_v2 turn 2).
+    const uint32_t max_age_ms = trusted_anchor ? 3000 : 1000;
+    if (base_ms == 0 || base_ms > now_ms || now_ms - base_ms > max_age_ms) {
+        GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "MPC: anchor fallback (age %u)",
+                      unsigned(base_ms ? now_ms - base_ms : 0));
         base_ms = now_ms;
     }
     _traj.commit(base_ms);

@@ -227,6 +227,8 @@ private:
     uint8_t _pre_iters;         // preconverge bookkeeping
     float _track_xN[6];         // seed terminal pin for READY tracking
     uint32_t _last_track_ms;    // READY tracking cadence
+    uint32_t _track_snap_ms;    // snapshot time of the last READY tracking
+                                // pin — the engage-staged plan's anchor
     float _pre_step;
 };
 

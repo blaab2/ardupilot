@@ -13,9 +13,13 @@
 
 /* SpiralDetector tuning (sitl_closed_loop.py class SpiralDetector, CAND-2) */
 #define SP_DEEP_DFC ((cs_real)1.5)
-#define SP_DEEP_N 3
+/* protection windows are TIME-based (were cycle counts): on target the
+ * cycle period stretches under load (measured 0.25-1.9 s), so cycle
+ * counts mis-scaled the latch latency exactly when protection matters.
+ * Thresholds = the validated 4 Hz config's effective values. */
+#define SP_DEEP_S ((cs_real)0.75)
 #define SP_STALL_DT ((cs_real)0.03)
-#define SP_STALL_N 8
+#define SP_STALL_S ((cs_real)2.0)
 #define SP_STALL_TREM ((cs_real)1.5)
 #define SP_STALL_TAU ((cs_real)0.6)
 #define SP_TAU_LO ((cs_real)0.05)
@@ -34,8 +38,17 @@
 #define FE_TAU ((cs_real)0.95)
 #define FE_XI_PAD ((cs_real)0.3)
 #define INNOV_GATE ((cs_real)1.0)
-#define K_INNOV 5
-#define K_RECOV 10
+/* overridable (offline_escalation_ab.py builds variants). Defaults CAPPED
+ * from 5/10 per the offline A/B on the recorded SimOnHW stream: depth >2
+ * bought zero accepts while costing 1.51 s worst-case target cycles; the
+ * uncapped burst also outlived the engage bridge (re-anchor diagnosis,
+ * CUBE-BENCH-NOTES 2026-07-29). */
+#ifndef K_INNOV
+#define K_INNOV 2
+#endif
+#ifndef K_RECOV
+#define K_RECOV 3
+#endif
 /* READY-phase leg-gate relaxation (cs_rh_arm_ready_ref): large enough to
  * make the corridor leg gates inert for the pre-path warm start, far below
  * the gth slack trigger (relax/2 = 5e8) so no elastic machinery engages. */
@@ -184,7 +197,7 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
     rh->crop_bound = 0;                  /* R5-anchored crop floor off       */
     rh->crop_margin = (cs_real)0;
     rh->tau0 = (cs_real)0;
-    rh->c_deep = rh->c_stall = 0;
+    rh->c_deep_s = rh->c_stall_s = (cs_real)0;
     rh->prev_trem = (cs_real)0;
     rh->prev_trem_valid = 0;
     rh->recoveries = 0;
@@ -358,6 +371,11 @@ cs_real cs_rh_progress(const cs_rh *rh)
     return rh ? rh->tau0 : (cs_real)0;
 }
 
+int cs_rh_last_keff(const cs_rh *rh)
+{
+    return rh ? rh->last_keff : 0;
+}
+
 int cs_rh_last_reject(const cs_rh *rh)
 {
     return rh ? rh->last_reject : 0;
@@ -383,7 +401,7 @@ int cs_rh_events(const cs_rh *rh, cs_rh_event *out, int max_events, int *n)
 /* SpiralDetector.update: feed one TURN cycle's measured state + the current
  * accepted plan's T_rem; returns the fired rule (0 = none), tau via out. */
 static int spiral_update(cs_rh *rh, cs_real v, cs_real xi, cs_real eta,
-                         cs_real trem, cs_real *tau_out)
+                         cs_real trem, cs_real dt, cs_real *tau_out)
 {
     cs_real tau, dist, vref;
     int in_win, hit, rule = 0;
@@ -393,26 +411,26 @@ static int spiral_update(cs_rh *rh, cs_real v, cs_real xi, cs_real eta,
     rh->sp_tau = tau;
     rh->sp_dist = dist;
     in_win = (tau > SP_TAU_LO && tau < SP_TAU_HI);
-    rh->c_deep = (in_win && rh->sp_deficit > SP_DEEP_DFC)
-        ? rh->c_deep + 1 : 0;
+    rh->c_deep_s = (in_win && rh->sp_deficit > SP_DEEP_DFC)
+        ? rh->c_deep_s + dt : (cs_real)0;
     hit = (rh->prev_trem_valid && trem == trem
            && rh->prev_trem - trem < SP_STALL_DT
            && trem <= SP_STALL_TREM && tau >= SP_STALL_TAU);
-    rh->c_stall = hit ? rh->c_stall + 1 : 0;
+    rh->c_stall_s = hit ? rh->c_stall_s + dt : (cs_real)0;
     if (trem == trem) {
         rh->prev_trem = trem;
         rh->prev_trem_valid = 1;
     }
     if (rh->t_now >= rh->cool_until && rh->recoveries < SP_MAX_RECOV) {
-        if (rh->c_deep >= SP_DEEP_N)
+        if (rh->c_deep_s >= SP_DEEP_S)
             rule = CS_RH_RULE_DEEP;
-        else if (rh->c_stall >= SP_STALL_N)
+        else if (rh->c_stall_s >= SP_STALL_S)
             rule = CS_RH_RULE_TSTALL;
     }
     if (!rule)
         return 0;
     ++rh->recoveries;
-    rh->c_deep = rh->c_stall = 0;
+    rh->c_deep_s = rh->c_stall_s = (cs_real)0;
     rh->cool_until = rh->t_now + SP_COOLDOWN;
     if (rh->n_events < CS_RH_MAX_EVENTS) {
         cs_rh_event *e = &rh->events[rh->n_events++];
@@ -451,7 +469,7 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
     rh->last_reject = 0;
 
     /* ---- 1. spiral detection BEFORE the solve (CAND-2) ---- */
-    rule = spiral_update(rh, x_meas[0], x_meas[2], x_meas[3], trem_now,
+    rule = spiral_update(rh, x_meas[0], x_meas[2], x_meas[3], trem_now, dt,
                          &tau_r);
     if (rule) {
         if (tau_r > FE_TAU
@@ -609,6 +627,7 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
     rc = cs_solver_set_pins(rh->s, x_meas, rh->xN);
     if (rc != CS_OK)
         return rc;
+    rh->last_keff = k_eff;
     for (i = 0; i < k_eff; ++i) {
         rc = cs_solver_iterate(rh->s);
         if (rc != CS_OK)

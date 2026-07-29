@@ -94,6 +94,20 @@ static const int MPC_K_ITERS = 1;
 #ifndef MPC_BENCH_WCET
 #define MPC_BENCH_WCET 0
 #endif
+
+// LATENCY-INJECTION diagnostic (validation-ladder step B): pad every
+// solver call on this thread to the MEASURED H743 cost (v2 bench:
+// ~290 ms/iteration + ~60 ms rh overhead) so host SITL exhibits the
+// target's timing behavior - escalated-cycle gaps, engage-commit
+// latency, protection-window timing - with host-fast numerics. SITL
+// experiments only; NEVER for flight or SimOnHW builds.
+#ifndef MPC_SIM_SOLVE_LATENCY
+#define MPC_SIM_SOLVE_LATENCY 0
+#endif
+#if MPC_SIM_SOLVE_LATENCY
+static const uint32_t MPC_SIM_ITER_MS = 290;
+static const uint32_t MPC_SIM_OVERHEAD_MS = 60;
+#endif
 #if MPC_BENCH_WCET
 #include "mpc_bench_seq.h"
 // stress cycles appended after the recorded sequence: growing canonical
@@ -605,13 +619,53 @@ void AP_MPCSolver::thread_main()
             break;
         case State::ENGAGED:
             if (last_state != State::ENGAGED) {
-                // engage: the first cycle runs immediately and stages its
-                // returned accepted plan regardless of the accept flag (the
-                // harness's `not sent_traj` first-commit bootstrap)
                 _first_cycle = true;
                 _last_cycle_snap_ms = 0;
                 _next_cycle_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: engaged");
+                // ENGAGE-STAGE (re-anchor diagnosis, CUBE-BENCH-NOTES):
+                // stage the READY-converged iterate as a flyable plan NOW,
+                // anchored at the last READY-tracking pin's snapshot time
+                // (latency comp aligns the timeline). On target the first
+                // engaged solve can take >1 s; waiting for it (the old
+                // first-commit bootstrap) let the bridge expire into the
+                // Tier-2 zero-velocity hold and re-created the engage
+                // transient at speed. Staging here also feeds plan-time
+                // pinning from cycle one, so the first solve sees a small
+                // innovation instead of an escalation trigger.
+                float T_cur = 0;
+                if (cs_solver_get_iterate(_solver, _X, _U, &T_cur) == CS_OK &&
+                    T_cur > 0.5f) {
+                    bool sane = true;
+                    for (uint16_t k = 0; k <= PLAN_N && sane; k++) {
+                        const float v = _X[k * 6 + 0];
+                        const float eta = _X[k * 6 + 3];
+                        sane = isfinite(v) && v >= 0.0f && v < 20.0f &&
+                               isfinite(eta) && fabsf(eta) < 40.0f;
+                    }
+                    uint32_t gen;
+                    {
+                        WITH_SEMAPHORE(_sem);
+                        gen = _arm_generation;
+                    }
+                    Snapshot anchor;
+                    memset(&anchor, 0, sizeof(anchor));
+                    anchor.time_ms = (_track_snap_ms != 0) ? _track_snap_ms
+                                                           : now;
+                    if (sane && stage_plan(_X, T_cur, anchor, gen)) {
+                        _first_cycle = false;   // this IS the bootstrap
+                        {
+                            WITH_SEMAPHORE(_sem);
+                            _accepted_T = T_cur;
+                            _accept_ms = anchor.time_ms;
+                            _have_accepted = true;
+                        }
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "MPC: engage-staged (T %.1f age %u)",
+                                      (double)T_cur,
+                                      unsigned(now - anchor.time_ms));
+                    }
+                }
             }
             if (int32_t(now - _next_cycle_ms) >= 0) {
                 _next_cycle_ms += MPC_CYCLE_MS;
@@ -650,6 +704,7 @@ void AP_MPCSolver::thread_rearm()
                         PLAN_N, MPC_K_ITERS);
     memcpy(_track_xN, &cs_seed_X[sel][PLAN_N * 6], sizeof(_track_xN));
     _last_track_ms = 0;
+    _track_snap_ms = 0;
     if (rc == CS_OK) {
         rc = cs_rh_set_frame_d(rh, d);
     }
@@ -690,6 +745,9 @@ void AP_MPCSolver::thread_preconverge()
         if (cs_solver_iterate(_solver) != CS_OK) {
             break;
         }
+#if MPC_SIM_SOLVE_LATENCY
+        hal.scheduler->delay(MPC_SIM_ITER_MS);
+#endif
         cs_real step = 0, defect = 0, slack = 0, kappa = 0;
         int qp_status = 0, qp_iters = 0;
         if (cs_solver_get_info(_solver, &step, &defect, &slack, &kappa,
@@ -843,10 +901,14 @@ void AP_MPCSolver::thread_track()
     if (cs_solver_set_pins(_solver, x_meas, _track_xN) != CS_OK) {
         return;
     }
+    _track_snap_ms = snap.time_ms;
     for (uint8_t i = 0; i < 2; i++) {
         if (cs_solver_iterate(_solver) != CS_OK) {
             break;
         }
+#if MPC_SIM_SOLVE_LATENCY
+        hal.scheduler->delay(MPC_SIM_ITER_MS);
+#endif
     }
 }
 
@@ -913,6 +975,10 @@ void AP_MPCSolver::thread_cycle()
     int accepted = 0, event = CS_RH_EVENT_NONE;
     const int rc = cs_rh_step(rh, x_meas, dt_s, _X, _U, &T_plan,
                               &T_rem_out, &accepted, &event);
+#if MPC_SIM_SOLVE_LATENCY
+    hal.scheduler->delay(MPC_SIM_OVERHEAD_MS +
+                         MPC_SIM_ITER_MS * uint32_t(cs_rh_last_keff(rh)));
+#endif
     if (rc != CS_OK) {
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "MPC: rh_step failed (rc %d)", rc);
         return;
@@ -955,7 +1021,12 @@ void AP_MPCSolver::thread_cycle()
     // (max xi) and flare depth at eta=1.5 (interp), tau0, accept flag.
     {
         static uint8_t dbg_n;
-        if (_first_cycle) {
+        static uint32_t dbg_gen;
+        // keyed to the arm generation, NOT _first_cycle: engage-staging
+        // consumes the bootstrap flag before the first cycle runs, which
+        // silently disabled this telemetry for every non-first turn
+        if (dbg_gen != arm_generation) {
+            dbg_gen = arm_generation;
             dbg_n = 0;
         }
         if (dbg_n < 25) {
