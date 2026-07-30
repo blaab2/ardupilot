@@ -681,6 +681,20 @@ void AP_MPCSolver::thread_main()
                     if (best_d2 > 9.0f) {
                         sane = false;
                     }
+                    // corridor guard: never stage a plan whose row-to-row
+                    // crossing sits over the crop (xi < 0 mid-crossing).
+                    // The gate-anchored tracking redesign makes this
+                    // unreachable by construction; it stays as the safety
+                    // net for the invariant "only flight-legal shapes are
+                    // flown" (v4 turn 3 flew a gate-relaxed diagonal at
+                    // xi -7: CUBE-BENCH-NOTES correction 2026-07-30)
+                    for (uint16_t k = 0; k <= PLAN_N && sane; k++) {
+                        const float eta = _X[k * 6 + 3];
+                        if (eta > 2.0f && eta < _rec.d - 2.0f &&
+                            _X[k * 6 + 2] < -0.5f) {
+                            sane = false;
+                        }
+                    }
                     uint32_t gen;
                     {
                         WITH_SEMAPHORE(_sem);
@@ -742,6 +756,7 @@ void AP_MPCSolver::thread_rearm()
     int rc = cs_rh_init(rh, _solver, cs_seed_X[sel], cs_seed_T[sel],
                         PLAN_N, MPC_K_ITERS);
     memcpy(_track_xN, &cs_seed_X[sel][PLAN_N * 6], sizeof(_track_xN));
+    _seed_xi0 = cs_seed_X[sel][2];
     _last_track_ms = 0;
     _track_snap_ms = 0;
     if (rc == CS_OK) {
@@ -925,18 +940,21 @@ void AP_MPCSolver::thread_track()
         return;
     }
     _last_track_ms = now;
-    // align the armed R5 reference to the VEHICLE's progress before the
-    // live-pinned solve: the arm-time reference is anchored at tau0=0 (the
-    // seed start, xi=-18) while this pin sits up to 12 m earlier — the
-    // per-index pull then drags every node toward a further-along, SLOWER
-    // reference state and the tracked iterate learns a premature braking
-    // profile (flown: both turns at ~3 m/s six metres before the corner).
-    // cs_rh_arm_ready_ref restretches with the vehicle's (possibly
-    // negative) tau via exact backward extrapolation of the cruise
-    // approach segment — reference node 0 sits AT the vehicle.
-    if (cs_rh_arm_ready_ref((cs_rh *)_rh, x_meas) != CS_OK) {
-        return;
-    }
+    // GATE-ANCHORED tracking (redesign, 2026-07-30): the engage trigger IS
+    // the xi crossing, so at the only moment this iterate will ever be
+    // used the vehicle's along-row position is the handover point by
+    // definition. Converge the DEVIATIONS that are genuinely unknown at
+    // engage (eta settle residual, speed, heading branch, plan-carried
+    // a/theta) but pin xi at the SEED START. This keeps tau0 = 0 so the
+    // corridor leg gates stay REAL (no cs_rh_arm_ready_ref, no negative-
+    // tau restretch, no CS_RH_READY_RLX gate relaxation), the plan is
+    // never backward-stretched (T stays ~seed T), and the tracked iterate
+    // remains a real-gated seed-frame solution BY CONSTRUCTION - the
+    // engage-staged plan is then flight-legal without further checks.
+    // Predecessor design pinned at the live xi (-30..-18): the stretched,
+    // gate-relaxed re-solve migrated toward the min-time diagonal crop
+    // cut and v4 flew it (CUBE-BENCH-NOTES correction 2026-07-30).
+    x_meas[2] = _seed_xi0;
     if (cs_solver_set_pins(_solver, x_meas, _track_xN) != CS_OK) {
         return;
     }
