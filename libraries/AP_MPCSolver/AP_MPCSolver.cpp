@@ -498,7 +498,7 @@ void AP_MPCSolver::thread_main()
                     rc = cs_rh_set_frame_d(rh, BENCH_SEQ_D);
                 }
                 if (rc == CS_OK) {
-                    rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
+                    rc = cs_rh_set_ref_tracking(rh, 3.0f, 1, 1.5f);
                 }
                 bench_phase = (rc == CS_OK) ? 1 : 4;
             } else if (bench_phase == 1) {
@@ -763,14 +763,17 @@ void AP_MPCSolver::thread_rearm()
         rc = cs_rh_set_frame_d(rh, d);
     }
     if (rc == CS_OK) {
-        // BASELINE config for the MPC_FREEZE_PLAN diagnostic: index-matched
-        // L2 pull w=10 (mode 1), as committed at 104d09a — the frozen-plan
-        // experiment isolates the replan loop, so the reference config is
-        // the baseline it is compared against. Tube alternative (ABI 10
-        // mode 3, w=30, hinge r0=0.25): `cs_rh_set_ref_tracking(rh, 30.0f,
-        // 3, 1.5f)` — flight ledger for both is in the memory notes. Crop
-        // floor still DISARMED (machinery via cs_rh_set_crop_bound).
-        rc = cs_rh_set_ref_tracking(rh, 10.0f, 1, 1.5f);
+        // Index-matched L2 pull, mode 1, w=3 (was 10 through the SimOnHW
+        // campaign). The three-way lambda map (cert_lambda_map.py,
+        // CUBE-BENCH-NOTES) measured w=10 NON-contracting at the mid-family
+        // seed members (period-2 limit cycle, |lambda|>=0.97 at
+        // d=13.75..14.5, 36>30 iters even at 14.1) while w=3 contracts at
+        // ALL 10 members in 18-21 iters with |lambda|<=0.87 — and w~3 was
+        // already the over-bulge sweep's sufficient weight. Tube
+        // alternative (ABI 10 mode 3, hinge r0=0.25) is measured inert for
+        // preconvergence (dead-band contains the seed => identical to
+        // w=0). Crop floor still DISARMED (cs_rh_set_crop_bound).
+        rc = cs_rh_set_ref_tracking(rh, 3.0f, 1, 1.5f);
     }
     if (rc != CS_OK) {
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "MPC: frame load failed (rc %d)", rc);
