@@ -88,6 +88,26 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 // cycles) - SITL experiments only.
 #define MPC_SEED_ONLY 0
 
+// LAYER-2 WIND FEED (default 0 = wind-blind OCP, bit-identical): feed the
+// conditioned EKF wind estimate into the embedded OCP as the per-solve
+// (w_xi, w_eta) parameters (csolver ABI 11, cs_rh_set_wind; w = 0 selects
+// the calm expression DAG byte-identically). Conditioning is the Layer-0
+// pattern (mpc_replay.cpp wind_for_ff: availability bool, ~1 s low-pass,
+// 12 m/s clamp) implemented as a TWIN here — deliberately NOT shared with
+// mpc_replay's: the two consumers arm independently (MPC_WIND_FF is its own
+// gate with its own filter state) and cross-wiring them would couple the
+// lean-map FF to this gate's state. On top of Layer 0 this feed adds the
+// WIND-STEP MONITOR (see wind_ocp_update below): the wind A/B campaign
+// measured the estimate's failure mode as LAG on direction steps, not
+// noise. Fed once at arm (thread_rearm: ARMED preconvergence + READY
+// tracking then solve against it) and refreshed before every ENGAGED
+// cycle. NOTE: flying =1 in real wind needs the Layer-2 re-certification
+// stage first (active set changes under wind); =1 in calm air is
+// behavior-neutral within run noise (estimate ~0 -> calm DAG).
+#ifndef MPC_WIND_OCP
+#define MPC_WIND_OCP 0
+#endif
+
 // base RTI iterations per rh cycle (the committed Step-E config is k=1;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
@@ -170,6 +190,160 @@ static float wrap_near(float angle, float ref)
 {
     return ref + wrap_PI(angle - ref);
 }
+
+#if MPC_WIND_OCP
+// ---- Layer-2 OCP wind conditioning (main-loop writer / MPC-thread reader) --
+static const float WIND_OCP_CLAMP_MS = 12.0f;   // Layer-0 magnitude clamp
+static const float WIND_OCP_TAU_S    = 1.0f;    // Layer-0 ~1 s low-pass
+static const float WIND_OCP_STEP_MS  = 1.5f;    // step gate: |raw - filt| [m/s]
+static const float WIND_OCP_RAMP_S   = 3.0f;    // post-step re-feed ramp
+
+// filter/monitor state — written ONLY from the vehicle main loop (update())
+static Vector2f wind_ocp_filt_ne;       // ~1 s LPF of the clamped estimate
+static bool     wind_ocp_init;
+static uint32_t wind_ocp_last_ms;
+static bool     wind_ocp_step_active;
+static uint32_t wind_ocp_step_ms;
+static Vector2f wind_ocp_step_from_ne;  // fed value frozen at step detection
+static uint32_t wind_ocp_msg_ms;        // statustext rate limit
+
+// published FED wind, world NE (seqlock, same discipline as the state
+// snapshot: single main-loop writer, MPC-thread reader; odd seq = writing)
+static volatile uint32_t wind_ocp_seq;
+static Vector2f wind_ocp_fed_ne;
+
+static void wind_ocp_publish(const Vector2f &fed)
+{
+    const uint32_t s = wind_ocp_seq + 1;
+    __atomic_store_n(&wind_ocp_seq, s, __ATOMIC_RELEASE);
+    wind_ocp_fed_ne = fed;
+    __atomic_store_n(&wind_ocp_seq, s + 1, __ATOMIC_RELEASE);
+}
+
+static bool wind_ocp_read(Vector2f &out)
+{
+    for (uint8_t tries = 0; tries < 8; tries++) {
+        const uint32_t s1 = __atomic_load_n(&wind_ocp_seq, __ATOMIC_ACQUIRE);
+        if (s1 & 1U) {
+            continue;
+        }
+        out = wind_ocp_fed_ne;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        const uint32_t s2 = __atomic_load_n(&wind_ocp_seq, __ATOMIC_ACQUIRE);
+        if (s1 == s2 && (s1 != 0)) {    // seq 0 = never published -> calm
+            return true;
+        }
+    }
+    return false;
+}
+
+// Condition the raw EKF wind for the OCP. Layer-0 base (twin of mpc_replay's
+// wind_for_ff): availability-gated (hold last on gaps), snapped on the first
+// valid sample (no ramp-in from zero), ~1 s low-passed against lane switches
+// and filter resets, 12 m/s magnitude clamp.
+//
+// WIND-STEP MONITOR on top: the wind A/B campaign measured the EKF
+// estimate's failure mode as LAG on direction steps, not noise — after a
+// true-wind step the estimate traverses intermediate, partly MISDIRECTED
+// values for seconds, and feeding that transient re-shapes the plan every
+// cycle. When the raw estimate jumps > 1.5 m/s (vector distance) from the
+// filtered value, the FED wind freezes at its pre-step value and
+// re-approaches the estimate over ~3 s:
+//     fed = from + (filt - from) * t / 3 s
+// with filt the ~1 s LPF still chasing the raw estimate. At t = 3 s the LPF
+// has converged (> 95 %), so the ramp lands on the settled new estimate and
+// unfreezes without a kink; 3 s also keeps the wind quasi-static on the
+// scale of one plan horizon (~6 s turn) instead of injecting the estimator's
+// transient direction error. While a ramp is active the detector does NOT
+// re-trigger: the LPF residual of the step itself stays above the gate for
+// ~0.7 s (3 m/s step, 1 s tau) and would re-freeze continuously; a genuinely
+// new step during a ramp simply moves the ramp's live target (filt).
+static void wind_ocp_update()
+{
+    Vector3f w3;
+    if (!AP::ahrs().wind_estimate(w3)) {
+        return;                         // hold last published (calm pre-init)
+    }
+    Vector2f raw = w3.xy();
+    const float len = raw.length();
+    if (len > WIND_OCP_CLAMP_MS) {
+        raw *= WIND_OCP_CLAMP_MS / len;
+    }
+    const uint32_t now = AP_HAL::millis();
+    if (!wind_ocp_init) {
+        wind_ocp_filt_ne = raw;
+        wind_ocp_init = true;
+        wind_ocp_last_ms = now;
+        wind_ocp_publish(raw);
+        return;
+    }
+    // dt-based LPF (update() rate varies 50..400 Hz); the 0.2 s cap keeps a
+    // long between-turn IDLE gap from acting as a filter snap
+    const float dt = MIN((now - wind_ocp_last_ms) * 1.0e-3f, 0.2f);
+    wind_ocp_last_ms = now;
+
+    if (!wind_ocp_step_active &&
+        (raw - wind_ocp_filt_ne).length() > WIND_OCP_STEP_MS) {
+        wind_ocp_step_active = true;
+        wind_ocp_step_ms = now;
+        wind_ocp_step_from_ne = wind_ocp_filt_ne;   // pre-step fed value
+        if (now - wind_ocp_msg_ms > 10000) {        // rate-limited statustext
+            wind_ocp_msg_ms = now;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "MPC: wind step %.1f m/s (ramp %.0fs)",
+                          (double)(raw - wind_ocp_filt_ne).length(),
+                          (double)WIND_OCP_RAMP_S);
+        }
+    }
+
+    wind_ocp_filt_ne += (raw - wind_ocp_filt_ne) * (dt / (WIND_OCP_TAU_S + dt));
+
+    Vector2f fed = wind_ocp_filt_ne;
+    if (wind_ocp_step_active) {
+        const float frac = (now - wind_ocp_step_ms) * 1.0e-3f / WIND_OCP_RAMP_S;
+        if (frac >= 1.0f) {
+            wind_ocp_step_active = false;
+        } else {
+            fed = wind_ocp_step_from_ne
+                + (wind_ocp_filt_ne - wind_ocp_step_from_ne) * frac;
+        }
+    }
+    wind_ocp_publish(fed);
+}
+
+// ---- canonical rotation + MIRROR SIGN FLIP -------------------------------
+// world_to_canonical() maps world-NE VECTORS into the canonical turn frame:
+//     [x_c]   [ cos_h  sin_h] [n]        (R(-h): world NE -> row frame,
+//     [y_c] = [-sin_h  cos_h] [e]         +x_c along-row toward the corner)
+// and for mirrored turns additionally reflects the cross-row axis in AND
+// out (see its mirror block: eta_u = -eta_u; vy_c = -vy_c), i.e.
+//     canonical = M * R(-h) * world,   M = diag(1, -1) iff mirror.
+// The ABI-11 dynamics are written in that same basis and consume the wind
+// only through the air velocity u = v_ground - w. Both terms of that
+// subtraction must live in ONE basis, so the wind vector — a physical world
+// vector exactly like the velocity — takes the identical map M * R(-h):
+//     w_xi  =    cos_h * w_n + sin_h * w_e
+//     w_eta = -(-sin_h * w_n + cos_h * w_e)     for mirror, else unnegated.
+// Physically: the mirrored problem is the reflection of the world problem
+// about the row axis, and a reflection reverses the cross-row component of
+// every vector — a world wind toward +eta_world enters the mirrored
+// canonical solve as toward -eta. Omitting the flip models every crosswind
+// on the WRONG side for mirrored turns (every second turn of a
+// boustrophedon) — the silent sign bug named in the Layer-2 roadmap: it is
+// invisible in calm tests (w = 0 is mirror-invariant) and shows in wind
+// only as a wrong-side bulge/feasibility error.
+static void wind_ocp_to_canonical(const AP_MPCSolver::TurnRecord &rec,
+                                  const Vector2f &w_ne,
+                                  float &w_xi, float &w_eta)
+{
+    w_xi = rec.cos_h * w_ne.x + rec.sin_h * w_ne.y;
+    float w_eta_u = -rec.sin_h * w_ne.x + rec.cos_h * w_ne.y;
+    if (rec.mirror) {
+        w_eta_u = -w_eta_u;
+    }
+    w_eta = w_eta_u;
+}
+#endif  // MPC_WIND_OCP
 
 AP_MPCSolver::AP_MPCSolver() :
     _initialised(false),
@@ -405,6 +579,11 @@ void AP_MPCSolver::update()
     _snap.vel_d = vel_ned.z;
     __atomic_store_n(&_snap_seq, seq + 1, __ATOMIC_RELEASE);
     _snap_valid = true;
+#if MPC_WIND_OCP
+    // condition + publish the OCP wind on the main loop (same writer/reader
+    // split as the snapshot: ALL AHRS access stays off the MPC thread)
+    wind_ocp_update();
+#endif
 }
 
 bool AP_MPCSolver::read_snapshot(Snapshot &out) const
@@ -787,6 +966,21 @@ void AP_MPCSolver::thread_rearm()
         // w=0). Crop floor still DISARMED (cs_rh_set_crop_bound).
         rc = cs_rh_set_ref_tracking(rh, 3.0f, 1, 1.5f);
     }
+#if MPC_WIND_OCP
+    if (rc == CS_OK) {
+        // arm-time wind (cs_rh_init just RESET the solver wind to calm, like
+        // the row offset): the ARMED preconvergence and the READY tracking
+        // solves then converge against the wind the turn will actually be
+        // flown in; ENGAGED cycles refresh it per cycle (thread_cycle).
+        // Pre-publish (no valid estimate yet) leaves the calm default.
+        Vector2f w_ne;
+        if (wind_ocp_read(w_ne)) {
+            float w_xi, w_eta;
+            wind_ocp_to_canonical(rec, w_ne, w_xi, w_eta);
+            rc = cs_rh_set_wind(rh, w_xi, w_eta);
+        }
+    }
+#endif
     if (rc != CS_OK) {
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "MPC: frame load failed (rc %d)", rc);
         WITH_SEMAPHORE(_sem);
@@ -924,8 +1118,28 @@ bool AP_MPCSolver::build_x_meas(const Snapshot &snap, float x_meas[6],
     const float psi_m = wrap_near(psi_raw, _X[k0 * 6 + 1]);
     const float a_pin = constrain_float(_X[k0 * 6 + 4],
                                         MPC_A_TRIM - MPC_ENV_TOL, MPC_A_CAP);
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+    // S2 symmetrized h2 box: chi in [-pi, pi] (brake-and-crab quadrant
+    // admitted). Nearest-branch consistency with cs_rh.c's branch_commit is
+    // already structural here: theta is PLAN-carried (_X[k0*6+5], on the
+    // plan's continuous branch by construction) and psi_m is wrap_near'ed
+    // onto the plan's psi at the same node — exactly branch_commit's
+    // nearest-multiple-of-2pi rule with the plan as reference. So a chi
+    // outside the box means a genuine measured-heading deviation, not a
+    // representation flip, and CLAMPING (staying on the plan's branch)
+    // matches branch_commit's committed-representation semantics: it too
+    // keeps the plan branch for any deviation within pi + hysteresis rather
+    // than re-wrapping onto the reflected representation. (The ENGAGED path
+    // additionally passes through branch_commit inside cs_rh_step; this
+    // clamp is what keeps the READY set_pins path — which bypasses it —
+    // inside the widened box.)
+    const float chi = constrain_float(_X[k0 * 6 + 5] - psi_m,
+                                      -float(M_PI) + 1.0e-3f,
+                                      float(M_PI) - 1.0e-3f);
+#else
     const float chi = constrain_float(_X[k0 * 6 + 5] - psi_m,
                                       -0.2f + 1.0e-3f, M_PI - 1.0e-3f);
+#endif
     x_meas[0] = constrain_float(v_raw, MPC_V_MIN + 1.0e-3f,
                                 MPC_V_INF - 5.0e-3f);
     x_meas[1] = psi_m;
@@ -984,6 +1198,26 @@ void AP_MPCSolver::thread_track()
     // gate-relaxed re-solve migrated toward the min-time diagonal crop
     // cut and v4 flew it (CUBE-BENCH-NOTES correction 2026-07-30).
     x_meas[2] = _seed_xi0;
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+    // S2 branch rule for the READY pins: this path feeds cs_solver_set_pins
+    // DIRECTLY, bypassing cs_rh_step and therefore the core's branch_commit
+    // — so apply the same nearest-branch wrap here, onto the ITERATE'S
+    // NODE-0 angles (the x0-pin residual is formed against node 0; _X holds
+    // the current iterate from build_x_meas). build_x_meas already wrapped
+    // psi at the NEAREST node k0 — during the final approach that is node 0
+    // and this is a no-op; near +-pi-class states the extra wrap is what
+    // keeps a representation flip from becoming a ~2*pi pin residual that
+    // destroys the READY warm start. psi and theta wrap INDEPENDENTLY, the
+    // same per-angle rule branch_commit applies (plan continuity keeps the
+    // implied chi consistent). No hysteresis state is needed here: the wrap
+    // reference is the iterate's node-0 angle — pinned to the seed frame by
+    // this very tracking design — not a moving projection, so the +-pi
+    // decision boundary cannot chatter the way branch_commit's
+    // progress-interpolated reference could (which is why THE CORE carries
+    // the commitment/hysteresis machinery and this path does not).
+    x_meas[1] = wrap_near(x_meas[1], _X[1]);
+    x_meas[5] = wrap_near(x_meas[5], _X[5]);
+#endif
     if (cs_solver_set_pins(_solver, x_meas, _track_xN) != CS_OK) {
         return;
     }
@@ -1046,6 +1280,21 @@ void AP_MPCSolver::thread_cycle()
     }
 #endif
     cs_rh *rh = (cs_rh *)_rh;
+#if MPC_WIND_OCP
+    {
+        // per-cycle wind refresh BEFORE the solve: rotate the conditioned
+        // world-NE estimate into the armed canonical frame (mirror sign flip
+        // on w_eta — derivation at wind_ocp_to_canonical). _rec is stable
+        // while non-IDLE (same unlocked access as world_to_canonical).
+        Vector2f w_ne;
+        if (wind_ocp_read(w_ne)) {
+            float w_xi, w_eta;
+            wind_ocp_to_canonical(_rec, w_ne, w_xi, w_eta);
+            // fails only on null args (rh/solver exist here by construction)
+            (void)cs_rh_set_wind(rh, w_xi, w_eta);
+        }
+    }
+#endif
     float x_meas[6], xi_unused = 0;
     if (!build_x_meas(snap, x_meas, xi_unused)) {
         return;

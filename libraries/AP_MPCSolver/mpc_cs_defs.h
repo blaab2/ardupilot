@@ -17,6 +17,21 @@
  * the arena (csolver/README.md "CS_PINNED_ONLY") */
 #define CS_PINNED_ONLY 1
 
+/* Layer-2 chi-box symmetrization (csolver ABI 11 compile gate). Default 0 =
+ * the flown [-0.2, pi] gauge box, bit-identical to the pre-ABI-11 behavior.
+ * 1 widens the h2 box to [-pi, pi] (brake-and-crab quadrant) and compiles the
+ * cs_rh entry-point branch discipline (branch_commit: nearest-branch wrap of
+ * measured psi/theta onto the accepted plan + hysteresis at +-pi) PLUS the
+ * firmware-side twins in AP_MPCSolver.cpp (build_x_meas chi clamp, READY-pin
+ * branch wrap). Overridable from the command line for build checks
+ * (waf configure --define CS_CHI_SYM=1); MUST be consistent across every TU
+ * including this header. DO NOT fly =1 before the sym re-certification stage
+ * (SOSC/multipliers/kappa/lambda-map on the sym formulation) has run —
+ * Layer-2 roadmap, CUBE-BENCH-NOTES. */
+#ifndef CS_CHI_SYM
+#define CS_CHI_SYM 0
+#endif
+
 /* the generated CasADi code guards its scalar typedef with #ifndef */
 #ifndef casadi_real
 #define casadi_real float
