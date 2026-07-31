@@ -1,0 +1,30 @@
+# SN77 QUADRATIC-drag variant (SIM_Frame). Identical to SN77.json except mdrag_coef=0:
+# with momentum drag off, SIM_Frame's load-time split puts ALL of drag_force = mg*tan(refAngle)
+# into the bluff-body term -> areaCd = drag_force/(0.5*rho(refAlt)*refSpd^2) ~ 0.1975 m^2,
+# i.e. pure quadratic drag matching (k/m)|v|v at all speeds (SN77.json's mdrag_coef=0.2 trips
+# the BCOEF=0 rescale branch -> momentum-only, LINEAR wind response with ~half the quadratic
+# wind-delta gain at cruise). Use for judging the quadratic wind feed-forward (MPC_WIND_FF).
+{
+    "mass" : 6.55,
+    "diagonal_size" : 1.1,
+    "refSpd" : 11.8,
+    "refAngle" : 14.33,
+    "refVoltage" : 24.0,
+    "refCurrent" : 21.6,
+    "refAlt" : 270,
+    "refTempC" : 25,
+    "refBatRes" : 0.008,
+    "maxVoltage" : 25.2,
+    "battCapacityAh" : 10.0,
+    "propExpo" : 0.68,
+    "refRotRate" : 120,
+    "hoverThrOut" : 0.205,
+    "pwmMin" : 1000,
+    "pwmMax" : 2000,
+    "spin_min" : 0.15,
+    "spin_max" : 1.0,
+    "slew_max" : 0,
+    "disc_area" : 1.207,
+    "mdrag_coef" : 0.0,
+    "num_motors" : 4
+}

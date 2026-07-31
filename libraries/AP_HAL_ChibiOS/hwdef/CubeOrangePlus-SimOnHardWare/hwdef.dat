@@ -17,5 +17,10 @@ AUTOBUILD_TARGETS Copter
 # embedded SN77 vehicle model: physics parity with the host-SITL harness
 # (scripts/sitl_validation/SN77.json is the source of truth; SIM_Frame
 # loads @ROMFS/models/<json> when the frame string carries ":<json>")
+# SN77Q.json = quadratic-drag variant (mdrag_coef=0 -> pure areaCd bluff-body
+# drag); both models ship in ROMFS, but the frame string is COMPILE-TIME: to
+# fly the quadratic model on the Cube, flip the define below to "+:SN77Q.json"
+# and rebuild.
 ROMFS models/SN77.json libraries/AP_HAL_ChibiOS/hwdef/CubeOrangePlus-SimOnHardWare/SN77.json
+ROMFS models/SN77Q.json libraries/AP_HAL_ChibiOS/hwdef/CubeOrangePlus-SimOnHardWare/SN77Q.json
 define AP_SIM_FRAME_STRING "+:SN77.json"
