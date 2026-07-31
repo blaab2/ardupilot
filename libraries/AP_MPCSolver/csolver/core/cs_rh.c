@@ -54,6 +54,36 @@
  * the gth slack trigger (relax/2 = 5e8) so no elastic machinery engages. */
 #define CS_RH_READY_RLX ((cs_real)50.0)
 
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+/* ---- S2 branch discipline (chi box symmetrized to [-pi, pi]) ----
+ * With the h2 box widened, chi = theta - psi ~ +-pi (pure braking) admits
+ * two representations of the SAME physical state, and a measured feed that
+ * wraps its angles to a principal interval can flip representation between
+ * cycles (-pi <-> +pi chatter): the x0 pin residual then jumps ~2*pi, the
+ * warm start is destroyed and the reference/proximity residuals (psi, theta
+ * columns) pull a full turn. The solver keeps ALL its interior angles as
+ * continuous (unwrapped) reals — the seed is continuous, the dynamics
+ * integrate psidot/thetadot, no core path ever wraps — so branch safety
+ * reduces to ONE entry-point rule: every measured angle is mapped onto the
+ * plan's branch before it enters the solver, with a representation
+ * commitment (hysteresis) so the +-pi decision boundary cannot chatter.
+ * (Default CS_CHI_SYM=0 builds compile none of this — bit-identical.) */
+#define CS_TWO_PI ((cs_real)6.28318530717958647692528676655900577)
+/* hysteresis margin beyond pi before the committed branch is abandoned:
+ * ~20 deg — far above the per-cycle angle noise (~6 deg/sample apex course
+ * noise, M1.4b), far below a genuine branch change (2*pi). */
+#define CS_CHI_HYST ((cs_real)0.35)
+
+/* the multiple of 2*pi that brings val nearest ref */
+static cs_real nearest_mult_2pi(cs_real ref, cs_real val)
+{
+    return CS_TWO_PI
+        * (cs_real)floor((double)((ref - val) / CS_TWO_PI) + (double)0.5);
+}
+
+static void branch_commit(cs_rh *rh, const cs_real *in, cs_real *out);
+#endif /* CS_CHI_SYM */
+
 /* np.interp over the uniform node grid linspace(0, 1, n+1); col strided
  * (stage-major state columns). Clamps outside [0, 1] like np.interp —
  * pre-path (tq < 0) reference nodes are NOT segment-extrapolated: the seed
@@ -133,6 +163,41 @@ static void project_xy(const cs_real *X, int nx, int N, cs_real xi,
     *dist_out = (cs_real)sqrt((double)best);
 }
 
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+/* Map the measured psi/theta onto the accepted plan's branch (nearest-
+ * branch wrapping) with representation commitment: the reference angle is
+ * the accepted plan interpolated at the vehicle's XY-projected progress
+ * (the plan is continuous, so its interpolated angles are branch-valid);
+ * the previous cycle's committed 2*pi offset is KEPT unless the committed
+ * representation has moved further than pi + CS_CHI_HYST from the
+ * reference — only a decisive (genuine) branch change re-wraps, so the
+ * +-pi decision boundary cannot chatter cycle to cycle. v/xi/eta/a copy
+ * through untouched. */
+static void branch_commit(cs_rh *rh, const cs_real *in, cs_real *out)
+{
+    cs_real tau, dist;
+    int j;
+    for (j = 0; j < 6; ++j)
+        out[j] = in[j];
+    project_xy(rh->Xa, rh->nx, rh->N, in[2], in[3], &tau, &dist);
+    for (j = 0; j < 2; ++j) {
+        const int idx = j ? 5 : 1;             /* psi (1), theta (5) */
+        const cs_real ref = interp_node(rh->Xa + idx, rh->nx, rh->N, tau);
+        cs_real off = nearest_mult_2pi(ref, in[idx]);
+        if (rh->br_valid) {
+            cs_real d_prev = in[idx] + rh->br_off[j] - ref;
+            if (d_prev < (cs_real)0)
+                d_prev = -d_prev;
+            if (d_prev <= (cs_real)CS_PD_CHI_HI + CS_CHI_HYST)
+                off = rh->br_off[j];           /* keep the committed branch */
+        }
+        rh->br_off[j] = off;
+        out[idx] = in[idx] + off;
+    }
+    rh->br_valid = 1;
+}
+#endif /* CS_CHI_SYM */
+
 /* restretch a plan from fractional progress tau_r onto [0, 1]: X columns
  * over the node grid, U columns over the control grid (rh_step's interp). */
 static void restretch(const cs_real *X, const cs_real *U, int N, int nx,
@@ -207,6 +272,8 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
     rh->n_cycles = rh->n_fallbacks = 0;
     rh->last_reject = 0;
     rh->n_events = 0;
+    rh->br_off[0] = rh->br_off[1] = (cs_real)0;  /* S2 branch commitment */
+    rh->br_valid = 0;
     for (i = 0; i < CS_RH_MAX_EVENTS; ++i) {
         rh->events[i].t = rh->events[i].tau = (cs_real)0;
         rh->events[i].deficit = rh->events[i].v = (cs_real)0;
@@ -215,8 +282,11 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
     }
     /* arm the mission on the solver (fly_closed_loop's csolver setup +
      * rh_gate_reset): pins, elastic corridor, progress gate at the margin,
-     * seed as iterate, canonical row offset. */
+     * seed as iterate, canonical row offset, calm wind (S3: per-mission
+     * reset like the row offset — cs_rh_set_wind re-arms per cycle). */
     rc = cs_solver_set_row_offset(s, (cs_real)0);
+    if (rc == CS_OK)
+        rc = cs_solver_set_wind(s, (cs_real)0, (cs_real)0);
     if (rc == CS_OK)
         rc = cs_solver_set_pins(s, S, S + (size_t)N * snx);
     if (rc == CS_OK)
@@ -253,6 +323,13 @@ int cs_rh_set_frame_d(cs_rh *rh, cs_real d)
         return rc;
     rh->d_off = d - CS_RH_D_CANON;
     return CS_OK;
+}
+
+int cs_rh_set_wind(cs_rh *rh, cs_real w_xi, cs_real w_eta)
+{
+    if (!rh || !rh->s)
+        return CS_ERR_ARG;
+    return cs_solver_set_wind(rh->s, w_xi, w_eta);
 }
 
 int cs_rh_set_ref_tracking(cs_rh *rh, cs_real w, int mode, cs_real slack_max)
@@ -458,8 +535,19 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
     cs_real tau0_prev, v_out, v_ret, vx;
     int rc, i, k, rule, recov = 0, k_eff, k0, mask, qp_status, ev;
     cs_real tau_r = (cs_real)0;
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+    cs_real xw[6];
+#endif
     if (!rh || !rh->s || !x_meas)
         return CS_ERR_ARG;
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+    /* S2: one entry-point rule — measured angles onto the plan's branch
+     * (committed representation, hysteresis at +-pi) BEFORE anything reads
+     * x_meas; every interior consumer (pin, innovation, spiral, cs_h,
+     * reference residuals) then stays branch-consistent by induction. */
+    branch_commit(rh, x_meas, xw);
+    x_meas = xw;
+#endif
     ++rh->n_cycles;
     rh->t_now += dt;
     if (rh->age_valid)

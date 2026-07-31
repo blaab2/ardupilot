@@ -111,6 +111,15 @@ typedef struct {
      * bit-unchanged. */
     cs_real row_off;
 
+    /* per-solve wind (w_xi, w_eta), CANONICAL frame (Layer-2 S3, ABI 11):
+     * stored like row_off, passed into every dynamics model evaluation
+     * (cs_step_jac here, cs_step in the seed rollout). The caller applies
+     * the mirror sign flip on w_eta for right-handed turns, exactly like
+     * the state mirroring (G0.4). Default (0, 0) = the calm problem
+     * BIT-UNCHANGED (the generated model selects the calm expression DAG).
+     * h rows are wind-independent. Set via cs_solver_set_wind. */
+    cs_real wind[2];
+
     /* R5-proximity reference tracking (turn-2 conditioning fix). Adds a
      * Gauss-Newton state cost w_ref * sum_k ||x_k - x_ref_k||^2 to the QP,
      * x_ref = the reference R5 seed restretched to the current progress:

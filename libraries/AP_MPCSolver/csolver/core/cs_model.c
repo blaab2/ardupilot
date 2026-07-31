@@ -156,28 +156,28 @@ static int cs_call(cs_fn fn, const cs_real *const *in, int n_in,
 }
 
 int cs_ode(const cs_real *x, const cs_real *u, const cs_real *T,
-           cs_real *xdot)
+           const cs_real *w, cs_real *xdot)
 {
-    const cs_real *in[3];
+    const cs_real *in[4];
     cs_real *out[1];
-    if (!x || !u || !T || !xdot)
+    if (!x || !u || !T || !w || !xdot)
         return CS_ERR_ARG;
-    in[0] = x; in[1] = u; in[2] = T;
+    in[0] = x; in[1] = u; in[2] = T; in[3] = w;
     out[0] = xdot;
-    return cs_call(turn_r5_expl_ode_fun, in, 3, out, 1);
+    return cs_call(turn_r5_expl_ode_fun, in, 4, out, 1);
 }
 
 int cs_vde_forw(const cs_real *x, const cs_real *Sx, const cs_real *Sw,
-                const cs_real *u, const cs_real *T,
+                const cs_real *u, const cs_real *T, const cs_real *w,
                 cs_real *xdot, cs_real *Sxdot, cs_real *Swdot)
 {
-    const cs_real *in[5];
+    const cs_real *in[6];
     cs_real *out[3];
-    if (!x || !Sx || !Sw || !u || !T || !xdot || !Sxdot || !Swdot)
+    if (!x || !Sx || !Sw || !u || !T || !w || !xdot || !Sxdot || !Swdot)
         return CS_ERR_ARG;
-    in[0] = x; in[1] = Sx; in[2] = Sw; in[3] = u; in[4] = T;
+    in[0] = x; in[1] = Sx; in[2] = Sw; in[3] = u; in[4] = T; in[5] = w;
     out[0] = xdot; out[1] = Sxdot; out[2] = Swdot;
-    return cs_call(turn_r5_expl_vde_forw, in, 5, out, 3);
+    return cs_call(turn_r5_expl_vde_forw, in, 6, out, 3);
 }
 
 int cs_h(const cs_real *x, const cs_real *u, cs_real *h)
@@ -213,31 +213,32 @@ static int variant_index(int N)
 }
 
 int cs_step(int N, const cs_real *x, const cs_real *u, const cs_real *T,
-            cs_real *x_next)
+            const cs_real *w, cs_real *x_next)
 {
-    const cs_real *in[3];
+    const cs_real *in[4];
     cs_real *out[1];
     int v = variant_index(N);
     if (v < 0)
         return CS_ERR_BADN;
-    if (!x || !u || !T || !x_next)
+    if (!x || !u || !T || !w || !x_next)
         return CS_ERR_ARG;
-    in[0] = x; in[1] = u; in[2] = T;
+    in[0] = x; in[1] = u; in[2] = T; in[3] = w;
     out[0] = x_next;
-    return cs_call(k_step[v], in, 3, out, 1);
+    return cs_call(k_step[v], in, 4, out, 1);
 }
 
 int cs_step_jac(int N, const cs_real *x, const cs_real *u, const cs_real *T,
-                cs_real *x_next, cs_real *A, cs_real *B, cs_real *bT)
+                const cs_real *w, cs_real *x_next, cs_real *A, cs_real *B,
+                cs_real *bT)
 {
-    const cs_real *in[3];
+    const cs_real *in[4];
     cs_real *out[4];
     int v = variant_index(N);
     if (v < 0)
         return CS_ERR_BADN;
-    if (!x || !u || !T || !x_next || !A || !B || !bT)
+    if (!x || !u || !T || !w || !x_next || !A || !B || !bT)
         return CS_ERR_ARG;
-    in[0] = x; in[1] = u; in[2] = T;
+    in[0] = x; in[1] = u; in[2] = T; in[3] = w;
     out[0] = x_next; out[1] = A; out[2] = B; out[3] = bT;
-    return cs_call(k_step_jac[v], in, 3, out, 4);
+    return cs_call(k_step_jac[v], in, 4, out, 4);
 }

@@ -344,7 +344,7 @@ int cs_solver_set_seed(cs_solver *s, const cs_real *X, const cs_real *U,
             }
         for (k = 0; k < s->N; ++k) {
             rc = cs_step(s->N, s->X + (size_t)k * s->nx,
-                         s->U + (size_t)k * s->nu, &s->T,
+                         s->U + (size_t)k * s->nu, &s->T, s->qp.wind,
                          s->X + (size_t)(k + 1) * s->nx);
             if (rc != CS_OK)
                 return rc;
@@ -557,6 +557,15 @@ int cs_solver_set_row_offset(cs_solver *s, cs_real d_minus_14p1)
     if (!s || !(d_minus_14p1 == d_minus_14p1))      /* NaN guard */
         return CS_ERR_ARG;
     s->qp.row_off = d_minus_14p1;
+    return CS_OK;
+}
+
+int cs_solver_set_wind(cs_solver *s, cs_real w_xi, cs_real w_eta)
+{
+    if (!s || !(w_xi == w_xi) || !(w_eta == w_eta)) /* NaN guard */
+        return CS_ERR_ARG;
+    s->qp.wind[0] = w_xi;
+    s->qp.wind[1] = w_eta;
     return CS_OK;
 }
 

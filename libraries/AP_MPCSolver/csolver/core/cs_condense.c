@@ -8,6 +8,22 @@
 
 #define CS_BIG ((cs_real)1e20)   /* "no bound" for simple bounds / one-sided rows */
 
+/* Layer-2 S2 — chi-box symmetrization, compile-gated (CS_CHI_SYM, default
+ * 0): the h2 steering box chi = theta - psi is the flown [-0.2, pi] branch
+ * (CS_PD_CHI_LO/HI). The [-0.2, pi] box is a 2*pi GAUGE FIX, not physics
+ * (wind_r5.py B-ddagger: symmetrizing to [-pi, pi] makes the certified-
+ * infeasible 90-degree crosswind feasible with zero slack — brake-and-crab
+ * lives in the excluded quadrant). CS_CHI_SYM=1 widens the box to
+ * [-CS_PD_CHI_HI, CS_PD_CHI_HI] = [-pi, pi]; branch discipline at the +-pi
+ * boundary lives in cs_rh.c (nearest-branch wrap of the measured angles +
+ * representation-commitment hysteresis). Default build: the macro expands
+ * to exactly the previous constant — bit-identical. */
+#if defined(CS_CHI_SYM) && CS_CHI_SYM
+#define CS_CHI_LO_EFF (-(cs_real)CS_PD_CHI_HI)
+#else
+#define CS_CHI_LO_EFF ((cs_real)CS_PD_CHI_LO)
+#endif
+
 static const int k_bx_idx[CS_PD_NBX] = CS_PD_BX_IDX;
 static const cs_real k_bx_lb[CS_PD_NBX] = CS_PD_BX_LB;
 static const cs_real k_bx_ub[CS_PD_NBX] = CS_PD_BX_UB;
@@ -142,6 +158,7 @@ int cs_condense_init(cs_qp *qp, cs_arena *arena, int N)
     qp->gate_tau0 = (cs_real)-1;  /* full-horizon index gating (batch) */
     qp->gate_rlx_out = qp->gate_rlx_ret = qp->gate_rlx_xi = (cs_real)0;
     qp->row_off = (cs_real)0;     /* canonical d = 14.1 (G0.2) */
+    qp->wind[0] = qp->wind[1] = (cs_real)0;   /* calm (S3, ABI 11) */
     cs_scaling_default(&qp->sc);
     {   /* LM state metric: physical (lm_w = sx^2) — the M1/acados-parity
          * damping; E/e themselves are stored scaled (M2). */
@@ -341,7 +358,7 @@ static void gate_bounds(const cs_qp *qp, int k, cs_real eta_k,
                         cs_real *lo, cs_real *hi)
 {
     lo[0] = -qp->relax;            hi[0] = (cs_real)(CS_PD_J_MAX * CS_PD_J_MAX);
-    lo[1] = (cs_real)CS_PD_CHI_LO; hi[1] = (cs_real)CS_PD_CHI_HI;
+    lo[1] = CS_CHI_LO_EFF;         hi[1] = (cs_real)CS_PD_CHI_HI;
     lo[2] = -qp->relax;            hi[2] = qp->relax;
     lo[3] = -qp->relax;            hi[3] = qp->relax;
     lo[4] = -qp->relax;            hi[4] = qp->relax;
@@ -491,7 +508,8 @@ int cs_condense_build(cs_qp *qp, const cs_real *X, const cs_real *U,
         const cs_real *ek = qp->e + (size_t)k * nx;
         cs_real *En = qp->E + (size_t)(k + 1) * nx * nz0;
         cs_real *en = qp->e + (size_t)(k + 1) * nx;
-        rc = cs_step_jac(N, Xk, Uk, &T, qp->xnext, qp->Ak, qp->Bk, qp->bTk);
+        rc = cs_step_jac(N, Xk, Uk, &T, qp->wind,
+                         qp->xnext, qp->Ak, qp->Bk, qp->bTk);
         if (rc != CS_OK)
             return rc;
         /* e~_{k+1} = A~_k e~_k + Sx^-1 c_k,  c_k = F(X_k,U_k,T) - X_{k+1} */

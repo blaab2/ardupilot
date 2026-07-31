@@ -152,6 +152,15 @@ typedef struct {
 
     int last_keff;               /* iterations run by the last step    */
 
+    /* S2 (CS_CHI_SYM builds) representation-commitment state: the committed
+     * 2*pi branch offsets applied to the measured psi (br_off[0]) and theta
+     * (br_off[1]) before they enter the solver, kept across cycles with
+     * hysteresis at the +-pi boundary (see branch_commit in cs_rh.c).
+     * Present in every build for a stable struct layout; unused (zero) when
+     * CS_CHI_SYM is 0 — default behavior unchanged. */
+    cs_real br_off[2];
+    int br_valid;
+
     /* scratch (restretch / iterate readback) */
     cs_real Xs[(CS_RH_NMAX + 1) * 6];
     cs_real Us[CS_RH_NMAX * 2];
@@ -180,6 +189,16 @@ int cs_rh_init(cs_rh *rh, cs_solver *s, const cs_real *S, cs_real T_seed,
  * handled here: the caller mirrors a right-handed turn's states into the
  * canonical frame before every call and mirrors plans back (G0.4). */
 int cs_rh_set_frame_d(cs_rh *rh, cs_real d);
+
+/* Per-solve wind (Layer-2 S3, ABI 11): passthrough to cs_solver_set_wind.
+ * w = (w_xi, w_eta) in the CANONICAL frame, m/s — the caller applies the
+ * mirror sign flip on w_eta for right-handed turns together with the state
+ * mirroring (G0.4), and feeds the gated/LPF'd/clamped EKF estimate per MPC
+ * cycle (the Layer-0 conditioning: availability bool + ~1 s LPF + 12 m/s
+ * clamp; the measured failure mode is estimate LAG, not noise). cs_rh_init
+ * RESETS the wind to (0, 0) per mission, like the row offset — re-arm after
+ * init. w = (0, 0) = the calm problem bit-unchanged. */
+int cs_rh_set_wind(cs_rh *rh, cs_real w_xi, cs_real w_eta);
 
 /* Arm the R5-proximity reference tracking (turn-2 over-bulge fix). w = the L2
  * reference weight (0 disables, the canonical rh); mode 1 = L2 / 2 = L1

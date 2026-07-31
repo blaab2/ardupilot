@@ -7,6 +7,7 @@
   "A_CAP": 5.6638061407502285,
   "J_MAX": 5.0
  },
+ "wind_input": true,
  "corridor": {
   "approach_ub": [
    [
@@ -91,19 +92,19 @@
  },
  "work": {
   "turn_r5_expl_ode_fun": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 1,
    "sz_iw": 0,
-   "sz_w": 8,
-   "n_in": 3,
+   "sz_w": 16,
+   "n_in": 4,
    "n_out": 1
   },
   "turn_r5_expl_vde_forw": {
-   "sz_arg": 5,
+   "sz_arg": 6,
    "sz_res": 3,
    "sz_iw": 0,
-   "sz_w": 26,
-   "n_in": 5,
+   "sz_w": 42,
+   "n_in": 6,
    "n_out": 3
   },
   "turn_r5_constr_h": {
@@ -123,67 +124,67 @@
    "n_out": 3
   },
   "turn_r5_N15_disc_step": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 1,
    "sz_iw": 0,
-   "sz_w": 30,
-   "n_in": 3,
+   "sz_w": 38,
+   "n_in": 4,
    "n_out": 1
   },
   "turn_r5_N15_disc_step_jac": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 4,
    "sz_iw": 0,
-   "sz_w": 87,
-   "n_in": 3,
+   "sz_w": 163,
+   "n_in": 4,
    "n_out": 4
   },
   "turn_r5_N20_disc_step": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 1,
    "sz_iw": 0,
-   "sz_w": 30,
-   "n_in": 3,
+   "sz_w": 38,
+   "n_in": 4,
    "n_out": 1
   },
   "turn_r5_N20_disc_step_jac": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 4,
    "sz_iw": 0,
-   "sz_w": 87,
-   "n_in": 3,
+   "sz_w": 163,
+   "n_in": 4,
    "n_out": 4
   },
   "turn_r5_N30_disc_step": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 1,
    "sz_iw": 0,
-   "sz_w": 30,
-   "n_in": 3,
+   "sz_w": 38,
+   "n_in": 4,
    "n_out": 1
   },
   "turn_r5_N30_disc_step_jac": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 4,
    "sz_iw": 0,
-   "sz_w": 87,
-   "n_in": 3,
+   "sz_w": 163,
+   "n_in": 4,
    "n_out": 4
   },
   "turn_r5_N60_disc_step": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 1,
    "sz_iw": 0,
-   "sz_w": 30,
-   "n_in": 3,
+   "sz_w": 38,
+   "n_in": 4,
    "n_out": 1
   },
   "turn_r5_N60_disc_step_jac": {
-   "sz_arg": 3,
+   "sz_arg": 4,
    "sz_res": 4,
    "sz_iw": 0,
-   "sz_w": 87,
-   "n_in": 3,
+   "sz_w": 163,
+   "n_in": 4,
    "n_out": 4
   }
  }

@@ -34,7 +34,7 @@ const casadi_int* turn_r5_N60_disc_step_sparsity_in(casadi_int i);
 const casadi_int* turn_r5_N60_disc_step_sparsity_out(casadi_int i);
 int turn_r5_N60_disc_step_work(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
 int turn_r5_N60_disc_step_work_bytes(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
-#define turn_r5_N60_disc_step_SZ_ARG 3
+#define turn_r5_N60_disc_step_SZ_ARG 4
 #define turn_r5_N60_disc_step_SZ_RES 1
 #define turn_r5_N60_disc_step_SZ_IW 0
 #define turn_r5_N60_disc_step_SZ_W 0
@@ -55,7 +55,7 @@ const casadi_int* turn_r5_N60_disc_step_jac_sparsity_in(casadi_int i);
 const casadi_int* turn_r5_N60_disc_step_jac_sparsity_out(casadi_int i);
 int turn_r5_N60_disc_step_jac_work(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
 int turn_r5_N60_disc_step_jac_work_bytes(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
-#define turn_r5_N60_disc_step_jac_SZ_ARG 3
+#define turn_r5_N60_disc_step_jac_SZ_ARG 4
 #define turn_r5_N60_disc_step_jac_SZ_RES 4
 #define turn_r5_N60_disc_step_jac_SZ_IW 0
 #define turn_r5_N60_disc_step_jac_SZ_W 0

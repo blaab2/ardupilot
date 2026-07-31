@@ -34,7 +34,7 @@ const casadi_int* turn_r5_expl_ode_fun_sparsity_in(casadi_int i);
 const casadi_int* turn_r5_expl_ode_fun_sparsity_out(casadi_int i);
 int turn_r5_expl_ode_fun_work(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
 int turn_r5_expl_ode_fun_work_bytes(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
-#define turn_r5_expl_ode_fun_SZ_ARG 3
+#define turn_r5_expl_ode_fun_SZ_ARG 4
 #define turn_r5_expl_ode_fun_SZ_RES 1
 #define turn_r5_expl_ode_fun_SZ_IW 0
 #define turn_r5_expl_ode_fun_SZ_W 0
@@ -55,7 +55,7 @@ const casadi_int* turn_r5_expl_vde_forw_sparsity_in(casadi_int i);
 const casadi_int* turn_r5_expl_vde_forw_sparsity_out(casadi_int i);
 int turn_r5_expl_vde_forw_work(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
 int turn_r5_expl_vde_forw_work_bytes(casadi_int *sz_arg, casadi_int* sz_res, casadi_int *sz_iw, casadi_int *sz_w);
-#define turn_r5_expl_vde_forw_SZ_ARG 5
+#define turn_r5_expl_vde_forw_SZ_ARG 6
 #define turn_r5_expl_vde_forw_SZ_RES 3
 #define turn_r5_expl_vde_forw_SZ_IW 0
 #define turn_r5_expl_vde_forw_SZ_W 0

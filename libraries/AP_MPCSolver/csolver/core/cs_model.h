@@ -26,8 +26,13 @@
  * 5 = M1.4/M1.5 (soft weights, eta box, T_MIN 0.2); 6 = G0.2 runtime
  * row-spacing shift (cs_solver_set_row_offset) + the cs_rh receding-horizon
  * wrapper layer (cs_rh.h). ABI 7 adds cs_solver_set_ref (R5-proximity
- * reference tracking). ABI 10 adds ref mode 3 (normal-only path tube). */
-#define CS_ABI_VERSION 10
+ * reference tracking). ABI 10 adds ref mode 3 (normal-only path tube).
+ * ABI 11 (Layer-2 S3): per-solve wind parameters — the dynamics functions
+ * (cs_ode/cs_vde_forw/cs_step/cs_step_jac and the generated model) take a
+ * trailing w[2] = (w_xi, w_eta); cs_solver_set_wind / cs_rh_set_wind store
+ * it like row_off. w = (0, 0) is BIT-EXACT calm (the generated code selects
+ * the unchanged calm expression DAG). h rows are wind-independent. */
+#define CS_ABI_VERSION 11
 
 int cs_abi_version(void);
 int cs_real_size(void);                      /* sizeof(cs_real): 8=f64, 4=f32 */
@@ -46,24 +51,28 @@ int cs_model_init(void *mem, size_t size);
 /* The _work() maxima actually allocated (after init). */
 int cs_model_work(int *sz_arg, int *sz_res, int *sz_iw, int *sz_w);
 
-/* xdot = T*f(x,u)  — tau-domain ODE (pass T=1 for physical time) */
+/* xdot = T*f(x,u,w)  — tau-domain ODE (pass T=1 for physical time).
+ * w = per-solve wind (w_xi, w_eta), canonical frame (ABI 11); w = (0, 0)
+ * evaluates the calm dynamics bit-exactly. */
 int cs_ode(const cs_real *x, const cs_real *u, const cs_real *T,
-           cs_real *xdot);
+           const cs_real *w, cs_real *xdot);
 
 /* forward VDE of the tau dynamics: Sxdot = Jx*Sx, Swdot = Jx*Sw + [Ju, f] */
 int cs_vde_forw(const cs_real *x, const cs_real *Sx, const cs_real *Sw,
-                const cs_real *u, const cs_real *T,
+                const cs_real *u, const cs_real *T, const cs_real *w,
                 cs_real *xdot, cs_real *Sxdot, cs_real *Swdot);
 
-/* h rows: [jerk_sq, chi, eta - apI(xi), eta - reI(xi), xi] (acados order) */
+/* h rows: [jerk_sq, chi, eta - apI(xi), eta - reI(xi), xi] (acados order).
+ * Wind-independent — no w input. */
 int cs_h(const cs_real *x, const cs_real *u, cs_real *h);
 int cs_h_jac(const cs_real *x, const cs_real *u,
              cs_real *h, cs_real *Jx, cs_real *Ju);
 
 /* one discrete RK4 step of T*f over h = 1/N; N in the compiled variant set */
 int cs_step(int N, const cs_real *x, const cs_real *u, const cs_real *T,
-            cs_real *x_next);
+            const cs_real *w, cs_real *x_next);
 int cs_step_jac(int N, const cs_real *x, const cs_real *u, const cs_real *T,
-                cs_real *x_next, cs_real *A, cs_real *B, cs_real *bT);
+                const cs_real *w, cs_real *x_next, cs_real *A, cs_real *B,
+                cs_real *bT);
 
 #endif /* CS_MODEL_H */

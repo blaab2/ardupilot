@@ -112,6 +112,17 @@ int cs_solver_set_gate(cs_solver *s, cs_real tau0, cs_real rlx_out,
  * and the M2 free-terminal xn boxes (override via cs_solver_set_xn_box). */
 int cs_solver_set_row_offset(cs_solver *s, cs_real d_minus_14p1);
 
+/* Per-solve wind parameters (Layer-2 S3, ABI 11): w = (w_xi, w_eta) in the
+ * CANONICAL frame, m/s — the air velocity is u_air = v_ground - w and the
+ * dynamics carry the air-relative vector drag (see model/gen_model.py).
+ * Stored like row_off and passed into every dynamics model evaluation from
+ * the next cs_solver_iterate()/rollout on; no QP re-dim, warm start kept.
+ * The caller mirrors w_eta for right-handed turns together with the state
+ * mirroring (G0.4) and feeds the gated/LPF'd EKF estimate per cycle.
+ * Default (0, 0) = the calm problem BIT-UNCHANGED (the generated model
+ * selects the calm expression DAG at w = 0). NaN rejected. */
+int cs_solver_set_wind(cs_solver *s, cs_real w_xi, cs_real w_eta);
+
 /* Elastic (soft) corridor rows for the shrinking-horizon rh mode (M1.2).
  * on != 0 attaches one nonnegative L1+L2-penalized slack column to the ONE
  * gated corridor row of each interior stage (outbound eta<=apI, return
