@@ -41,7 +41,16 @@
 // worst-case FF error to ~2x the calm drag scale. A formal
 // wind-VARIANCE gate needs an EKF API that AP_AHRS does not expose -
 // recorded as a follow-up, not silently skipped.
-#define MPC_WIND_FF 1
+// DEFAULT 0 (implemented, NOT armed): the phase-deconfounded SITL A/B
+// (3 phases x calm/air FF, CUBE-BENCH-NOTES 2026-07-31) measured the
+// air FF neutral on turns 1/2 and consistently ~0.2 m WORSE on turn 3
+// - and the SIM is structurally the wrong judge: the SN77 frame
+// model's drag is momentum-dominated (linear in airspeed, its own
+// BCOEF=0 print) while this FF and the real fleet fit are quadratic,
+// so the wind-delta gain differs between SIM and reality. Re-evaluate
+// against a quadratic-drag SIM model or real-flight data before
+// arming.
+#define MPC_WIND_FF 0
 
 // Engage-handover bridge lifetime: how long start() continues the pre-engage
 // desired state (constant velocity) while waiting for the first plan commit
