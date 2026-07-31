@@ -198,6 +198,20 @@ static const float WIND_OCP_TAU_S    = 1.0f;    // Layer-0 ~1 s low-pass
 static const float WIND_OCP_STEP_MS  = 1.5f;    // step gate: |raw - filt| [m/s]
 static const float WIND_OCP_RAMP_S   = 3.0f;    // post-step re-feed ramp
 
+// DEAD-BAND on the fed wind (Layer-2 S5; REQUIRED for flying =1). Two
+// measured facts force this: (a) S3 — the calm SITL EKF reports 0.6-1.4 m/s
+// PSEUDO-wind (drag-fusion bias), so an armed gate without a dead-band never
+// feeds w=0 in calm air; (b) S4 re-certification — ARMED preconvergence
+// against the calm reference limit-cycles (lambda ~ -1) at row-parallel wind
+// of even 1 m/s, i.e. small spurious wind puts the solver in the UNCERTIFIED
+// cycling regime on typical days. Radial ramp, not a step:
+//     fed = clamp((|w| - DB_LO) / (DB_HI - DB_LO), 0, 1) * w
+// continuous in |w| (no discontinuity for the >1.5 m/s step monitor to
+// alias on); below 1 m/s the OCP flies the certified calm point, above
+// 1.5 m/s the estimate passes unscaled.
+#define WIND_OCP_DB_LO_MS 1.0f     // fed = 0 below this magnitude [m/s]
+#define WIND_OCP_DB_HI_MS 1.5f     // fed = full estimate above this [m/s]
+
 // filter/monitor state — written ONLY from the vehicle main loop (update())
 static Vector2f wind_ocp_filt_ne;       // ~1 s LPF of the clamped estimate
 static bool     wind_ocp_init;
@@ -211,6 +225,18 @@ static uint32_t wind_ocp_msg_ms;        // statustext rate limit
 // snapshot: single main-loop writer, MPC-thread reader; odd seq = writing)
 static volatile uint32_t wind_ocp_seq;
 static Vector2f wind_ocp_fed_ne;
+
+// radial dead-band ramp (rationale at WIND_OCP_DB_LO_MS above); applied to
+// the CONDITIONED value right before publish — after the LPF and the
+// step-monitor ramp, before canonicalization at the readers
+static Vector2f wind_ocp_deadband(const Vector2f &w)
+{
+    const float len = w.length();
+    const float scale = constrain_float(
+        (len - WIND_OCP_DB_LO_MS) / (WIND_OCP_DB_HI_MS - WIND_OCP_DB_LO_MS),
+        0.0f, 1.0f);
+    return w * scale;
+}
 
 static void wind_ocp_publish(const Vector2f &fed)
 {
@@ -274,7 +300,7 @@ static void wind_ocp_update()
         wind_ocp_filt_ne = raw;
         wind_ocp_init = true;
         wind_ocp_last_ms = now;
-        wind_ocp_publish(raw);
+        wind_ocp_publish(wind_ocp_deadband(raw));
         return;
     }
     // dt-based LPF (update() rate varies 50..400 Hz); the 0.2 s cap keeps a
@@ -308,7 +334,7 @@ static void wind_ocp_update()
                 + (wind_ocp_filt_ne - wind_ocp_step_from_ne) * frac;
         }
     }
-    wind_ocp_publish(fed);
+    wind_ocp_publish(wind_ocp_deadband(fed));
 }
 
 // ---- canonical rotation + MIRROR SIGN FLIP -------------------------------
@@ -978,6 +1004,14 @@ void AP_MPCSolver::thread_rearm()
             float w_xi, w_eta;
             wind_ocp_to_canonical(rec, w_ne, w_xi, w_eta);
             rc = cs_rh_set_wind(rh, w_xi, w_eta);
+            // per-turn record of the FED (post-dead-band) wind: the S4
+            // certified envelope is stated in canonical components
+            // (w_eta in [-2, 0], |w_xi| < 1) — this line is the flight
+            // evidence for labeling each turn certified/uncertified
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "MPC: wind fed NE(%.2f,%.2f) can(%.2f,%.2f)",
+                          (double)w_ne.x, (double)w_ne.y,
+                          (double)w_xi, (double)w_eta);
         }
     }
 #endif
