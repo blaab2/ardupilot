@@ -76,6 +76,18 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 // SITL experiments only.
 #define MPC_FREEZE_PLAN 0
 
+// SEED-ONLY diagnostic (SITL): fly the RAW SEED as the plan with ZERO
+// solver iterations - no ARMED preconvergence, no READY tracking, no
+// engaged cycles. The engage-staging path already stages the solver
+// iterate, which without any cs_solver_iterate() calls IS the selected
+// seed member with finite-difference controls (cs_rh_init sets it via
+// cs_solver_set_seed). Isolates what the MPC buys over pure seed
+// replay: entry-deviation convergence (READY), disturbance rejection
+// and re-planning (ENGAGED). t_rem ticks from the staged anchor as in
+// MPC_FREEZE_PLAN; spiral/forced-exit protection never runs (no rh
+// cycles) - SITL experiments only.
+#define MPC_SEED_ONLY 0
+
 // base RTI iterations per rh cycle (the committed Step-E config is k=1;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
@@ -793,6 +805,17 @@ void AP_MPCSolver::thread_rearm()
 
 void AP_MPCSolver::thread_preconverge()
 {
+#if MPC_SEED_ONLY
+    // seed-only diagnostic: no iterations - the iterate stays the seed
+    {
+        WITH_SEMAPHORE(_sem);
+        if (_state == State::ARMED) {
+            _state = State::READY;
+        }
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "MPC: ready (seed-only, 0 iters)");
+    return;
+#endif
     // live seed policy (harness RUN_UP): converge the turn solution before
     // engage; budget CAPPED at 30 iterations — longer budgets let the flat
     // u-reg objective drift the plan off R5 (measured in SITL)
@@ -924,6 +947,9 @@ bool AP_MPCSolver::build_x_meas(const Snapshot &snap, float x_meas[6],
 // starts from a converged-to-reality warm start whatever the offset.
 void AP_MPCSolver::thread_track()
 {
+#if MPC_SEED_ONLY
+    return;             // seed-only diagnostic: no tracking solves
+#endif
     const uint32_t now = AP_HAL::millis();
     if (now - _last_track_ms < 150) {
         return;
@@ -980,7 +1006,7 @@ void AP_MPCSolver::thread_cycle()
         if (_state != State::ENGAGED) {
             return;
         }
-#if MPC_FREEZE_PLAN
+#if MPC_FREEZE_PLAN || MPC_SEED_ONLY
         if (!_first_cycle && _have_accepted) {
             return;     // plan frozen: first engaged cycle staged + accepted
         }
