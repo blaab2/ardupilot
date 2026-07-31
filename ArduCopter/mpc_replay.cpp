@@ -27,6 +27,22 @@
 // 0 = bit-identical to the original input_thrust_vector_heading() hand-off.
 #define MPC_TILT_RATE_FF 0
 
+// AIR-RELATIVE drag feed-forward (Layer 0 of the wind roadmap, wind A/B
+// in CUBE-BENCH-NOTES): drag acts on AIRSPEED, so the lean-map FF uses
+// v_air = v_meas - w_ekf instead of the ground velocity. The EKF wind
+// states exist on copters only with drag fusion configured
+// (EK3_DRAG_BCOEF_*/MCOEF - mpc_auto.parm carries the SN77 frame model's
+// own suggested values, BCOEF 0 / MCOEF 0.293); without them
+// wind_estimate() reports unavailable and this reduces exactly to the
+// calm FF - graceful degradation. Safety plumbing: the availability
+// bool is the first gate; the estimate itself is already filter-smooth
+// (slow EKF wind process noise), so the ~1 s low-pass here only guards
+// lane switches/filter resets, and the 12 m/s clamp bounds the
+// worst-case FF error to ~2x the calm drag scale. A formal
+// wind-VARIANCE gate needs an EKF API that AP_AHRS does not expose -
+// recorded as a follow-up, not silently skipped.
+#define MPC_WIND_FF 1
+
 // Engage-handover bridge lifetime: how long start() continues the pre-engage
 // desired state (constant velocity) while waiting for the first plan commit
 // before conceding to the Tier-2 station-keep hold. With ENGAGE-STAGING a
@@ -214,6 +230,33 @@ bool MPCTrajReplay::replay_active() const
            copter.mode_guided.submode() == ModeGuided::SubMode::TrajStream;
 }
 
+#if MPC_WIND_FF
+// EKF wind for the air-relative FF: availability-gated, snapped on the
+// first valid sample (no ramp-in from zero at the first turn), then
+// ~1 s low-passed against lane switches/resets, magnitude-clamped.
+static Vector2f wind_ff_ne_ms;
+static bool wind_ff_init;
+static Vector2f wind_for_ff()
+{
+    Vector3f w;
+    if (!AP::ahrs().wind_estimate(w)) {
+        return wind_ff_ne_ms;           // hold last (or zero pre-init)
+    }
+    Vector2f w2 = w.xy();
+    const float len = w2.length();
+    if (len > 12.0f) {
+        w2 *= 12.0f / len;
+    }
+    if (!wind_ff_init) {
+        wind_ff_ne_ms = w2;
+        wind_ff_init = true;
+    } else {
+        wind_ff_ne_ms += (w2 - wind_ff_ne_ms) * 0.0025f;   // ~1 s at 400 Hz
+    }
+    return wind_ff_ne_ms;
+}
+#endif
+
 // replay controller entry — mirrors pva_control_start() but sizes the NE/D
 // limits to the plan envelope, holds heading (crab) and feeds the buffered
 // trajectory RAW (no S-curve)
@@ -256,7 +299,10 @@ void MPCTrajReplay::start()
     // down by the new FF so the commanded acceleration is continuous and drag is
     // not double-counted. From here the PID corrects only unmodeled effects.
     {
-        const Vector2f vel_ne_ms = copter.pos_control->get_vel_estimate_NED_ms().xy();
+        Vector2f vel_ne_ms = copter.pos_control->get_vel_estimate_NED_ms().xy();
+#if MPC_WIND_FF
+        vel_ne_ms -= wind_for_ff();     // drag acts on AIRSPEED
+#endif
         copter.pos_control->set_drag_accel_ff_NE_mss(vel_ne_ms * (_traj.drag_k * vel_ne_ms.length()), true);
     }
 
@@ -437,7 +483,10 @@ void MPCTrajReplay::run()
     // the modeled drag share enters after the velocity PID so the PID's own
     // correction path is untouched and free for unmodeled disturbances.
     {
-        const Vector2f vel_ne_ms = copter.pos_control->get_vel_estimate_NED_ms().xy();
+        Vector2f vel_ne_ms = copter.pos_control->get_vel_estimate_NED_ms().xy();
+#if MPC_WIND_FF
+        vel_ne_ms -= wind_for_ff();     // drag acts on AIRSPEED
+#endif
         copter.pos_control->set_drag_accel_ff_NE_mss(vel_ne_ms * (_traj.drag_k * vel_ne_ms.length()), false);
     }
 
