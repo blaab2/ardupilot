@@ -162,8 +162,12 @@ void MPCTrajReplay::commit_pending()
     // than only GUIP's current replay setpoint. These node sets are the exact
     // trajectory fan needed to see how successive replans move relative to
     // R5 and the flown track.
-    if (_external_active && plan.anchor_ms >= _plan_snapshot_start_ms &&
-        plan.anchor_ms - _plan_snapshot_start_ms >= _plan_snapshot_next_ms) {
+    // schedule on commit wall-clock, NOT plan.anchor_ms: the engage plan's
+    // anchor (solve snapshot during READY) can predate start()'s schedule
+    // reset by one cycle, silently dropping the FIRST snapshot of a turn -
+    // fatal for one-plan-per-turn modes (MPC_SEED_ONLY lost whole turns)
+    if (_external_active &&
+        millis() - _plan_snapshot_start_ms >= _plan_snapshot_next_ms) {
         for (uint16_t i = 0; i < plan.n; i++) {
             copter.Log_Write_MPC_Plan(_plan_snapshot_id, uint8_t(i),
                                       plan.dt_ms, plan.pos_n[i], plan.pos_e[i]);
