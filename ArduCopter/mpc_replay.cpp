@@ -158,7 +158,7 @@ void MPCTrajReplay::commit_pending()
     }
     _traj.pending_next = plan.n;
 #if HAL_LOGGING_ENABLED
-    // Capture the COMPLETE accepted trajectory every three seconds, rather
+    // Capture the COMPLETE accepted trajectory every second, rather
     // than only GUIP's current replay setpoint. These node sets are the exact
     // trajectory fan needed to see how successive replans move relative to
     // R5 and the flown track.
@@ -169,7 +169,7 @@ void MPCTrajReplay::commit_pending()
                                       plan.dt_ms, plan.pos_n[i], plan.pos_e[i]);
         }
         _plan_snapshot_id++;
-        _plan_snapshot_next_ms += 3000U;
+        _plan_snapshot_next_ms += 1000U;
     }
 #endif
     // no guided auto-start: the mode driving the onboard solver (AUTO

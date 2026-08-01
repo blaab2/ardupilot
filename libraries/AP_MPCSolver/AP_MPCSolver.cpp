@@ -5,6 +5,7 @@
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_HAL/AP_HAL.h>
 #include <GCS_MAVLink/GCS.h>
+#include <AP_Logger/AP_Logger.h>
 
 #include <float.h>
 #include <math.h>
@@ -1298,19 +1299,34 @@ void AP_MPCSolver::thread_cycle()
             tv = _pin_tgt_vel_ne_ms;
             tms = _pin_tgt_ms;
         }
+        // MPCX pin-source record: 0 = plan pin, 1 = divergence re-anchor
+        // (measured), 2 = stale target (measured), 3 = no target yet
+        // (engage bootstrap, measured)
+        uint8_t pin_src = 3;
+        float pin_div = 0.0f;
         if (tms != 0 && snap.time_ms - tms <= MPC_PLAN_PIN_MAX_AGE_MS) {
             const float div = Vector2f(snap.pos_n - tp.x,
                                        snap.pos_e - tp.y).length();
+            pin_div = div;
             if (div <= MPC_PLAN_PIN_MAX_DIV_M) {
                 snap.pos_n = tp.x;
                 snap.pos_e = tp.y;
                 snap.vel_n = tv.x;
                 snap.vel_e = tv.y;
+                pin_src = 0;
             } else {
+                pin_src = 1;
                 GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
                               "MPC: pin re-anchor (d %.1f)", (double)div);
             }
+        } else if (tms != 0) {
+            pin_src = 2;
         }
+#if HAL_LOGGING_ENABLED
+        AP::logger().WriteStreaming("MPCX", "TimeUS,Src,Div", "s-m", "F-0",
+                                    "QBf", AP_HAL::micros64(), pin_src,
+                                    (double)pin_div);
+#endif
     }
 #endif
     cs_rh *rh = (cs_rh *)_rh;
