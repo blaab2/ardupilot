@@ -109,6 +109,14 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 #define MPC_WIND_OCP 0
 #endif
 
+// PER-TURN FROZEN WIND (diagnostic, needs MPC_WIND_OCP=1): keep the
+// wind parameter at its arm-time (thread_rearm) value for the whole
+// turn instead of the per-cycle refresh — plan-consistent wind across
+// cycles, no estimate-ripple excitation. Default 0 = live refresh.
+#ifndef MPC_WIND_FREEZE_TURN
+#define MPC_WIND_FREEZE_TURN 0
+#endif
+
 // base RTI iterations per rh cycle (the committed Step-E config is k=1;
 // cs_rh escalates internally on a large innovation / recovery cycle)
 static const int MPC_K_ITERS = 1;
@@ -1330,12 +1338,16 @@ void AP_MPCSolver::thread_cycle()
     }
 #endif
     cs_rh *rh = (cs_rh *)_rh;
-#if MPC_WIND_OCP
+#if MPC_WIND_OCP && !MPC_WIND_FREEZE_TURN
     {
         // per-cycle wind refresh BEFORE the solve: rotate the conditioned
         // world-NE estimate into the armed canonical frame (mirror sign flip
         // on w_eta — derivation at wind_ocp_to_canonical). _rec is stable
         // while non-IDLE (same unlocked access as world_to_canonical).
+        // MPC_WIND_FREEZE_TURN=1 skips this: the wind stays at the
+        // arm-time (thread_rearm) value for the WHOLE turn — per-turn
+        // frozen-wind diagnostic (plan consistency across cycles; the
+        // estimate ripple no longer excites the iteration).
         Vector2f w_ne;
         if (wind_ocp_read(w_ne)) {
             float w_xi, w_eta;
