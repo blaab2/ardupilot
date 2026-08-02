@@ -67,6 +67,12 @@ static const uint8_t MPC_PRECONV_ITERS_PER_TICK = 5;
 #define MPC_PLAN_PIN_MAX_AGE_MS 300
 #define MPC_PLAN_PIN_MAX_DIV_M 2.0f
 
+// staging guard: max tolerated exceedance of the approach-corridor
+// envelope on a staged plan's outbound leg (audit 2026-08-02: calm
+// staged plans measure <= 0.11 m; wind-cycling iterates carried
+// +1.4-1.6 m of unresolved elastic violation and got staged/flown)
+#define MPC_STAGE_OUT_MARGIN 0.30f
+
 // DIAGNOSTIC: freeze the plan one engaged cycle after engage — the first
 // cycle stages the bootstrap/accepted plan (its READY-converged iterate,
 // live-pinned at the engage state), then ALL further cycling stops and the
@@ -919,6 +925,57 @@ void AP_MPCSolver::thread_main()
                         if (eta > 2.0f && eta < _rec.d - 2.0f &&
                             _X[k * 6 + 2] < -0.5f) {
                             sane = false;
+                        }
+                    }
+                    // outbound-envelope staging guard (audit 2026-08-02):
+                    // a NON-CONVERGED preconvergence iterate carries its
+                    // unresolved corridor violation as elastic slack -
+                    // under wind cycling the staged plan exceeded the
+                    // approach envelope by +1.43 m (windfan_wfix), while
+                    // converged solutions are zero-slack and calm staged
+                    // plans measure <= 0.11 m. Never stage a plan whose
+                    // outbound leg exceeds the measured-AP approach
+                    // envelope (formulation approach_ub, d-independent
+                    // knots) by more than MPC_STAGE_OUT_MARGIN.
+                    if (sane) {
+                        static const float AP_XI[6] = {-10.0f, -6.0f,
+                            -4.0f, -2.0f, -1.0f, -0.5f};
+                        static const float AP_UB[6] = {0.0919f, 0.2172f,
+                            0.3858f, 0.8082f, 1.4248f, 2.1408f};
+                        uint16_t k_apex = 0;
+                        float xi_pk = -1.0e9f;
+                        for (uint16_t k = 0; k <= PLAN_N; k++) {
+                            if (_X[k * 6 + 2] > xi_pk) {
+                                xi_pk = _X[k * 6 + 2];
+                                k_apex = k;
+                            }
+                        }
+                        float worst = 0.0f;
+                        for (uint16_t k = 0; k < k_apex; k++) {
+                            const float xi = _X[k * 6 + 2];
+                            if (xi > -0.5f || xi < -30.0f) {
+                                continue;
+                            }
+                            float ub = AP_UB[0];
+                            for (int j = 0; j < 5; j++) {
+                                if (xi > AP_XI[j]) {
+                                    const float t =
+                                        (xi - AP_XI[j])
+                                        / (AP_XI[j + 1] - AP_XI[j]);
+                                    ub = AP_UB[j]
+                                        + t * (AP_UB[j + 1] - AP_UB[j]);
+                                }
+                            }
+                            const float e = _X[k * 6 + 3] - ub;
+                            if (e > worst) {
+                                worst = e;
+                            }
+                        }
+                        if (worst > MPC_STAGE_OUT_MARGIN) {
+                            sane = false;
+                            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                          "MPC: stage declined (outbound "
+                                          "corridor +%.2f)", (double)worst);
                         }
                     }
                     uint32_t gen;

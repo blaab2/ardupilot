@@ -81,6 +81,12 @@ enum {
     CS_RH_REJ_VMIN = 16,
     CS_RH_REJ_QP = 32,
     CS_RH_REJ_SLACK = 64,
+    /* outbound approach-corridor envelope exceeded by more than
+     * VAL_OUT_MARGIN on the plan's pre-apex leg (audit 2026-08-02:
+     * non-converged wind-cycling iterates carried +1.4-1.6 m of
+     * unresolved elastic violation through staging/bootstrap; converged
+     * solutions are zero-slack, calm plans measure <= 0.11 m) */
+    CS_RH_REJ_CORR = 128,
 };
 
 typedef struct {

@@ -34,6 +34,23 @@
 #define VAL_ETA_MAX ((cs_real)17.0)     /* + row offset at runtime */
 #define VAL_SLACK_MAX ((cs_real)1.0)
 
+/* outbound approach-corridor acceptance: max tolerated exceedance of the
+ * measured-AP approach envelope on a plan's pre-apex leg. The envelope
+ * knots are the formulation's approach_ub (d-INDEPENDENT; identical to
+ * the corridor interpolant baked into the generated model rows). The
+ * elastic corridor prices exceedance inside the QP, but a NON-CONVERGED
+ * iterate carries its unresolved violation as slack and the summed slack
+ * budget (val_slack_max) tolerated meter-class corridor exceedance in
+ * the wind-cycling regime - this row gives the crop-side bound its own
+ * acceptance cap (CS_RH_REJ_CORR). */
+#define VAL_OUT_MARGIN ((cs_real)0.30)
+static const cs_real VAL_AP_XI[6] = {
+    (cs_real)-10.0, (cs_real)-6.0, (cs_real)-4.0,
+    (cs_real)-2.0, (cs_real)-1.0, (cs_real)-0.5 };
+static const cs_real VAL_AP_UB[6] = {
+    (cs_real)0.0919, (cs_real)0.2172, (cs_real)0.3858,
+    (cs_real)0.8082, (cs_real)1.4248, (cs_real)2.1408 };
+
 /* forced-exit + iteration escalation (M1.4/B2, CAND-2) */
 #define FE_TAU ((cs_real)0.95)
 #define FE_XI_PAD ((cs_real)0.3)
@@ -773,6 +790,40 @@ int cs_rh_step(cs_rh *rh, const cs_real *x_meas, cs_real dt,
                 mask |= CS_RH_REJ_ETA;
             if (!(v_min > (cs_real)0))
                 mask |= CS_RH_REJ_VMIN;
+            {
+                /* outbound-envelope acceptance (CS_RH_REJ_CORR): check
+                 * the pre-apex nodes against the approach corridor */
+                int k_apex = 0;
+                cs_real xi_pk = rh->Xi_[2];
+                for (k = 1; k <= N; ++k) {
+                    if (rh->Xi_[(size_t)k * nx + 2] > xi_pk) {
+                        xi_pk = rh->Xi_[(size_t)k * nx + 2];
+                        k_apex = k;
+                    }
+                }
+                for (k = 0; k < k_apex; ++k) {
+                    const cs_real xi_k = rh->Xi_[(size_t)k * nx + 2];
+                    const cs_real eta_k = rh->Xi_[(size_t)k * nx + 3];
+                    cs_real ub;
+                    int j;
+                    if (xi_k > (cs_real)-0.5 || xi_k < (cs_real)-30.0)
+                        continue;
+                    ub = VAL_AP_UB[0];
+                    for (j = 0; j < 5; ++j) {
+                        if (xi_k > VAL_AP_XI[j]) {
+                            const cs_real t =
+                                (xi_k - VAL_AP_XI[j])
+                                / (VAL_AP_XI[j + 1] - VAL_AP_XI[j]);
+                            ub = VAL_AP_UB[j]
+                                + t * (VAL_AP_UB[j + 1] - VAL_AP_UB[j]);
+                        }
+                    }
+                    if (eta_k > ub + VAL_OUT_MARGIN) {
+                        mask |= CS_RH_REJ_CORR;
+                        break;
+                    }
+                }
+            }
         }
         if (!(qp_status > 0))
             mask |= CS_RH_REJ_QP;
