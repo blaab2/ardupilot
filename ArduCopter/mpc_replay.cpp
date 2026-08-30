@@ -180,6 +180,28 @@ void MPCTrajReplay::commit_pending()
     // MpcTurn) owns its own replay submode entry (start()/run()/stop())
     commit_assembled(plan.anchor_ms, false, true);
 #endif
+#if AP_BSOLVER_ENABLED
+    // The certified anytime MPC solves ONBOARD, so its committed prefix
+    // arrives here already lifted into local NED — no link in the control
+    // path.  auto_start is true: unlike AUTO's MpcTurn there is no outer mode
+    // owning the replay entry for this rung, so the first onboard plan enters
+    // GUIDED TrajStream itself.
+    if (copter.bsolver.enabled()) {
+        AP_BSolver::Plan bplan;
+        if (copter.bsolver.take_plan(bplan) &&
+            bplan.n > 0 && bplan.n <= TrajBuffer::TRAJ_MAX && bplan.dt_ms != 0 &&
+            !(copter.flightmode == &copter.mode_guided && copter.mode_guided.is_taking_off())) {
+            _traj.begin(uint16_t(_traj.pending_id + 1), bplan.n, bplan.dt_ms, bplan.drag_k);
+            for (uint16_t i = 0; i < bplan.n; i++) {
+                _traj.put(i, bplan.pos_n[i], bplan.pos_e[i],
+                          bplan.vel_n[i], bplan.vel_e[i],
+                          bplan.acc_n[i], bplan.acc_e[i]);
+            }
+            _traj.pending_next = bplan.n;
+            commit_assembled(bplan.anchor_ms, true, true);
+        }
+    }
+#endif
 }
 
 // shared commit tail of both ingress paths (see mpc_replay.h)
@@ -351,6 +373,10 @@ void MPCTrajReplay::run()
     // for the MAVLink/offboard path)
 #if AP_MPCSOLVER_ENABLED
     copter.mpc_solver.update();
+#endif
+#if AP_BSOLVER_ENABLED
+    // replay is running, so the ingress is by definition open
+    copter.bsolver.update(true);
 #endif
     commit_pending();
 

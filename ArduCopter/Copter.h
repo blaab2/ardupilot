@@ -174,6 +174,7 @@
 #include "mode.h"
 #include "mpc_replay.h"
 #include <AP_MPCSolver/AP_MPCSolver.h>
+#include <AP_BSolver/AP_BSolver.h>
 
 class Copter : public AP_Vehicle {
 public:
@@ -714,6 +715,9 @@ private:
     void twentyfive_hz_logging();
     void three_hz_loop();
     void one_hz_loop();
+#if AP_BSOLVER_ENABLED
+    void bsolver_update();
+#endif
     void init_simple_bearing();
     void update_simple_mode(void);
     void update_super_simple_bearing(bool force_update);
@@ -1072,6 +1076,11 @@ private:
     // Parameter wiring (MPC_ subgroup in ParametersG2) + boot init() call
     // are added with the AUTO MpcTurn stage.
     AP_MPCSolver mpc_solver;
+#endif
+#if AP_BSOLVER_ENABLED
+    // the certified anytime MPC, solved onboard (bsolver core, f64).
+    // Build-time exclusive with AP_MPCSolver: see AP_BSolver.h.
+    AP_BSolver bsolver;
 #endif
 #endif
     ModeLand mode_land;

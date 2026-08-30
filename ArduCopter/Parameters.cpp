@@ -1190,6 +1190,11 @@ const AP_Param::GroupInfo ParametersG2::var_info2[] = {
     // @Path: ../libraries/AP_MPCSolver/AP_MPCSolver.cpp
     AP_SUBGROUPPTR(mpc_solver_ptr, "MPC_", 23, ParametersG2, AP_MPCSolver),
 #endif
+#if AP_BSOLVER_ENABLED
+    // @Group: BSLV_
+    // @Path: ../libraries/AP_BSolver/AP_BSolver.cpp
+    AP_SUBGROUPPTR(bsolver_ptr, "BSLV_", 24, ParametersG2, AP_BSolver),
+#endif
 
     // ID 62 is reserved for the AP_SUBGROUPEXTENSION
 
@@ -1259,6 +1264,9 @@ ParametersG2::ParametersG2(void) :
 #endif
 #if MODE_GUIDED_ENABLED && AP_MPCSOLVER_ENABLED
     ,mpc_solver_ptr(&copter.mpc_solver)
+#endif
+#if AP_BSOLVER_ENABLED
+    ,bsolver_ptr(&copter.bsolver)
 #endif
 {
     AP_Param::setup_object_defaults(this, var_info);

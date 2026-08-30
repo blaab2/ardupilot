@@ -742,6 +742,10 @@ public:
     // we need a pointer to the onboard turn MPC for the G2 table (MPC_)
     void *mpc_solver_ptr;
 #endif
+#if AP_BSOLVER_ENABLED
+    // and to the onboard certified anytime MPC (BSLV_)
+    void *bsolver_ptr;
+#endif
 
 };
 

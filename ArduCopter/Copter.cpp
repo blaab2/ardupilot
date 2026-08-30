@@ -195,6 +195,26 @@ const AP_Scheduler::Task Copter::scheduler_tasks[] = {
     SCHED_TASK(loop_rate_logging, LOOP_RATE,    50,  75),
 #endif
     SCHED_TASK(one_hz_loop,            1,    100,  81),
+#if AP_BSOLVER_ENABLED
+    // The onboard certified anytime MPC is serviced independently of the
+    // flight mode: its FIRST plan is what enters GUIDED TrajStream, so
+    // servicing it from MPCTrajReplay::run() (which only runs once TrajStream
+    // is active) is circular and the solver never starts.
+    //
+    // PLACEMENT IS LOAD-BEARING.  AP_Scheduler.cpp:161 requires this table to
+    // be sorted by ASCENDING priority; it raises internal error 0x100000
+    // (flow_of_control) at BOOT otherwise, and that latched internal error is
+    // then what refuses the arm -- with a message that never mentions the
+    // scheduler.  Priority 82 must therefore sit between one_hz_loop (81) and
+    // ekf_check (84).  Placing it before one_hz_loop cost two SITL sessions to
+    // a misread "the solve overran the main loop" diagnosis.
+    //
+    // Cheap by construction: this slot only triggers init, checks the
+    // self-engage condition and hands any finished plan to replay.  The SOLVE
+    // runs on the AP_BSolver "BSLV" thread -- it costs hundreds of ms on this
+    // target (B3: 469.5 ms at q = 1) and cannot live in a scheduler slot.
+    SCHED_TASK(bsolver_update,        10,    120,  82),
+#endif
     SCHED_TASK(ekf_check,             10,     75,  84),
     SCHED_TASK(check_vibration,       10,     50,  87),
     SCHED_TASK(gpsglitch_check,       10,     50,  90),
@@ -774,6 +794,20 @@ uint32_t Copter::ap_value() const
 }
 
 // one_hz_loop - runs at 1Hz
+#if AP_BSOLVER_ENABLED
+// service the onboard certified anytime MPC and commit any plan it produced.
+// Mode-independent by design -- see the scheduler entry.
+void Copter::bsolver_update()
+{
+    // The ingress refuses plans mid-takeoff (mpc_replay.cpp), so the solver
+    // must not start its mission clock before then either.
+    const bool ingress_ready = !(flightmode == &mode_guided &&
+                                 mode_guided.is_taking_off());
+    bsolver.update(ingress_ready);
+    mpc_replay.commit_pending();
+}
+#endif
+
 void Copter::one_hz_loop()
 {
 #if HAL_LOGGING_ENABLED

@@ -30,7 +30,13 @@ def build(bld):
             # core, compiled through the per-file mpc_build_*.c wrapper TUs
             # (f32 flight config; see AP_MPCSolver/mpc_cs_defs.h and
             # scripts/mpc/csolver/sync_firmware.sh)
-            'AP_MPCSolver'
+            'AP_MPCSolver',
+            # the certified anytime MPC solved ONBOARD: AP_BSolver class +
+            # the vendored bsolver C core (f64; see AP_BSolver/AP_BSolver.h
+            # and scripts/mpc/bsolver/sync_firmware.sh).  Mutually exclusive
+            # with AP_MPCSolver at build time -- the two do not fit together
+            # on the target (614 kB against 507 kB free heap).
+            'AP_BSolver'
         ],
     )
 

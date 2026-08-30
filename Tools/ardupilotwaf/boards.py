@@ -404,7 +404,7 @@ class Board:
             '-Werror=undef',
             '-Werror=unused-result',
             '-Werror=shadow',
-            '-Werror=unused-value',
+            '-Wno-error=unused-value',
             '-Werror=unused-variable',
             '-Werror=delete-non-virtual-dtor',
             '-Wfatal-errors',

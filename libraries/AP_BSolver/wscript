@@ -1,0 +1,46 @@
+def configure(cfg):
+    # The bsolver core is f64 BY CONSTRUCTION: doc/bsolver.tex section 3
+    # measures cond(H) up to 5.2e8, at which single precision leaves the
+    # Newton direction with no correct digits.  ArduPilot compiles with
+    # -fsingle-precision-constant, which would silently truncate every
+    # unsuffixed literal in the core AND every entry of the generated model
+    # table to float — destroying the bit-identity with the certificates that
+    # B0/B1 exist to establish.
+    cfg.env.DOUBLE_PRECISION_LIBRARIES['AP_BSolver'] = True
+
+    # ------------------------------------------------ WHICH TABLES ARE FLOWN
+    # The generated tables are a BUILD-TIME choice, exactly as on the host
+    # (scripts/mpc/bsolver/host/Makefile target `corner`): the record pair
+    # (N = 40, anchored corner) and the corner-online pair (N = 30, affine
+    # seams) define the SAME symbols and cannot coexist in one translation
+    # unit, so the selection is a substitution, never an edit to a #include.
+    #
+    #   BS_DATA_HEADER  is consumed by bsolver/core/bs_solver.h, so its path
+    #                   is relative to bsolver/core/ (same geometry as the
+    #                   host build, which is why the vendored copy needs no
+    #                   rewriting).
+    #   BS_REF_HEADER   is consumed by AP_BSolver.cpp, so its path is
+    #                   relative to this directory.
+    #   BS_DRV_NV       mirrors BS_NV of the selected model header for the
+    #                   driver's own fixed-size buffers, which are declared
+    #                   in AP_BSolver.h and must not pull the 94 kB table
+    #                   header into every TU that includes it.  AP_BSolver.cpp
+    #                   static_asserts BS_DRV_NV == BS_NV, so a stale value
+    #                   here is a COMPILE ERROR, not a silent overrun.
+    #
+    # Both flags go to the C and the C++ side: the core TU is compiled as C
+    # through bs_build_solver.c, and AP_BSolver.cpp includes the same core
+    # header, so a one-sided define would give the two TUs different tables.
+    corner_flags = [
+        '-DBS_DATA_HEADER="../model/generated/bs_model_corner_data.h"',
+        '-DBS_REF_HEADER="bsolver/model/generated/bs_reference_corner_data.h"',
+        '-DBS_DRV_NV=90',
+    ]
+
+    # DOUBLE_PRECISION_LIBRARIES patches CXXFLAGS only, and the vendored core
+    # is compiled as C through bs_build_solver.c, so the C path needs it too.
+    cfg.env.AP_LIB_EXTRA_CFLAGS['AP_BSolver'] = [
+        '-fno-single-precision-constant',
+        '-DAP_MATH_ALLOW_DOUBLE_FUNCTIONS=1',
+    ] + corner_flags
+    cfg.env.AP_LIB_EXTRA_CXXFLAGS['AP_BSolver'] = list(corner_flags)
