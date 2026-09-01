@@ -196,6 +196,7 @@ private:
     AP_Int8  _q;                 // Newton iterations per maintained solve
     AP_Int16 _qe;                // cap on the engage seed's Newton steps
     AP_Int8  _ir;                // restrict the setup to the pinned rows
+    AP_Int8  _ingress;           // engage away from the path start (BSLV_INGRESS)
 
     bool _inited;
     bool _thread_created;

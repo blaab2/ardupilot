@@ -37,7 +37,8 @@
  * Guarded, NOT deleted: the record build is still the certified one and B1
  * is stated on this clock. */
 const bs_schedule bs_sched_periodic = {
-    bs_periodic_family, bs_periodic_rot, NULL, BS_N_PHASE, 1
+    bs_periodic_family, bs_periodic_rot, NULL, BS_N_PHASE, 1,
+    NULL, NULL, NULL
 };
 #endif
 const bs_schedule bs_sched_mission = {
@@ -47,7 +48,8 @@ const bs_schedule bs_sched_mission = {
 #else
     NULL,                      /* the record's mission has no affine part */
 #endif
-    BS_N_MISSION, 0
+    BS_N_MISSION, 0,
+    NULL, NULL, NULL           /* no RAM-extra tables on a flash schedule */
 };
 
 /* The affine part of a schedule that has none.  off_of() hands this back for
@@ -68,8 +70,9 @@ static int tick_of(const bs_schedule *schedule, int t)
 
 static const bs_real *rot_of(const bs_schedule *schedule, int t)
 {
-    return &bs_rot[(size_t)schedule->rotation[tick_of(schedule, t)]
-                   * NX * NX];
+    const int idx = schedule->rotation[tick_of(schedule, t)];
+    if (idx < 0) return schedule->rot_extra;      /* runtime seam (ingress) */
+    return &bs_rot[(size_t)idx * NX * NX];
 }
 
 /* The affine seam offset applied at DESTINATION tick t, i.e. the c(t) of
@@ -78,13 +81,16 @@ static const bs_real *rot_of(const bs_schedule *schedule, int t)
  * encoding, slot 0 the zero vector as slot 0 of bs_rot is the identity. */
 static const bs_real *off_of(const bs_schedule *schedule, int t)
 {
-#ifdef BS_NOFF
     if (schedule->offset == NULL) return bs_off_zero;
-    return &bs_off[(size_t)schedule->offset[tick_of(schedule, t)] * NX];
+    {
+        const int idx = schedule->offset[tick_of(schedule, t)];
+        if (idx < 0) return schedule->off_extra;  /* runtime seam (ingress) */
+#ifdef BS_NOFF
+        return &bs_off[(size_t)idx * NX];
 #else
-    (void)schedule; (void)t;
-    return bs_off_zero;
+        return bs_off_zero;                       /* no flash table to index */
 #endif
+    }
 }
 
 static int family_of(const bs_schedule *schedule, int t)
@@ -92,9 +98,22 @@ static int family_of(const bs_schedule *schedule, int t)
     return schedule->family[tick_of(schedule, t)];
 }
 
-static const bs_real *row_block(int family)
+static const bs_real *rows_of(const bs_schedule *schedule, int t)
 {
+    const int family = schedule->family[tick_of(schedule, t)];
+    if (family < 0) return schedule->rows_extra;  /* runtime family (ingress) */
     return &bs_rows[(size_t)family * NR * 10];
+}
+
+/* Terminal-law family lookup: bs_P / bs_K have no RAM-extra entry, and by
+ * the ingress driver's construction (prefix capped at BS_N ticks) a negative
+ * family never reaches a horizon-terminal tick.  Clamp defensively to the
+ * trim family rather than index flash with a negative — wrong-but-bounded
+ * beats out-of-bounds if the invariant is ever broken. */
+static int terminal_family_of(const bs_schedule *schedule, int t)
+{
+    const int family = family_of(schedule, t);
+    return (family < 0) ? 0 : family;
 }
 
 /* c = a * b, (m x k) * (k x n), all row-major. */
@@ -198,7 +217,7 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
     problem->scratch = cursor;
 
     const bs_real *Pterm =
-        &bs_P[(size_t)family_of(schedule, phase + NN) * NX * NX];
+        &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
     bs_real *WG = problem->scratch;            /* NX x NV */
     bs_real *WA = WG + (size_t)NX * NV;        /* NX x NX */
     bs_real phi[NX * NX], next[NX * NX], TA[NX * NX], TB[NX * NU];
@@ -435,7 +454,7 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
             for (int j = 0; j < NU; ++j)
                 quad += U[t * NU + i] * bs_R[(size_t)i * NU + j] * U[t * NU + j];
     const bs_real *Pterm =
-        &bs_P[(size_t)family_of(schedule, phase + NN) * NX * NX];
+        &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
     for (int t = 0; t < NN; ++t) {
         const bs_real *W = (t == NN - 1) ? Pterm : bs_Q;
         const bs_real *x = &states[t * NX];
@@ -488,7 +507,7 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
 
     bs_real barrier = 0.0;
     for (int t = 0; t < NN; ++t) {
-        const bs_real *rows = row_block(family_of(schedule, phase + t));
+        const bs_real *rows = rows_of(schedule, phase + t);
         const bs_real *state = (t == 0) ? xi : &states[(t - 1) * NX];
         const int width = NU * (t + 1);
         const int deriv = want_derivatives && (t >= t_start);
@@ -662,8 +681,8 @@ void bs_shift_append(const bs_problem *problem, const bs_real *U,
     bs_terminal_state(problem, U, xi, terminal);
     for (int i = 0; i < NV - NU; ++i) U_shifted[i] = U[i + NU];
     const bs_real *K =
-        &bs_K[(size_t)family_of(problem->schedule, problem->phase + NN)
-              * NU * NX];
+        &bs_K[(size_t)terminal_family_of(problem->schedule,
+                                         problem->phase + NN) * NU * NX];
     for (int i = 0; i < NU; ++i) {
         bs_real acc = 0.0;
         for (int j = 0; j < NX; ++j) acc += K[(size_t)i * NX + j] * terminal[j];

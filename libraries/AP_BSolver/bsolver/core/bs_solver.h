@@ -87,6 +87,19 @@ typedef struct {
     const int *offset;     /* NULL == no affine part, i.e. all-zero */
     int length;
     int periodic;
+    /* RAM-extra tables for RUNTIME-BUILT schedules (the ingress prefix of
+     * BSLV_INGRESS).  Flash schedules leave them NULL — their positional
+     * initializers zero the trailing fields — and a NEGATIVE index in
+     * family/rotation/offset selects the extra entry: family -1 reads
+     * rows_extra (one BS_NROW x 10 block), rotation -1 reads rot_extra
+     * (one BS_NX x BS_NX matrix), offset -1 reads off_extra (one BS_NX
+     * vector).  A negative family must never sit at a horizon-terminal
+     * tick: bs_P / bs_K carry no extra entry (the ingress driver caps the
+     * prefix at BS_N ticks so the terminal family is always a flash one).
+     * The non-negative path is bit-identical to the pre-extension core. */
+    const bs_real *rows_extra;
+    const bs_real *rot_extra;
+    const bs_real *off_extra;
 } bs_schedule;
 
 #ifdef BS_N_PHASE
