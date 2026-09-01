@@ -123,8 +123,9 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
     // the re-timing kick through the corner windows, the corridor is missed
     // by 2-4x and the in-window |e_c| runs to 2.69-3.74 m against the 2.0 m
     // band.  At q = 2 the host C mission closes it (|e_c| 1.9618, |e_l|
-    // 2.7721) and the WCET fits: 135.7 ms on the Cube against the 250 ms
-    // tick, 46 % margin.
+    // 2.7721) and the WCET fits: 132.2 ms on the Cube against the 250 ms
+    // tick (worst of two boots on the deployed anisotropic configuration;
+    // 39-47 % margin after the x1.16 whole-tick calibration).
     //
     // The record's N = 40 ANCHORED configuration read the other way round
     // (uniform q >= 1 certified on the interleaved cadence,
