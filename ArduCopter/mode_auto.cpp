@@ -37,6 +37,14 @@ bool ModeAuto::init(bool ignore_checks)
         mpc_turn_teardown();
         mpc_turn_inhibit_idx = 0xFFFF;
 #endif
+#if AUTO_BSLV_ENABLED
+        // fresh AUTO session: any previous run's state (incl. the sticky
+        // finished flag) resets so the compiled run can engage again
+        bslv_teardown();
+        bslv_stage = BslvStage::IDLE;
+        bslv_inhibit = false;
+        copter.bsolver.reset_mission();
+#endif
 
         // stop ROI from carrying over from previous runs of the mission
         // To-Do: reset the yaw as part of auto_wp_start when the previous command was not a wp command to remove the need for this special ROI check
@@ -85,6 +93,12 @@ void ModeAuto::exit()
     }
     mpc_turn_teardown();
 #endif
+#if AUTO_BSLV_ENABLED
+    if (bslv_stage == BslvStage::ENGAGED || bslv_stage == BslvStage::ARMED) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: run aborted (mode change)");
+    }
+    bslv_teardown();
+#endif
     if (copter.mode_auto.mission.state() == AP_Mission::MISSION_RUNNING) {
         copter.mode_auto.mission.stop();
     }
@@ -126,6 +140,14 @@ void ModeAuto::run()
             }
             mpc_turn_planner.invalidate();
 #endif
+#if AUTO_BSLV_ENABLED
+            if (bslv_stage == BslvStage::ENGAGED) {
+                bslv_abort("mission changed");
+            } else if (bslv_stage == BslvStage::ARMED) {
+                bslv_teardown();
+            }
+            // tables no longer match; the builder recompiles via its poll
+#endif
             // if mission is running restart the current command if it is a waypoint or spline command
             if ((mission.state() == AP_Mission::MISSION_RUNNING) && (_mode == SubMode::WP)) {
                 if (mission.restart_current_nav_cmd()) {
@@ -144,6 +166,11 @@ void ModeAuto::run()
     // onboard turn-MPC state machine: snapshot service + engage gate while a
     // turn is armed, exit decision while SubMode::MPC_TURN flies
     mpc_turn_update();
+#endif
+#if AUTO_BSLV_ENABLED
+    // anytime-MPC run state machine: engage gate while ARMED, completion
+    // and consistency watch while ENGAGED
+    bslv_update();
 #endif
 
     // call the correct auto controller
@@ -198,6 +225,11 @@ void ModeAuto::run()
 #if AUTO_MPC_TURN_ENABLED
     case SubMode::MPC_TURN:
         mpc_turn_run();
+        break;
+#endif
+#if AUTO_BSLV_ENABLED
+    case SubMode::BSLV_MISSION:
+        bslv_run();
         break;
 #endif
     }
@@ -285,6 +317,9 @@ bool ModeAuto::move_vehicle_on_ekf_reset() const
 #if AUTO_MPC_TURN_ENABLED
     case SubMode::MPC_TURN:
 #endif
+#if AUTO_BSLV_ENABLED
+    case SubMode::BSLV_MISSION:
+#endif
         // these submodes smoothly move to maintain an absolute position
         return true;
     }
@@ -296,6 +331,13 @@ bool ModeAuto::move_vehicle_on_ekf_reset() const
 // Go straight to landing sequence via DO_LAND_START, if succeeds pretend to be Auto RTL mode
 bool ModeAuto::jump_to_landing_sequence_auto_RTL(ModeReason reason)
 {
+#if AUTO_BSLV_ENABLED
+    // the jump re-dispatches start_command under an engaged run: release
+    // the replay and the envelope BEFORE the landing sequence takes over
+    if (bslv_stage == BslvStage::ENGAGED || bslv_stage == BslvStage::ARMED) {
+        bslv_abort("auto RTL");
+    }
+#endif
     if (!mission.jump_to_landing_sequence(get_stopping_point())) {
         LOGGER_WRITE_ERROR(LogErrorSubsystem::FLIGHT_MODE, LogErrorCode(Number::AUTO_RTL));
         // make sad noise
@@ -312,6 +354,11 @@ bool ModeAuto::jump_to_landing_sequence_auto_RTL(ModeReason reason)
 // Join mission after DO_RETURN_PATH_START waypoint, if succeeds pretend to be Auto RTL mode
 bool ModeAuto::return_path_start_auto_RTL(ModeReason reason)
 {
+#if AUTO_BSLV_ENABLED
+    if (bslv_stage == BslvStage::ENGAGED || bslv_stage == BslvStage::ARMED) {
+        bslv_abort("auto RTL");
+    }
+#endif
     if (!mission.jump_to_closest_mission_leg(get_stopping_point())) {
         LOGGER_WRITE_ERROR(LogErrorSubsystem::FLIGHT_MODE, LogErrorCode(Number::AUTO_RTL));
         // make sad noise
@@ -1870,8 +1917,168 @@ bool ModeAuto::get_loc_from_cmd(const AP_Mission::Mission_Command& cmd, const Lo
 }
 
 // do_nav_wp - initiate move to next waypoint
+#if AUTO_BSLV_ENABLED
+// ============================ BSLV_MISSION ============================
+// The onboard anytime MPC flies the compiled waypoint run through
+// MPCTrajReplay, patterned on the MpcTurn lifecycle: ARM at the run's
+// first waypoint, stage the stock leg toward it, ENGAGE via the READY
+// gate (classic rest at the start, or the ingress leg from a hover),
+// cooperative verify for per-item GCS progress, finish at the terminal
+// hover.  Every abort restores stock AUTO for the rest of the session.
+
+void ModeAuto::bslv_check_arm(const AP_Mission::Mission_Command &cmd)
+{
+    if (bslv_stage != BslvStage::IDLE || bslv_inhibit ||
+        !copter.bsolver.enabled() || !copter.bsolver.mission_ready()) {
+        return;
+    }
+    if (cmd.index != copter.bsolver.run_first_idx()) {
+        return;
+    }
+    copter.bsolver.reset_mission();
+    bslv_stage = BslvStage::ARMED;
+    bslv_park_ms = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: run armed (wp %u-%u)",
+                  (unsigned)copter.bsolver.run_first_idx(),
+                  (unsigned)copter.bsolver.run_last_idx());
+}
+
+void ModeAuto::bslv_update()
+{
+    if (!copter.bsolver.enabled()) {
+        return;
+    }
+    // consistency guard: the submode changed under an engaged run (an
+    // auto_RTL jump, a scripted submode, ...) — release everything
+    if (bslv_stage == BslvStage::ENGAGED &&
+        _mode != SubMode::BSLV_MISSION) {
+        bslv_teardown();
+        return;
+    }
+    if (bslv_stage == BslvStage::ARMED) {
+        if (_mode != SubMode::WP) {
+            return;
+        }
+        if (is_disarmed_or_landed() || wp_nav->paused()) {
+            return;
+        }
+        if (!copter.bsolver.mission_ready()) {
+            bslv_teardown();           // tables invalidated under us
+            return;
+        }
+        if (copter.bsolver.engage_try()) {
+            // the MpcTurn contract order: replay first (captures the
+            // staged desired state for the bridge), then the solver
+            copter.mpc_replay.start();
+            copter.bsolver.engage();
+            bslv_expected_idx =
+                (uint16_t)(copter.bsolver.run_first_idx() + 1);
+            bslv_engage_ms = millis();
+            set_submode(SubMode::BSLV_MISSION);
+            bslv_stage = BslvStage::ENGAGED;
+            return;
+        }
+        // parked at the run start without engaging: hand back to stock
+        if (wp_nav->reached_wp_destination()) {
+            if (bslv_park_ms == 0) {
+                bslv_park_ms = millis();
+            } else if (millis() - bslv_park_ms > 10000) {
+                bslv_inhibit = true;
+                bslv_teardown();
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "BSLV: engage timeout, stock AUTO");
+            }
+        }
+        return;
+    }
+    if (bslv_stage == BslvStage::ENGAGED) {
+        if (copter.bsolver.finished()) {
+            bslv_finish();
+            return;
+        }
+        if (!copter.bsolver.active()) {
+            bslv_abort("solver stopped");
+            return;
+        }
+        // the replay ran out of plan mid-run and station-kept too long
+        if (copter.mpc_replay.hold_active() &&
+            millis() - bslv_engage_ms > 20000) {
+            bslv_abort("no plan");
+        }
+    }
+}
+
+void ModeAuto::bslv_run()
+{
+    if (is_disarmed_or_landed()) {
+        bslv_teardown();
+        make_safe_ground_handling(copter.is_tradheli() &&
+                                  motors->get_interlock());
+        return;
+    }
+    copter.motors->set_desired_spool_state(
+        AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    copter.mpc_replay.run();
+}
+
+void ModeAuto::bslv_finish()
+{
+    // the run is complete and the replay holds the terminal hover
+    bslv_teardown();
+    bslv_stage = BslvStage::DONE;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: run complete");
+    // safe owner for the gap until the mission advances (the DONE branch
+    // of verify releases the run's last item next mission.update())
+    loiter_start();
+}
+
+void ModeAuto::bslv_abort(const char *reason)
+{
+    bslv_teardown();
+    bslv_inhibit = true;               // stock AUTO for this session
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "BSLV: run abort (%s)", reason);
+    if (mission.state() == AP_Mission::MISSION_RUNNING &&
+        mission.restart_current_nav_cmd()) {
+        // stock AUTO re-flies the current leg from a clean wp_start
+    } else {
+        loiter_start();
+    }
+}
+
+void ModeAuto::bslv_teardown()
+{
+    bslv_stage = BslvStage::IDLE;
+    bslv_park_ms = 0;
+    copter.mpc_replay.stop();
+    copter.bsolver.disengage();
+    // undo what MPCTrajReplay::start() changed (mpc_turn_teardown's
+    // restore, verbatim): the NE envelope and the drag feed-forward
+    copter.pos_control->NE_set_max_speed_accel_m(
+        wp_nav->get_default_speed_NE_ms(),
+        wp_nav->get_wp_acceleration_mss());
+    copter.pos_control->NE_set_correction_speed_accel_m(
+        wp_nav->get_default_speed_NE_ms(),
+        wp_nav->get_wp_acceleration_mss());
+    copter.pos_control->set_drag_accel_ff_NE_mss(Vector2f{}, true);
+}
+#endif // AUTO_BSLV_ENABLED
+
 void ModeAuto::do_nav_wp(const AP_Mission::Mission_Command& cmd)
 {
+#if AUTO_BSLV_ENABLED
+    // While the anytime MPC flies the run, the cooperative verify below
+    // advances AP_Mission item by item; each advance re-enters here.  The
+    // EXPECTED in-run item is bookkeeping only (the solver already flies
+    // it); anything else means the sequence changed under us.
+    if (bslv_stage == BslvStage::ENGAGED) {
+        if (cmd.index == bslv_expected_idx) {
+            bslv_expected_idx++;
+            return;
+        }
+        bslv_abort("mission seq changed");
+        // fall through: stock handling flies this unexpected leg
+    }
+#endif
     // calculate default location used when lat, lon or alt is zero
     Location default_loc = copter.current_loc;
 
@@ -1902,8 +2109,20 @@ void ModeAuto::do_nav_wp(const AP_Mission::Mission_Command& cmd)
         loiter_time_max = cmd.p1;
     }
 
+#if AUTO_BSLV_ENABLED
+    // arm the anytime-MPC takeover when this leg targets the compiled
+    // run's first waypoint; the staged leg then plans a FULL STOP there
+    // (no next-wp preload), where the classic rest-engage gate fires if
+    // the ingress did not engage earlier from the hover.
+    bslv_check_arm(cmd);
+    const bool bslv_staging = (bslv_stage == BslvStage::ARMED &&
+                               copter.bsolver.mission_ready() &&
+                               cmd.index == copter.bsolver.run_first_idx());
+#else
+    const bool bslv_staging = false;
+#endif
     // set next destination if necessary
-    if (!set_next_wp(cmd, target_loc)) {
+    if (!bslv_staging && !set_next_wp(cmd, target_loc)) {
         // failure to set next destination can only be because of missing terrain data
         copter.failsafe_terrain_on_event();
         return;
@@ -2597,6 +2816,35 @@ bool ModeAuto::verify_yaw()
 // verify_nav_wp - check if we have reached the next way point
 bool ModeAuto::verify_nav_wp(const AP_Mission::Mission_Command& cmd)
 {
+#if AUTO_BSLV_ENABLED
+    if (bslv_stage == BslvStage::ARMED && copter.bsolver.mission_ready() &&
+        cmd.index == copter.bsolver.run_first_idx()) {
+        // park the mission at the run start while the takeover stages
+        return false;
+    }
+    if (bslv_stage == BslvStage::ENGAGED) {
+        const int32_t tv = copter.bsolver.tau_vertex(cmd.index);
+        if (tv >= 0) {
+            if (cmd.index == copter.bsolver.run_last_idx()) {
+                return false;          // the finish path releases this one
+            }
+            if (copter.bsolver.mission_tau() > tv) {
+                // the solver's clock passed this vertex: true per-item
+                // progress for the GCS, no wp_nav involvement
+                AP_Notify::events.waypoint_complete = 1;
+                gcs().send_text(MAV_SEVERITY_INFO, "Reached command #%i",
+                                cmd.index);
+                return true;
+            }
+            return false;
+        }
+    }
+    if (bslv_stage == BslvStage::DONE && copter.bsolver.mission_ready() &&
+        cmd.index == copter.bsolver.run_last_idx()) {
+        bslv_stage = BslvStage::IDLE;  // consumed; the mission moves on
+        return true;
+    }
+#endif
     // check if we have reached the waypoint
     if ( !copter.wp_nav->reached_wp_destination() ) {
         return false;

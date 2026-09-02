@@ -803,12 +803,9 @@ void Copter::bsolver_update()
     // and the configured cruise speed; rebuilds run on the solver thread.
     bsolver.mission_poll(mode_auto.mission,
                          wp_nav->get_default_speed_NE_ms());
-    // The ingress refuses plans mid-takeoff (mpc_replay.cpp), so the solver
-    // must not start its mission clock before then either.
-    const bool ingress_ready = !(flightmode == &mode_guided &&
-                                 mode_guided.is_taking_off());
-    bsolver.update(ingress_ready);
-    mpc_replay.commit_pending();
+    bsolver.update(true);      // init + re-broadcast only; the AUTO
+                               // submode owns engagement and the replay
+                               // services commit_pending from run()
 }
 #endif
 

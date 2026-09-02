@@ -36,6 +36,8 @@
 
 class MPCTrajReplay {
 public:
+    // Tier-2 station-keep currently holding (no live plan)?
+    bool hold_active() const { return _hold_active; }
     MPCTrajReplay() {}
 
     CLASS_NO_COPY(MPCTrajReplay);

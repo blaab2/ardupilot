@@ -17,6 +17,13 @@
 #define AUTO_MPC_TURN_ENABLED (AP_MPCSOLVER_ENABLED && MODE_GUIDED_ENABLED && MODE_AUTO_ENABLED)
 #endif
 
+// AUTO BSLV_MISSION stage: the onboard anytime MPC flies whole waypoint
+// runs of the uploaded mission (runtime-built tables) through the shared
+// MPCTrajReplay helper.  Build-exclusive with MPC_TURN (the cores are).
+#ifndef AUTO_BSLV_ENABLED
+#define AUTO_BSLV_ENABLED (AP_BSOLVER_ENABLED && MODE_GUIDED_ENABLED && MODE_AUTO_ENABLED)
+#endif
+
 class Parameters;
 class ParametersG2;
 
@@ -586,10 +593,29 @@ public:
 #if AUTO_MPC_TURN_ENABLED
         MPC_TURN,           // onboard turn-MPC flies a detected headland turn (MPCTrajReplay)
 #endif
+#if AUTO_BSLV_ENABLED
+        BSLV_MISSION,       // onboard anytime MPC flies the compiled waypoint run (MPCTrajReplay)
+#endif
     };
 
     // set submode.  returns true on success, false on failure
     void set_submode(SubMode new_submode);
+
+#if AUTO_BSLV_ENABLED
+    // ---- onboard anytime MPC: whole-run mission flight ----
+    enum class BslvStage : uint8_t { IDLE, ARMED, ENGAGED, DONE };
+    void bslv_check_arm(const AP_Mission::Mission_Command &cmd);
+    void bslv_update();
+    void bslv_run();
+    void bslv_finish();
+    void bslv_abort(const char *reason);
+    void bslv_teardown();
+    BslvStage bslv_stage;
+    uint16_t bslv_expected_idx;    // next in-run index start_command hands us
+    uint32_t bslv_engage_ms;
+    uint32_t bslv_park_ms;         // armed-but-unengaged dwell at the start
+    bool bslv_inhibit;             // stock AUTO flies the run this session
+#endif
 
     // pause continue in auto mode
     bool pause() override;

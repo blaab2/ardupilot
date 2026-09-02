@@ -177,18 +177,8 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
     // thing here that changes bs_problem_init's contract.
     AP_GROUPINFO("IR", 4, AP_BSolver, _ir, 1),
 
-    // @Param: INGRESS
-    // @DisplayName: Engage away from the path start via an ingress leg
-    // @Values: 0:Classic rest-engage only,1:Ingress engage enabled
-    // @User: Advanced
-    // With INGRESS = 1 the READY gate also fires away from the path start:
-    // after the climb completes (|vz| < 0.5 m/s for 1 s) at near-hover, the
-    // approach to the path start is built as the FIRST LEG of the anytime
-    // problem (a negative-tau prefix of plain row-family cells with the
-    // corridor pair at 5 m; INGRESS-CAMPAIGN.md + the slow-junction /
-    // existing-family probes).  Every refusal falls back to the classic
-    // READY gate unchanged; 0 keeps today's behaviour exactly.
-    AP_GROUPINFO("INGRESS", 5, AP_BSolver, _ingress, 0),
+    // (param index 5 was BSLV_INGRESS, retired 2026-09-02: the ingress
+    // leg is now the unconditional AUTO approach — do not reuse the slot)
 
     AP_GROUPEND
 };
@@ -704,6 +694,8 @@ void AP_BSolver::engage()
 void AP_BSolver::disengage()
 {
     _active = false;
+    WITH_SEMAPHORE(_plan_sem);
+    _plan_valid = false;
 }
 
 void AP_BSolver::mission_poll(AP_Mission &mission, float v_cap_ms)
@@ -753,81 +745,103 @@ void AP_BSolver::update(bool ingress_ready)
                           (unsigned)(bs_workspace_size() * sizeof(double)));
         }
     }
-    // THE READY GATE, and the only place this class reads the AHRS.  The
-    // mission clock starts at tau = 0 from the reference's rest-engage IC,
-    // whose lifted node 0 is the path start; engaging anywhere else hands the
-    // position controller a step it did not ask for.  So: armed, airborne,
-    // the ingress actually open, and the vehicle station-keeping within
-    // READY_RADIUS_M of the path start.
-    //
-    // The ingress term is not decoration.  Measured before it existed, the
-    // solver self-engaged at 2 m during the GUIDED takeoff — while replay
-    // still refuses plans — and burned 35 ticks at zero along-track speed,
-    // slipping the assignment offset by one EVERY tick before tracking began.
-    //
-    // Deliberately NOT triggered over MAVLink: the point of this architecture
-    // is that nothing in the control path crosses a link.
-    if (!_active) {
-        // A finished mission stays finished: re-evaluating the gate after
-        // completion could rewind tau (a larger ingress prefix than the
-        // engage's) and resume publishing from stale end-of-mission state.
-        // Re-engagement is a reboot/re-init flow, not a gate flow.
-        if (_finished) {
-            return;
-        }
-        Vector3p p;
-        Vector3f v;
-        if (mt != nullptr && ingress_ready && hal.util->get_soft_armed() &&
-            AP::ahrs().get_relative_position_NED_origin(p) &&
-            AP::ahrs().get_velocity_NED(v) && (-p.z) > 2.0) {
-            const double dn = (double)p.x - mt->path[0];
-            const double de = (double)p.y - mt->path[1];
-            const float speed = v.xy().length();
-            if (dn * dn + de * de <= (double)READY_RADIUS_M * READY_RADIUS_M &&
-                speed <= READY_SPEED_MS) {
-                ing_n = 0;                     // classic rest-engage
-                engage();
-            } else if (_ingress != 0 && speed <= READY_SPEED_MS) {
-                // THE INGRESS GATE (BSLV_INGRESS = 1).  Same near-hover
-                // requirement, no radius: the approach becomes the first
-                // leg of the problem.  Climb-complete (D1): |vz| < 0.5 m/s
-                // sustained for 1 s, so a GUIDED takeoff still in its climb
-                // cannot trigger it.
-                const uint32_t now_ms = AP_HAL::millis();
-                if (fabsf(v.z) < 0.5f) {
-                    if (ing_climb_ok_ms == 0) {
-                        ing_climb_ok_ms = now_ms;
-                    }
-                } else {
-                    ing_climb_ok_ms = 0;
-                }
-                if (ing_climb_ok_ms != 0 &&
-                    now_ms - ing_climb_ok_ms >= 1000) {
-                    if (ing_build(p)) {
-                        // the RAM tables just changed under the same
-                        // possible cache key: force a rebuild
-                        _problem_phase = INT32_MIN;
-                        _problem_npin = -1;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "BSLV: ingress %ld cells chi %+d deg",
-                                      (long)ing_n,
-                                      (int)lround(ing_ang_deg));
-                        engage();
-                    } else if (now_ms - ing_txt_ms >= 5000) {
-                        ing_txt_ms = now_ms;
-                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                      "BSLV: ingress too far for %d cells",
-                                      (int)ING_MAX);
-                    }
-                }
+    // ENGAGEMENT MOVED TO THE OWNING MODE (AUTO's BSLV_MISSION submode
+    // calls engage_try() while its run is armed).  This slot keeps only
+    // init and the re-broadcast; the solve is on the solver thread.
+    (void)ingress_ready;
+}
+
+// THE READY GATE, relocated from update(): the only place this class
+// reads the AHRS.  Called by the owning mode (AUTO, staged toward the
+// run's first waypoint) every loop while it wants engagement.  Two ways
+// in: CLASSIC rest-engage within READY_RADIUS_M of the path start, or
+// the INGRESS leg from any near-hover within the prefix cap — the
+// approach then becomes the first leg of the anytime problem.  Returns
+// true when the gate passed and any ingress leg is built; the CALLER
+// then runs the engage contract in order: mpc_replay.start() (captures
+// the pre-engage desired state) followed by engage().
+bool AP_BSolver::engage_try()
+{
+    if (_enable == 0 || !_inited || _active || _finished ||
+        mt == nullptr) {
+        return false;
+    }
+    Vector3p p;
+    Vector3f v;
+    if (!(hal.util->get_soft_armed() &&
+          AP::ahrs().get_relative_position_NED_origin(p) &&
+          AP::ahrs().get_velocity_NED(v) && (-p.z) > 2.0)) {
+        ing_climb_ok_ms = 0;
+        return false;
+    }
+    const double dn = (double)p.x - mt->path[0];
+    const double de = (double)p.y - mt->path[1];
+    const float speed = v.xy().length();
+    if (dn * dn + de * de <= (double)READY_RADIUS_M * READY_RADIUS_M &&
+        speed <= READY_SPEED_MS) {
+        ing_n = 0;                     // classic rest-engage at the start
+        return true;                   // caller: replay.start(); engage()
+    }
+    if (speed <= READY_SPEED_MS) {
+        const uint32_t now_ms = AP_HAL::millis();
+        if (fabsf(v.z) < 0.5f) {
+            if (ing_climb_ok_ms == 0) {
+                ing_climb_ok_ms = now_ms;
             }
         } else {
             ing_climb_ok_ms = 0;
         }
+        if (ing_climb_ok_ms != 0 && now_ms - ing_climb_ok_ms >= 1000) {
+            if (ing_build(p)) {
+                _problem_phase = INT32_MIN;    // RAM tables changed
+                _problem_npin = -1;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "BSLV: ingress %ld cells chi %+d deg",
+                              (long)ing_n, (int)lround(ing_ang_deg));
+                return true;           // caller: replay.start(); engage()
+            }
+            if (now_ms - ing_txt_ms >= 5000) {
+                ing_txt_ms = now_ms;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "BSLV: ingress too far for %d cells",
+                              (int)ING_MAX);
+            }
+        }
+    } else {
+        ing_climb_ok_ms = 0;
+    }
+    return false;
+}
+
+// Reset the mission clock and model state for a fresh engage.  SAFE ONLY
+// WHILE INACTIVE: the solver thread touches this state exclusively when
+// _active (the idle branch only rebuilds mission tables), so a
+// main-thread reset while disengaged is race-free.  This is what makes
+// the sticky _finished re-armable per AUTO entry.
+void AP_BSolver::reset_mission()
+{
+    if (_active) {
         return;
     }
-    // Nothing else happens here.  The solve is on the solver thread; this
-    // function runs in a scheduler slot and must stay cheap.
+    _seeded = false;
+    _finished = false;
+    _tick = 0;
+    _offset = 0;
+    _phase_ledger = 0.0;
+    _problem_phase = INT32_MIN;
+    _problem_npin = -1;
+    _prefix_moved = 0.0f;
+    _overruns = 0;
+    ing_n = 0;
+    ing_climb_ok_ms = 0;
+    {
+        WITH_SEMAPHORE(_plan_sem);
+        _plan_valid = false;
+    }
+    memset(_xi, 0, sizeof(_xi));
+    memset(_U, 0, sizeof(_U));
+    memset(_committed, 0, sizeof(_committed));
+    _tau_pub = INT32_MIN;
 }
 
 #if !BS_BENCH_WCET
@@ -1090,6 +1104,7 @@ bool AP_BSolver::solve_once()
     }
     if ((float)moved > _prefix_moved) _prefix_moved = (float)moved;
 
+    _tau_pub = tau_raw;
     // (b) PUBLISH the standing commitment.  Node i of this plan is node i+1
     //     of the previous one, exactly: same inputs, same recursion, one tick
     //     on.  Nothing is re-anchored at a measurement.
@@ -1547,6 +1562,26 @@ void AP_BSolver::write_log() const
         _plan.pos_n[0], _plan.pos_e[0]);
 }
 #endif
+
+uint16_t AP_BSolver::run_first_idx() const
+{
+    return bs_mb.run_first_idx();
+}
+
+uint16_t AP_BSolver::run_last_idx() const
+{
+    return bs_mb.run_last_idx();
+}
+
+int32_t AP_BSolver::tau_vertex(uint16_t wp_idx) const
+{
+    return bs_mb.tau_vertex(wp_idx);
+}
+
+bool AP_BSolver::mission_ready() const
+{
+    return mt != nullptr;
+}
 
 bool AP_BSolver::take_plan(Plan &out)
 {

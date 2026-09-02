@@ -153,6 +153,23 @@ public:
     void engage();
     void disengage();
 
+    // The READY gate (classic rest at the path start OR the ingress leg
+    // from a near-hover).  Called by the owning mode each loop while it
+    // wants engagement; true exactly when engage() ran.
+    bool engage_try();
+    // reset clock/model/plan state for a fresh engage (only while
+    // inactive) — makes the sticky finished() re-armable per AUTO entry
+    void reset_mission();
+    bool finished() const { return _finished; }
+    // mission-clock position of the last published plan (INT32_MIN
+    // before the first publish); aligned 32-bit read, any thread
+    int32_t mission_tau() const { return _tau_pub; }
+    // the compiled run's bookkeeping (for the AUTO submode)
+    uint16_t run_first_idx() const;
+    uint16_t run_last_idx() const;
+    int32_t tau_vertex(uint16_t wp_idx) const;
+    bool mission_ready() const;
+
     // telemetry
     int32_t tick() const { return _tick; }
     int32_t offset() const { return _offset; }
@@ -201,7 +218,6 @@ private:
     AP_Int8  _q;                 // Newton iterations per maintained solve
     AP_Int16 _qe;                // cap on the engage seed's Newton steps
     AP_Int8  _ir;                // restrict the setup to the pinned rows
-    AP_Int8  _ingress;           // engage away from the path start (BSLV_INGRESS)
 
     bool _inited;
     bool _thread_created;
@@ -215,6 +231,7 @@ private:
     int32_t _problem_npin;       // quadratic-row restriction it was built at
     uint32_t _next_solve_ms;
     uint32_t _anchor_ms;
+    volatile int32_t _tau_pub = INT32_MIN;   // last published plan's tau
 
     double _xi[6];               // MODEL quotient state (never measured)
     double _U[BS_DRV_NV];        // the plan (decision vector)

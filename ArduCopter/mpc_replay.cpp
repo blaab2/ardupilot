@@ -183,9 +183,9 @@ void MPCTrajReplay::commit_pending()
 #if AP_BSOLVER_ENABLED
     // The certified anytime MPC solves ONBOARD, so its committed prefix
     // arrives here already lifted into local NED — no link in the control
-    // path.  auto_start is true: unlike AUTO's MpcTurn there is no outer mode
-    // owning the replay entry for this rung, so the first onboard plan enters
-    // GUIDED TrajStream itself.
+    // path.  auto_start is FALSE since the AUTO BSLV_MISSION submode owns
+    // the replay entry (start()/run()/stop()), exactly like AUTO's
+    // MpcTurn on the csolver side.
     if (copter.bsolver.enabled()) {
         AP_BSolver::Plan bplan;
         if (copter.bsolver.take_plan(bplan) &&
@@ -198,7 +198,7 @@ void MPCTrajReplay::commit_pending()
                           bplan.acc_n[i], bplan.acc_e[i]);
             }
             _traj.pending_next = bplan.n;
-            commit_assembled(bplan.anchor_ms, true, true);
+            commit_assembled(bplan.anchor_ms, false, true);
         }
     }
 #endif
