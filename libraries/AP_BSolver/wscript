@@ -31,9 +31,14 @@ def configure(cfg):
     # Both flags go to the C and the C++ side: the core TU is compiled as C
     # through bs_build_solver.c, and AP_BSolver.cpp includes the same core
     # header, so a one-sided define would give the two TUs different tables.
+    # RUNTIME TABLES (2026-09-02): the flight build no longer bakes a
+    # mission.  BS_DATA_HEADER selects the runtime-constants header
+    # (dims + weights + family recipes, no mission), and the mission
+    # tables are built ON THE AIRCRAFT at upload time by
+    # bs_mission_build.c.  The flash pairs remain in the vendored tree
+    # for host gates only.
     corner_flags = [
-        '-DBS_DATA_HEADER="../model/generated/bs_model_corner_data.h"',
-        '-DBS_REF_HEADER="bsolver/model/generated/bs_reference_corner_data.h"',
+        '-DBS_DATA_HEADER="../model/generated/bs_model_runtime_const.h"',
         '-DBS_DRV_NV=90',
     ]
 

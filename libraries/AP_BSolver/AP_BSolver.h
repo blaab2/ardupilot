@@ -124,6 +124,11 @@ public:
     bool enabled() const { return _enable != 0; }
     bool active() const { return _active; }
 
+    // Mission intake: cheap change detection against the uploaded
+    // mission and the configured cruise speed; the rebuild itself runs
+    // on the solver thread while the solver is idle.  Scheduler context.
+    void mission_poll(class AP_Mission &mission, float v_cap_ms);
+
     // Scheduler service.  `ingress_ready` must be the vehicle's answer to
     // "would a plan handed over right now actually be accepted by replay?".
     // It gates ENGAGE, and it has to: the mission clock starts at engage and

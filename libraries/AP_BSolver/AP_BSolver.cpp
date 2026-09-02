@@ -3,26 +3,21 @@
 #if AP_BSOLVER_ENABLED
 
 #include <AP_AHRS/AP_AHRS.h>
+#include <AP_Mission/AP_Mission.h>
 #include <GCS_MAVLink/GCS.h>
 #include <AP_Logger/AP_Logger.h>
 #include <stdlib.h>
 #include <string.h>
 
-// The mission REFERENCE tables are a build-time choice, mirroring the one
-// bsolver/core/bs_solver.h makes for the MODEL tables with BS_DATA_HEADER.
-// The record pair (N = 40) and the corner-online pair (N = 30) define the
-// same bs_ref_* symbols and cannot coexist in one translation unit, so this
-// is a substitution, not an addition; wscript sets both flags together and
-// AP_BSolver.cpp static_asserts that the two halves agree.  Default = the
-// record, so the file stays buildable with no flags at all.
-#ifndef BS_REF_HEADER
-#define BS_REF_HEADER "bsolver/model/generated/bs_reference_data.h"
-#endif
-
+// RUNTIME TABLES (2026-09-02): the flight build bakes NO mission.  The
+// model constants come from bs_model_runtime_const.h (selected as
+// BS_DATA_HEADER in wscript) and the mission tables are built on the
+// aircraft at upload time by AP_BSMissionBuilder / bs_mission_build.c.
 extern "C" {
 #include "bsolver/core/bs_solver.h"
-#include BS_REF_HEADER
+#include "bsolver/core/bs_mission_build.h"
 }
+#include "AP_BSMissionBuilder.h"
 
 extern const AP_HAL::HAL &hal;
 
@@ -36,6 +31,13 @@ extern const AP_HAL::HAL &hal;
 // solve never run together, so they share it.
 static double *bs_arena;
 static size_t bs_arena_words;
+
+// THE PUBLISHED MISSION TABLES.  Written by the builder on the solver
+// thread while the solver is inactive, read by everything below.  NULL
+// until the first successful build; the READY gate requires it.
+static const bs_mission_tables *mt;
+static AP_BSMissionBuilder bs_mb;
+static AP_Mission *bs_mb_mission;      // captured at poll time
 
 // The ONE bs_problem the driver owns.  It is file-scope so ensure_problem()
 // can keep it across ticks: the reference loop assembles at tau at the top of
@@ -108,30 +110,9 @@ static_assert(BS_DRV_NV == BS_NV,
 static_assert(BS_DRV_M == BS_M_COMMIT,
               "BS_DRV_M must equal BS_M_COMMIT of the selected "
               "BS_DATA_HEADER");
-// ... and the MODEL half and the REFERENCE half must be the same pair.  They
-// are selected by two independent flags, so a half-switched build is a real
-// hazard, and it is silent: both halves define every symbol this file uses.
-// Three checks, each catching a different mix.
-//  (a) the clamped lookups here index bs_ref_ang / bs_ref_fam over a clock
-//      the core's schedule must cover.  Record 930/976, corner 966/966.
-static_assert(BS_REF_NCLK <= BS_N_MISSION,
-              "the reference clock must not outrun the model's mission "
-              "schedule: BS_DATA_HEADER and BS_REF_HEADER are mismatched");
-//  (b) the family enum is renumbered between the pairs (record a=0,h=1,t=2;
-//      corner t=0,c1=1,c2=2,c3=3,h=4).  BS_FAM_T exists only in the corner
-//      model header, so this fires on corner-model + record-reference.
-#ifdef BS_FAM_T
-static_assert(BS_REF_FAM_TRIM == BS_FAM_T,
-              "the reference's trim-family code disagrees with the model's: "
-              "BS_DATA_HEADER and BS_REF_HEADER are mismatched");
-#endif
-//  (c) the corner model's clock arrays are the FULL padded mission and its
-//      reference header matches them exactly; the record's do not.
-#ifdef BS_NOFF
-static_assert(BS_REF_NCLK == BS_N_MISSION,
-              "the corner model header needs the corner reference header: "
-              "BS_DATA_HEADER and BS_REF_HEADER are mismatched");
-#endif
+// The old model/reference cross-header asserts are gone with the flash
+// reference header; the equivalent invariants are now runtime gates in
+// bs_mission_build (G1-G10), checked per uploaded mission.
 
 // The airframe drag coefficient the replay's lean map feeds forward,
 // k/m in 1/m — the same SN77 number AP_MPCSolver streams (MPC_K_OVER_M).
@@ -242,6 +223,7 @@ AP_BSolver::AP_BSolver()
 // window_track / published_track -- and it needs only the sample at tau.
 static void ref_sample(int32_t tau, double *x, double *y)
 {
+    if (mt == nullptr) { *x = 0.0; *y = 0.0; return; }
     if (tau < 0) {
         if (ing_n > 0) {
             // The ingress leg publishes a JERK-SHAPED REST-TO-TRIM RAMP, not
@@ -265,9 +247,9 @@ static void ref_sample(int32_t tau, double *x, double *y)
         }
         tau = 0;
     }
-    const int32_t i = (tau > BS_REF_NPATH - 1 ? BS_REF_NPATH - 1 : tau);
-    *x = bs_ref_path[2 * i];
-    *y = bs_ref_path[2 * i + 1];
+    const int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    *x = mt->path[2 * i];
+    *y = mt->path[2 * i + 1];
 }
 
 // CHART frame at schedule tick tau: the heading the quotient's deviations are
@@ -276,6 +258,7 @@ static void ref_sample(int32_t tau, double *x, double *y)
 // angles exist as their own table.
 static void ref_frame(int32_t tau, double *tx, double *ty)
 {
+    if (mt == nullptr) { *tx = 1.0; *ty = 0.0; return; }
     if (tau < 0) {
         if (ing_n > 0) {              // the leg's chart heading is constant
             *tx = ing_dir_n;
@@ -284,14 +267,15 @@ static void ref_frame(int32_t tau, double *tx, double *ty)
         }
         tau = 0;
     }
-    const int32_t i = (tau > BS_REF_NPSI - 1 ? BS_REF_NPSI - 1 : tau);
-    const double a = bs_ref_psi[i];
+    const int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    const double a = mt->psi[i];
     *tx = cos(a);
     *ty = sin(a);
 }
 
 static double ang_at(int32_t tau)
 {
+    if (mt == nullptr) return 0.0;
     if (ing_n > 0) {
         // the junction seam sits at DESTINATION tick 0: the transition from
         // the last leg tick onto the body chart.  bs_ref_ang[0] is 0 on this
@@ -302,8 +286,8 @@ static double ang_at(int32_t tau)
         if (tau < 0) return 0.0;      // the leg is straight
     }
     const int32_t i = (tau < 0) ? 0
-                    : (tau > BS_REF_NCLK - 1 ? BS_REF_NCLK - 1 : tau);
-    return bs_ref_ang[i];
+                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    return mt->ang[i];
 }
 
 static int fam_at(int32_t tau)
@@ -311,10 +295,11 @@ static int fam_at(int32_t tau)
     // The ingress family is deliberately NOT the trim family: ledger_step's
     // family gate then cannot fire on the leg (the campaign's D4 gating,
     // confirmed as the intended mechanics by the wide-leg probe).
+    if (mt == nullptr) return BS_MB_FAM_T;
     if (tau < 0 && ing_n > 0) return -1;
     const int32_t i = (tau < 0) ? 0
-                    : (tau > BS_REF_NCLK - 1 ? BS_REF_NCLK - 1 : tau);
-    return (int)bs_ref_fam[i];
+                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    return (int)mt->sfam[i];
 }
 
 // THE AFFINE PART OF THE SEAM MAP, c(tau), applied at the DESTINATION tick.
@@ -339,18 +324,14 @@ static int fam_at(int32_t tau)
 static const double *off_at(int32_t tau)
 {
     static const double zero[BS_NX] = { 0.0 };
+    if (mt == nullptr) return zero;
     if (ing_n > 0) {
         if (tau == 0) return ing_offvec;   // the junction's affine kick
         if (tau < 0) return zero;          // constant pace on the leg
     }
-#ifdef BS_NOFF
     const int32_t i = (tau < 0) ? 0
-                    : (tau > BS_N_MISSION - 1 ? BS_N_MISSION - 1 : tau);
-    return &bs_off[(size_t)bs_mission_off[i] * BS_NX];
-#else
-    (void)tau;
-    return zero;
-#endif
+                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    return &mt->off[(size_t)mt->soff[i] * BS_NX];
 }
 
 // One exact-ZOH plant step followed by the chart re-expression at the solve
@@ -361,7 +342,7 @@ static const double *off_at(int32_t tau)
 static void plant_step(double *xi, const double *u, double seam_deg,
                        const double *off)
 {
-    const double Ts = BS_REF_TS;
+    const double Ts = BS_TS;
     const double d0 = xi[0], a0 = xi[1], el0 = xi[2];
     const double ec0 = xi[3], ed0 = xi[4], an0 = xi[5];
     const double j = u[0], nu = u[1], jn = u[2];
@@ -456,12 +437,13 @@ static void plant_step(double *xi, const double *u, double seam_deg,
 static bool ledger_step(double *phase, int32_t *offset, int32_t tau,
                         double trig)
 {
-    if (!(fabs(trig) > BS_REF_HYST)) return false;
+    if (mt == nullptr) return false;
+    if (!(fabs(trig) > mt->hyst)) return false;
     // exact zero test (see plant_step): the seam table holds exact values
     if (fabs(ang_at(tau)) > 0.0 || fabs(ang_at(tau + 1)) > 0.0) return false;
-    if (fam_at(tau) != BS_REF_FAM_TRIM) return false;      // F-LEDGER
-    const double cell = (fam_at(tau) == BS_REF_FAM_TRIM) ? BS_REF_CELLT
-                                                         : BS_REF_CELLMIN;
+    if (fam_at(tau) != BS_MB_FAM_T) return false;          // F-LEDGER
+    const double cell = (fam_at(tau) == BS_MB_FAM_T) ? mt->cell_t
+                                                     : mt->cell_min;
     if (trig < 0.0) { *offset += 1; *phase += cell; }
     else            { *offset -= 1; *phase -= cell; }
     return true;
@@ -476,8 +458,9 @@ static bool ledger_step(double *phase, int32_t *offset, int32_t tau,
 // horizon schedules the crossing speed itself.
 static bool ing_build(const Vector3p &p)
 {
-    const double dn = bs_ref_path[0] - (double)p.x;
-    const double de = bs_ref_path[1] - (double)p.y;
+    if (mt == nullptr) return false;
+    const double dn = mt->path[0] - (double)p.x;
+    const double de = mt->path[1] - (double)p.y;
     const double L = sqrt(dn * dn + de * de);
     if (!(L > 0.1)) return false;
     // Tick count from the published ramp: rest to trim under the
@@ -493,7 +476,7 @@ static bool ing_build(const Vector3p &p)
     // T_switch as R(-chi) on the state pairs).
     {
         const double psi_leg = atan2(ing_dir_e, ing_dir_n);
-        double chi = degrees(bs_ref_psi[0] - psi_leg);
+        double chi = degrees(mt->psi[0] - psi_leg);
         while (chi > 180.0) chi -= 360.0;
         while (chi < -180.0) chi += 360.0;
         ing_ang_deg = chi;
@@ -504,13 +487,15 @@ static bool ing_build(const Vector3p &p)
     // tail decelerates to the speed whose rounding stays inside the
     // corridor.  chi <= ~20 deg is uncapped; a reversal (chi -> 180) goes
     // to the floor.
-    double v_j = BS_REF_VTRIM;
+    double v_j = mt->v_trim;
     {
         const double tn = tan(radians(fabs(ing_ang_deg)) * 0.5);
         if (tn > 1e-3) {
             v_j = sqrt(1.2 / (0.035 * tn));
         }
-        if (v_j > BS_REF_VTRIM) v_j = BS_REF_VTRIM;
+        // the mission's own leg-1 published arc starts from rest, so the
+        // ingress junction must arrive slow regardless of chi
+        if (v_j > 2.0) v_j = 2.0;
         if (v_j < 1.5) v_j = 1.5;
     }
     double arc = 0.0, vv = 0.0, aa = 0.0;
@@ -520,14 +505,14 @@ static bool ing_build(const Vector3p &p)
         // one Ts step of the jerk-shaped ramp (accelerate, cap, coast),
         // bounded by backward reachability of the junction speed under the
         // same face share: v <= sqrt(v_j^2 + 2 A (L - arc)).
-        double aa_n = aa + ING_J * BS_REF_TS;
+        double aa_n = aa + ING_J * BS_TS;
         if (aa_n > ING_A) aa_n = ING_A;
-        double vv_n = vv + 0.5 * (aa + aa_n) * BS_REF_TS;
-        if (vv_n > BS_REF_VTRIM) { vv_n = BS_REF_VTRIM; aa_n = 0.0; }
+        double vv_n = vv + 0.5 * (aa + aa_n) * BS_TS;
+        if (vv_n > mt->v_trim) { vv_n = mt->v_trim; aa_n = 0.0; }
         const double rem = (L - arc > 0.0) ? (L - arc) : 0.0;
         const double v_brk = sqrt(v_j * v_j + 2.0 * ING_A * rem);
         if (vv_n > v_brk) { vv_n = v_brk; aa_n = 0.0; }
-        arc += 0.5 * (vv + vv_n) * BS_REF_TS;
+        arc += 0.5 * (vv + vv_n) * BS_TS;
         vv = vv_n;
         aa = aa_n;
         n++;
@@ -543,13 +528,13 @@ static bool ing_build(const Vector3p &p)
     }
     // anchor = the ramp's rest point: exactly L before the path start, so
     // p_sched(-n) is the hover point and p_sched(0) the junction vertex.
-    ing_anchor_n = bs_ref_path[0] - L * ing_dir_n;
-    ing_anchor_e = bs_ref_path[1] - L * ing_dir_e;
+    ing_anchor_n = mt->path[0] - L * ing_dir_n;
+    ing_anchor_e = mt->path[1] - L * ing_dir_e;
 
     // family "tc": the row family with the corridor pair opened to 5 m.
     // The e_c rows are identified structurally (h = +-e3, no input part)
     // rather than by index, and exactly two must exist.
-    memcpy(ing_rows, &bs_rows[(size_t)BS_REF_FAM_TRIM * BS_NROW * 10],
+    memcpy(ing_rows, &mt->rows[(size_t)BS_MB_FAM_T * BS_NROW * 10],
            sizeof(ing_rows));
     int patched = 0;
     for (int i = 0; i < BS_NROW; ++i) {
@@ -569,7 +554,7 @@ static bool ing_build(const Vector3p &p)
     // ang_at(0)/off_at(0) override the flash values at the junction tick;
     // that is sound only while the mission's own tick 0 is seam-free.
     // Refuse rather than silently rewrite if a future table breaks this.
-    if (fabs(bs_ref_ang[0]) > 0.0) return false;
+    if (fabs(mt->ang[0]) > 0.0) return false;
 
     // junction seam: T_switch(chi) in bs_rot's own layout (pairs (0,4),
     // (1,5), (2,3): y_a' = c y_a + s y_b, y_b' = -s y_a + c y_b) and the
@@ -584,9 +569,11 @@ static bool ing_build(const Vector3p &p)
         ing_rotmat[pb[k] * BS_NX + pa[k]] = -sr;
         ing_rotmat[pb[k] * BS_NX + pb[k]] = cr;
     }
+    // the ingress crossing is capped at ~2 m/s (leg-1 starts from rest),
+    // so the seam kick carries the crossing pace, not trim
     memset(ing_offvec, 0, sizeof(ing_offvec));
-    ing_offvec[0] = BS_REF_VTRIM * (cr - 1.0);
-    ing_offvec[4] = -BS_REF_VTRIM * sr;
+    ing_offvec[0] = v_j * (cr - 1.0);
+    ing_offvec[4] = -v_j * sr;
 
     // the RAM schedule: n leg cells, the junction at destination tick n,
     // then the first BS_N body entries so the horizon spans the seam.  For
@@ -597,17 +584,13 @@ static bool ing_build(const Vector3p &p)
         ing_rot[i] = 0;                     // identity
         ing_off[i] = 0;                     // zero vector
     }
-    ing_fam[n] = bs_mission_family[0];
+    ing_fam[n] = mt->sfam[0];
     ing_rot[n] = -1;                        // rot_extra: T_switch(chi)
     ing_off[n] = -1;                        // off_extra: the junction kick
     for (int32_t i = 1; i <= BS_N; ++i) {
-        ing_fam[n + i] = bs_mission_family[i];
-        ing_rot[n + i] = bs_mission_rot[i];
-#ifdef BS_NOFF
-        ing_off[n + i] = bs_mission_off[i];
-#else
-        ing_off[n + i] = 0;
-#endif
+        ing_fam[n + i] = mt->sfam[i];
+        ing_rot[n + i] = mt->srot[i];
+        ing_off[n + i] = mt->soff[i];
     }
     bs_sched_ingress.family = ing_fam;
     bs_sched_ingress.rotation = ing_rot;
@@ -617,6 +600,11 @@ static bool ing_build(const Vector3p &p)
     bs_sched_ingress.rows_extra = ing_rows;
     bs_sched_ingress.rot_extra = ing_rotmat;
     bs_sched_ingress.off_extra = ing_offvec;
+    bs_sched_ingress.rows_tab = mt->sched.rows_tab;
+    bs_sched_ingress.P_tab = mt->sched.P_tab;
+    bs_sched_ingress.K_tab = mt->sched.K_tab;
+    bs_sched_ingress.rot_tab = mt->sched.rot_tab;
+    bs_sched_ingress.off_tab = mt->sched.off_tab;
     ing_n = n;
     return true;
 }
@@ -680,7 +668,7 @@ void AP_BSolver::init()
     memset(_xi, 0, sizeof(_xi));
     memset(_U, 0, sizeof(_U));
     memset(_committed, 0, sizeof(_committed));
-    _xi[0] = -BS_REF_VTRIM;          // rest-engage initial condition
+    // the rest-engage IC is set at seed time, from the mission tables
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: init (%u B arena)",
                   (unsigned)(bs_workspace_size() * sizeof(double)));
 #if BS_BENCH_WCET
@@ -716,6 +704,15 @@ void AP_BSolver::engage()
 void AP_BSolver::disengage()
 {
     _active = false;
+}
+
+void AP_BSolver::mission_poll(AP_Mission &mission, float v_cap_ms)
+{
+    if (_enable == 0) {
+        return;
+    }
+    bs_mb_mission = &mission;
+    bs_mb.poll(mission, v_cap_ms);
 }
 
 void AP_BSolver::update(bool ingress_ready)
@@ -780,11 +777,11 @@ void AP_BSolver::update(bool ingress_ready)
         }
         Vector3p p;
         Vector3f v;
-        if (ingress_ready && hal.util->get_soft_armed() &&
+        if (mt != nullptr && ingress_ready && hal.util->get_soft_armed() &&
             AP::ahrs().get_relative_position_NED_origin(p) &&
             AP::ahrs().get_velocity_NED(v) && (-p.z) > 2.0) {
-            const double dn = (double)p.x - bs_ref_path[0];
-            const double de = (double)p.y - bs_ref_path[1];
+            const double dn = (double)p.x - mt->path[0];
+            const double de = (double)p.y - mt->path[1];
             const float speed = v.xy().length();
             if (dn * dn + de * de <= (double)READY_RADIUS_M * READY_RADIUS_M &&
                 speed <= READY_SPEED_MS) {
@@ -839,6 +836,13 @@ void AP_BSolver::solver_thread()
     while (true) {
         hal.scheduler->delay(10);
         if (!_active) {
+            // rebuild the mission tables while the solver is idle
+            if (bs_mb_mission != nullptr) {
+                const bool ran = bs_mb.build_pending(*bs_mb_mission);
+                if (ran) {
+                    mt = bs_mb.tables();
+                }
+            }
             continue;
         }
         if (!_seeded) {
@@ -857,7 +861,7 @@ void AP_BSolver::solver_thread()
         // solve FITS -- 135.7 ms at q = 2 on the Cube against 250 ms -- so
         // unlike the record's N = 40 build (469.5 ms at q = 1, B3) this path
         // should stay cold; _overruns says whether it did.
-        _next_solve_ms = now + (uint32_t)(BS_REF_TS * 1000.0);
+        _next_solve_ms = now + (uint32_t)(BS_TS * 1000.0);
         _anchor_ms = now;
         // WALL TIME OF THE TICK.  micros() around the whole of solve_once():
         // the problem init, the shift-append warm start, the pinned Newton
@@ -871,7 +875,7 @@ void AP_BSolver::solver_thread()
         const uint32_t tick_us = AP_HAL::micros() - tick_us0;
         if (ok) {
             _solve_ms = (float)tick_us * 1e-3f;
-            if (tick_us > (uint32_t)(BS_REF_TS * 1e6)) {
+            if (tick_us > (uint32_t)(BS_TS * 1e6)) {
                 // Not a failure on its own: the M-input committed prefix is
                 // 2.5 s of standing plan and replay keeps publishing from it.
                 // Counted so the log says how often, and when.
@@ -890,7 +894,8 @@ bool AP_BSolver::ensure_problem(int32_t tau_raw)
     // tau + ing_n; tau >= 0 solves on the flash mission schedule at phase
     // tau, exactly as before -- the certified body problem sequence is
     // untouched by construction.
-    const bs_schedule *sched = &bs_sched_mission;
+    if (mt == nullptr) return false;
+    const bs_schedule *sched = &mt->sched;
     int32_t phase, key;
     if (tau_raw < 0 && ing_n > 0) {
         phase = tau_raw + ing_n;
@@ -899,7 +904,7 @@ bool AP_BSolver::ensure_problem(int32_t tau_raw)
         key = phase - ing_n;         // negative: cannot collide with body keys
     } else {
         phase = (tau_raw < 0) ? 0 : tau_raw;
-        if (phase > BS_REF_NEND) phase = BS_REF_NEND;
+        if (phase > mt->n_end) phase = mt->n_end;
         key = phase;
     }
     // The engage seed is a FULL-horizon solve, so its problem must carry the
@@ -946,9 +951,12 @@ void AP_BSolver::seed_once()
     if (!ensure_problem(-(int32_t)ing_n)) {
         return;
     }
+    if (mt == nullptr) {
+        return;
+    }
     memset(_U, 0, sizeof(_U));
     memset(_xi, 0, sizeof(_xi));
-    _xi[0] = -BS_REF_VTRIM;
+    _xi[0] = -mt->v_trim;
     _tick = 0;
     _offset = 0;
     _phase_ledger = 0.0;
@@ -1009,7 +1017,7 @@ void AP_BSolver::seed_once()
                               (double)v2.y * ing_dir_n;
             if (fabs(el) <= 2.0 && fabs(ec) <= 2.0 &&
                 fabs(vt) <= 2.0 && fabs(vc) <= 2.0) {
-                _xi[0] = -BS_REF_VTRIM + vt;
+                _xi[0] = -mt->v_trim + vt;
                 _xi[2] = el;
                 _xi[3] = ec;
                 _xi[4] = vc;
@@ -1050,8 +1058,11 @@ bool AP_BSolver::solve_once()
     // No re-timing can fire on the leg (fam_at returns the non-trim
     // sentinel there), so tau is non-decreasing and crosses 0 exactly once,
     // at the junction.
+    if (mt == nullptr) {
+        return false;
+    }
     const int32_t tau_raw = _tick - _offset - ing_n;
-    if (tau_raw >= BS_REF_NEND) {
+    if (tau_raw >= mt->n_end) {
         if (!_finished) {
             _finished = true;
             _active = false;
@@ -1094,7 +1105,7 @@ bool AP_BSolver::solve_once()
     bs_shift_append(&bs_driver_problem, _U, _xi, U_shift);
 
     // (d) plant step and the rigid clock, on the MODEL state
-    _phase_ledger += BS_REF_TS * _xi[0];
+    _phase_ledger += BS_TS * _xi[0];
     const double trig_el = _xi[2];        // e_l at the ledger instant
     plant_step(_xi, _U, ang_at(tau + 1), off_at(tau + 1));
     ledger_step(&_phase_ledger, &_offset, tau, trig_el);
@@ -1195,7 +1206,7 @@ bool AP_BSolver::solve_once()
 void AP_BSolver::lift_prefix(Plan &plan) const
 {
     plan.n = PLAN_NODES;
-    plan.dt_ms = (uint16_t)(BS_REF_TS * 1000.0);
+    plan.dt_ms = (uint16_t)(BS_TS * 1000.0);
     plan.anchor_ms = _anchor_ms;
     plan.drag_k = BS_DRAG_K;
 
@@ -1215,7 +1226,7 @@ void AP_BSolver::lift_prefix(Plan &plan) const
         int32_t tau = tick - off - ing_n;
         if (tau < -ing_n) tau = -ing_n;
         if (ing_n == 0 && tau < 0) tau = 0;
-        if (tau > BS_REF_NEND) tau = BS_REF_NEND;
+        if (mt != nullptr && tau > mt->n_end) tau = mt->n_end;
         tau_of[i] = tau;
 
         double px, py, tx, ty;
@@ -1226,7 +1237,7 @@ void AP_BSolver::lift_prefix(Plan &plan) const
 
         if (i + 1 >= PLAN_NODES) break;
 
-        phase += BS_REF_TS * xi[0];
+        phase += BS_TS * xi[0];
         const double trig_el_i = xi[2];
         plant_step(xi, &_U[3 * i], ang_at(tau + 1), off_at(tau + 1));
         ledger_step(&phase, &off, tau, trig_el_i);
@@ -1293,7 +1304,7 @@ void AP_BSolver::lift_prefix(Plan &plan) const
         rep[i] = (uint8_t)(nkeep - 1);
     }
 
-    const double inv = 1.0 / BS_REF_TS;
+    const double inv = 1.0 / BS_TS;
     double kn[PLAN_NODES], ke[PLAN_NODES];
     double kvn[PLAN_NODES], kve[PLAN_NODES];
     double kan[PLAN_NODES], kae[PLAN_NODES];
@@ -1440,7 +1451,8 @@ void AP_BSolver::bench_thread()
                 // ENGAGE seed: the mission's own rest-engage IC at tau = 0
                 // with a zero plan — the state the loop actually starts from,
                 // and the one where the Newton iteration does real work.
-                double xi[BS_NX] = { -BS_REF_VTRIM, 0, 0, 0, 0, 0 };
+                if (mt == nullptr) { status_ok = 0; break; }
+                double xi[BS_NX] = { -mt->v_trim, 0, 0, 0, 0, 0 };
                 for (uint16_t i = 0; i < BS_NV; ++i) U[i] = 0.0;
                 if (rep == 0 && v == 0 && q == 1) {
                     for (uint32_t i = 0; i < arena_words; ++i)
@@ -1448,7 +1460,7 @@ void AP_BSolver::bench_thread()
                 }
 
                 const uint32_t t0 = AP_HAL::micros();
-                if (bs_problem_init_pinned(&problem, &bs_sched_mission, 0,
+                if (bs_problem_init_pinned(&problem, &mt->sched, 0,
                                            v ? BS_M : 0, bench_mem,
                                            arena_words) != BS_OK) {
                     status_ok = 0; break;

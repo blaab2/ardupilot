@@ -100,6 +100,19 @@ typedef struct {
     const bs_real *rows_extra;
     const bs_real *rot_extra;
     const bs_real *off_extra;
+    /* RUNTIME TABLE POINTERS (the mission builder's RAM tables).  NULL on
+     * every flash schedule — the lookup then reads the flash symbols, a
+     * path that is bit-identical to the pre-extension core and is what
+     * every host certificate gate runs.  Non-NULL redirects family rows,
+     * terminal P/K, and the rotation/offset stores to the given arrays
+     * (strides BS_NROW*10 / NX*NX / NU*NX / NX*NX / NX).  Under
+     * BS_TABLES_RUNTIME (the firmware's runtime-const header) the flash
+     * symbols do not exist and these MUST be set. */
+    const bs_real *rows_tab;
+    const bs_real *P_tab;
+    const bs_real *K_tab;
+    const bs_real *rot_tab;
+    const bs_real *off_tab;
 } bs_schedule;
 
 #ifdef BS_N_PHASE

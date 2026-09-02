@@ -31,6 +31,7 @@
 #define NR BS_NROW
 #define NXT (BS_N * BS_NX)
 
+#ifndef BS_TABLES_RUNTIME
 #ifdef BS_N_PHASE
 /* The 59-phase periodic parity clock lives only in the record's data header
  * -- it is an "a"/"t" object and the corner-online header retires family "a".
@@ -38,7 +39,7 @@
  * is stated on this clock. */
 const bs_schedule bs_sched_periodic = {
     bs_periodic_family, bs_periodic_rot, NULL, BS_N_PHASE, 1,
-    NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 };
 #endif
 const bs_schedule bs_sched_mission = {
@@ -49,8 +50,10 @@ const bs_schedule bs_sched_mission = {
     NULL,                      /* the record's mission has no affine part */
 #endif
     BS_N_MISSION, 0,
-    NULL, NULL, NULL           /* no RAM-extra tables on a flash schedule */
+    NULL, NULL, NULL,          /* no RAM-extra tables on a flash schedule */
+    NULL, NULL, NULL, NULL, NULL
 };
+#endif /* !BS_TABLES_RUNTIME */
 
 /* The affine part of a schedule that has none.  off_of() hands this back for
  * schedule->offset == NULL, so every plant recursion is written once. */
@@ -72,7 +75,12 @@ static const bs_real *rot_of(const bs_schedule *schedule, int t)
 {
     const int idx = schedule->rotation[tick_of(schedule, t)];
     if (idx < 0) return schedule->rot_extra;      /* runtime seam (ingress) */
+    if (schedule->rot_tab) return &schedule->rot_tab[(size_t)idx * NX * NX];
+#ifndef BS_TABLES_RUNTIME
     return &bs_rot[(size_t)idx * NX * NX];
+#else
+    return schedule->rot_extra;   /* unreachable by construction */
+#endif
 }
 
 /* The affine seam offset applied at DESTINATION tick t, i.e. the c(t) of
@@ -85,6 +93,7 @@ static const bs_real *off_of(const bs_schedule *schedule, int t)
     {
         const int idx = schedule->offset[tick_of(schedule, t)];
         if (idx < 0) return schedule->off_extra;  /* runtime seam (ingress) */
+        if (schedule->off_tab) return &schedule->off_tab[(size_t)idx * NX];
 #ifdef BS_NOFF
         return &bs_off[(size_t)idx * NX];
 #else
@@ -102,7 +111,13 @@ static const bs_real *rows_of(const bs_schedule *schedule, int t)
 {
     const int family = schedule->family[tick_of(schedule, t)];
     if (family < 0) return schedule->rows_extra;  /* runtime family (ingress) */
+    if (schedule->rows_tab)
+        return &schedule->rows_tab[(size_t)family * NR * 10];
+#ifndef BS_TABLES_RUNTIME
     return &bs_rows[(size_t)family * NR * 10];
+#else
+    return schedule->rows_extra;  /* unreachable by construction */
+#endif
 }
 
 /* Terminal-law family lookup: bs_P / bs_K have no RAM-extra entry, and by
@@ -216,8 +231,14 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
     problem->nt_trial = cursor; cursor += (size_t)NV;
     problem->scratch = cursor;
 
-    const bs_real *Pterm =
-        &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
+    const bs_real *Pterm = schedule->P_tab
+        ? &schedule->P_tab[(size_t)terminal_family_of(schedule, phase + NN)
+                           * NX * NX]
+#ifndef BS_TABLES_RUNTIME
+        : &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
+#else
+        : schedule->P_tab;        /* unreachable by construction */
+#endif
     bs_real *WG = problem->scratch;            /* NX x NV */
     bs_real *WA = WG + (size_t)NX * NV;        /* NX x NX */
     bs_real phi[NX * NX], next[NX * NX], TA[NX * NX], TB[NX * NU];
@@ -453,8 +474,14 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
         for (int i = 0; i < NU; ++i)
             for (int j = 0; j < NU; ++j)
                 quad += U[t * NU + i] * bs_R[(size_t)i * NU + j] * U[t * NU + j];
-    const bs_real *Pterm =
-        &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
+    const bs_real *Pterm = schedule->P_tab
+        ? &schedule->P_tab[(size_t)terminal_family_of(schedule, phase + NN)
+                           * NX * NX]
+#ifndef BS_TABLES_RUNTIME
+        : &bs_P[(size_t)terminal_family_of(schedule, phase + NN) * NX * NX];
+#else
+        : schedule->P_tab;        /* unreachable by construction */
+#endif
     for (int t = 0; t < NN; ++t) {
         const bs_real *W = (t == NN - 1) ? Pterm : bs_Q;
         const bs_real *x = &states[t * NX];
@@ -680,9 +707,16 @@ void bs_shift_append(const bs_problem *problem, const bs_real *U,
     bs_real terminal[NX];
     bs_terminal_state(problem, U, xi, terminal);
     for (int i = 0; i < NV - NU; ++i) U_shifted[i] = U[i + NU];
-    const bs_real *K =
-        &bs_K[(size_t)terminal_family_of(problem->schedule,
-                                         problem->phase + NN) * NU * NX];
+    const bs_real *K = problem->schedule->K_tab
+        ? &problem->schedule->K_tab[
+              (size_t)terminal_family_of(problem->schedule,
+                                         problem->phase + NN) * NU * NX]
+#ifndef BS_TABLES_RUNTIME
+        : &bs_K[(size_t)terminal_family_of(problem->schedule,
+                                           problem->phase + NN) * NU * NX];
+#else
+        : problem->schedule->K_tab;  /* unreachable by construction */
+#endif
     for (int i = 0; i < NU; ++i) {
         bs_real acc = 0.0;
         for (int j = 0; j < NX; ++j) acc += K[(size_t)i * NX + j] * terminal[j];
