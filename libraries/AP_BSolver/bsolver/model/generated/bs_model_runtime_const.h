@@ -186,6 +186,36 @@ static const double bs_rc_hov_x[15] = {
     -9.91672260728449911e-02, -1.24401451072851665e-02, +0.00000000000000000e+00
 };
 
+/* v_seam(chi): admissible MISSION-seam crossing pace, measured in
+ * the CLOSED LOOP by tests/calibrate_seam_pace.py (single-corner
+ * missions, 140 m legs, v_cap 11.8, q=2; bisected for the largest
+ * pace with zero face violations, zero re-timings and a model
+ * corridor peak <= 1.45 m, which leaves the measured ~0.7 m of
+ * tracking error inside the 2 m band).  This REPLACES the static
+ * corridor-radius law, which is systematically optimistic in the
+ * mid range (it prices the rounding arc but not the along/cross
+ * coupling); the law is retained as a ceiling.  The rise past
+ * A 1.90 m target was measured too (v(72 deg) 8.9, v(108) 5.0,
+ * SN77 in 977 ticks) but does not survive corner INTERACTION:
+ * SN77's headland turns are vertex pairs 14.8 m apart and the
+ * isolated-corner pace then breaks the faces (0.315).  The rise
+ * past 135 deg is the reversal regime: the cross-kick v sin(chi)
+ * dies
+ * out and the corner becomes an along-track brake. */
+#define BS_NSEAM 13
+static const double bs_rc_seam_chi[BS_NSEAM] = {
+    +1.00000000000000000e+01, +2.00000000000000000e+01, +3.00000000000000000e+01, +4.50000000000000000e+01,
+    +6.00000000000000000e+01, +7.50000000000000000e+01, +9.00000000000000000e+01, +1.05000000000000000e+02,
+    +1.20000000000000000e+02, +1.35000000000000000e+02, +1.50000000000000000e+02, +1.65000000000000000e+02,
+    +1.80000000000000000e+02
+};
+static const double bs_rc_seam_v[BS_NSEAM] = {
+    +1.15000000000000000e+01, +1.15000000000000000e+01, +1.11549999999999994e+01, +8.98199999999999932e+00,
+    +7.39299999999999979e+00, +5.10500000000000043e+00, +3.77800000000000002e+00, +3.08800000000000008e+00,
+    +2.56599999999999984e+00, +2.57600000000000007e+00, +2.81700000000000017e+00, +3.58999999999999986e+00,
+    +3.27599999999999980e+00
+};
+
 /* v_adm(chi): admissible junction crossing speed, state level
  * (slow_junction_resim.py V7, flown config). */
 #define BS_NADM 13

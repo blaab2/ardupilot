@@ -16,6 +16,30 @@
 
 #define MB_MAX_SEAM 64
 #define MB_PI 3.14159265358979323846
+/* cornering budget: how much of the corridor the rounding arc may use,
+ * and the share of the lateral accel face it may ride (the rest is the
+ * closed loop's tracking margin) */
+/* d = 2.0 is the corridor face itself: the honest ceiling, because
+ * beyond it the law promises an arc the barrier will not allow and the
+ * closed loop starts violating (measured: harsh-angle missions break
+ * first, at d = 2.6-3.2).  kappa = 1.1 lets the corner ride slightly
+ * past the LATERAL face because the anisotropic polygon's braking
+ * direction (5.609) is what a decelerating corner actually loads.
+ * Measured at these values: zero face violations and zero re-timings on
+ * the SN77 waypoints and on a mixed-angle synthetic at 3-11.8 m/s. */
+#ifndef MB_CORNER_D
+#define MB_CORNER_D 2.0
+#endif
+#ifndef MB_CORNER_KAPPA
+#define MB_CORNER_KAPPA 1.1
+#endif
+#define MB_A_LAT 5.203
+
+/* HOST CALIBRATION HOOK.  Zero on the target (never written); the host
+ * calibration driver sets it to bisect the admissible crossing pace per
+ * junction angle in the CLOSED LOOP, which is what produces the
+ * calibrated table this law is then checked against. */
+double bs_mb_vj_cap = 0.0;
 
 /* ------------------------------------------------------------------ util */
 static double wrap180(double a)
@@ -40,19 +64,75 @@ static double v_adm_interp(double chi_deg)
     return bs_rc_adm_v[BS_NADM - 1];
 }
 
+/* The cold-injection admissible speed (slow_junction_resim V7) is the
+ * right budget for an INGRESS junction — a state handed to the chart
+ * with no preparation — and the WRONG one mid-mission, where the closed
+ * loop pre-banks into the seam.  Exported for the ingress builder;
+ * mission seams use the corridor-radius law below. */
+double bs_mb_v_adm(double chi_deg) { return v_adm_interp(chi_deg); }
+
+/* TRIED AND REJECTED (2026-09-03): holding the corner pace across the
+ * rounding span T = r tan(chi/2) either side of each vertex, so the
+ * tracker would finish decelerating before it rounds.  Measured on the
+ * SN77 waypoints it cost 38 ticks (1072 -> 1110) and introduced a face
+ * violation -- about 1.5 s per corner spent at corner pace on straight
+ * ground, for a tracking benefit the model cannot see.  The profile
+ * therefore brakes to the corner pace AT the vertex. */
+
 /* junction crossing speed for a seam of angle chi (deg): the kink-
  * rounding law fitted in flight, capped by the state-level admissible
  * speed and floored. */
 static double v_junction(double chi_deg, double v_trim)
 {
-    const double tn = tan(fabs(chi_deg) * MB_PI / 360.0);
+    /* THE CORRIDOR IS THE RADIUS.  An arc tangent to both legs deviates
+     * from the vertex by d = r (sec(chi/2) - 1), so the corridor budget
+     * d_eff the barrier already allows IS a cornering radius
+     *     r = d_eff / (sec(chi/2) - 1),
+     * and the fastest crossing the chart's own faces admit is
+     *     v = sqrt(kappa a_lat r).
+     * This is not a new constraint on the optimizer: it is the frame pace
+     * at which the optimizer's OWN constraint set is feasible, which it
+     * cannot choose itself (the lag band caps how far the published track
+     * may fall behind the frame).  At the deployed faces it reproduces
+     * the hand-tuned SN77 window pace: 6.6 m/s at 72 deg. */
+    const double half = fabs(chi_deg) * MB_PI / 360.0;
     double v = v_trim;
-    if (tn > 1e-3) {
-        const double vk = sqrt(BS_KINK_MISS / (BS_KINK_K * tn));
-        if (vk < v) v = vk;
+    /* The geometric ceiling.  THE CORRIDOR IS DISTANCE TO THE NEAREST
+     * LEG, not to the vertex: an inscribed arc of radius r departs the
+     * legs by r(1 - cos(chi/2)), while its distance from the VERTEX is
+     * the much larger r(sec(chi/2) - 1).  Using the vertex form (as an
+     * earlier revision did) understates the admissible radius by 70 % at
+     * 108 deg and priced that corner at 3.85 m/s where the flown record
+     * achieves 5.51. */
+    if (half > 1e-4) {
+        const double one_m_cos = 1.0 - cos(half);
+        if (one_m_cos > 1e-9) {
+            const double r = MB_CORNER_D / one_m_cos;
+            const double vc = sqrt(MB_CORNER_KAPPA * MB_A_LAT * r);
+            if (vc < v) v = vc;
+        }
     }
-    const double va = v_adm_interp(chi_deg);
-    if (va < v) v = va;
+    /* the CLOSED-LOOP calibration governs: the law prices the rounding
+     * arc but not the along/cross coupling, and is optimistic in the
+     * mid range (measured: 5.26 vs 3.78 m/s admissible at 90 deg). */
+    {
+        const double c = fabs(chi_deg);
+        double vs;
+        if (c <= bs_rc_seam_chi[0]) {
+            vs = bs_rc_seam_v[0];
+        } else if (c >= bs_rc_seam_chi[BS_NSEAM - 1]) {
+            vs = bs_rc_seam_v[BS_NSEAM - 1];
+        } else {
+            int i = 1;
+            while (i < BS_NSEAM - 1 && c > bs_rc_seam_chi[i]) i++;
+            const double t = (c - bs_rc_seam_chi[i - 1])
+                           / (bs_rc_seam_chi[i] - bs_rc_seam_chi[i - 1]);
+            vs = bs_rc_seam_v[i - 1]
+               + t * (bs_rc_seam_v[i] - bs_rc_seam_v[i - 1]);
+        }
+        if (vs < v) v = vs;
+    }
+    if (bs_mb_vj_cap > 0.0) v = bs_mb_vj_cap;   /* calibration override */
     if (v < BS_VJ_FLOOR) v = BS_VJ_FLOOR;
     if (v > v_trim) v = v_trim;
     return v;
@@ -249,7 +329,12 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
                             rep->detail = (d); return (st); } while (0)
 
     if (n_wp < 2 || n_wp > BS_MB_MAX_WP) FAIL(BS_MB_ERR_NWP, 0, n_wp);
-    if (!(pp->v_cap_ms >= BS_VCAP_MIN && pp->v_cap_ms <= BS_VCAP_MAX)) {
+    /* Tolerance on the ceiling: the configured speed arrives as a
+     * single-precision parameter, and 11.8f promotes to 11.80000019 --
+     * one ulp over the double literal.  Refusing the airframe's own
+     * cruise on that is a boundary bug, measured once. */
+    if (!(pp->v_cap_ms >= BS_VCAP_MIN - 1e-3 &&
+          pp->v_cap_ms <= BS_VCAP_MAX + 1e-3)) {
         FAIL(BS_MB_ERR_SPEED, 6, pp->v_cap_ms);
     }
 
@@ -331,6 +416,25 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
     vb[0] = 0.0;                    /* leg 1 published from rest */
     for (int i = 1; i + 1 < n_v; ++i) {
         vb[i] = v_junction(chi[i], v_trim);
+        /* THE ARC MUST FIT BETWEEN ITS NEIGHBOURS.  The rounding arc is
+         * tangent at T = r tan(chi/2) either side of the vertex, so with
+         * adjacent legs of length L the radius is bounded by
+         * r <= (L/2) / tan(chi/2) -- the half-leg is shared with the
+         * neighbouring corner.  The seam-pace table is calibrated on
+         * ISOLATED corners (140 m legs); without this term a mission
+         * whose corners sit 15 m apart inherits an isolated corner's
+         * pace and breaks (measured: 0.149 of face violation on the
+         * mixed-angle synthetic). */
+        const double half = fabs(chi[i]) * MB_PI / 360.0;
+        const double tn = tan(half);
+        if (tn > 1e-6) {
+            double Lmin = leg_len[i - 1];
+            if (leg_len[i] < Lmin) Lmin = leg_len[i];
+            const double r_fit = 0.5 * Lmin / tn;
+            const double v_fit = sqrt(MB_CORNER_KAPPA * MB_A_LAT * r_fit);
+            if (v_fit < vb[i]) vb[i] = v_fit;
+            if (vb[i] < BS_VJ_FLOOR) vb[i] = BS_VJ_FLOOR;
+        }
     }
     /* hover splice: r_h fixed point on the final leg */
     const int last = n_v - 2;       /* index of the final leg */
@@ -404,7 +508,8 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
                 if (an > BS_ARC_A_EFF) an = BS_ARC_A_EFF;
                 double vn = v + 0.5 * (a + an) * BS_TS;
                 if (vn > v_trim) { vn = v_trim; an = 0.0; }
-                const double rem = (L - arc > 0.0) ? (L - arc) : 0.0;
+                const double rem_b = L - arc;
+                const double rem = (rem_b > 0.0) ? rem_b : 0.0;
                 const double vbrk = sqrt(vt * vt
                                          + 2.0 * BS_ARC_A_EFF * rem);
                 if (vn > vbrk) { vn = vbrk; an = 0.0; }
@@ -510,7 +615,8 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
                 if (an > BS_ARC_A_EFF) an = BS_ARC_A_EFF;
                 double vn = v + 0.5 * (a + an) * BS_TS;
                 if (vn > v_trim) { vn = v_trim; an = 0.0; }
-                const double rem = (L - arc > 0.0) ? (L - arc) : 0.0;
+                const double rem_b = L - arc;
+                const double rem = (rem_b > 0.0) ? rem_b : 0.0;
                 const double vbrk = sqrt(vt * vt
                                          + 2.0 * BS_ARC_A_EFF * rem);
                 if (vn > vbrk) { vn = vbrk; an = 0.0; }

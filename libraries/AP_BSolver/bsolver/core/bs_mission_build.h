@@ -6,11 +6,12 @@
  * ARCHITECTURE ("a junction everywhere", owner decision 2026-09-02):
  * there is no turn-window construction.  Every mission vertex is a bare
  * SEAM — chart rotation T_switch(chi) plus the affine kick
- * off_vec(V_TRIM, V_TRIM, chi) at the destination tick — with plain
- * row-family "t" cells on both sides.  All pace variation lives in the
- * PUBLISHED reference arc: a jerk-shaped profile that decelerates to
- * v_j(chi) into each vertex and re-accelerates after (the flight-
- * verified BSLV_INGRESS ramp, generalized), starts leg 1 from rest, and
+ * off_vec(v_j, v_j, chi) at the CROSSING pace, at the destination tick —
+ * with plain row-family "t" cells on both sides.  All pace variation
+ * lives in the PUBLISHED reference arc: a jerk-shaped profile that
+ * decelerates to v_j(chi) into each vertex and re-accelerates after (the
+ * flight-verified BSLV_INGRESS ramp, generalized), starts leg 1 from
+ * rest, and
  * ends with the certified hover-anchor deceleration scaled to the
  * final-leg entry pace.  The model chart is pace-agnostic — uniform
  * cells, families t then h, exactly the structure of the flown
@@ -23,6 +24,21 @@
  * mission; their terminal pairs come from bs_dare_solve, with family
  * h cross-checked against the emitted reference as a solver sanity
  * gate.
+ *
+ * THE CORNER PACE IS DERIVED AND THEN MEASURED.  The corridor the
+ * barrier already allows IS a cornering radius: an arc tangent to both
+ * legs departs THE LEGS (which is what the corridor measures) by
+ * d = r (1 - cos(chi/2)), so the geometric ceiling is
+ *     v_j(chi) = sqrt(kappa a_lat d / (1 - cos(chi/2))).
+ * That ceiling prices the rounding arc but not the along/cross coupling
+ * the closed loop actually pays, so it is capped by a table measured IN
+ * THE CLOSED LOOP (tests/calibrate_seam_pace.py): per junction angle,
+ * the largest crossing pace with zero face violations, zero re-timings
+ * and a model corridor peak inside the tracking budget.
+ * The frame pace has to be authored at all because the optimizer cannot
+ * slow its own reference by more than the lag band; its VALUE is the
+ * speed at which the optimizer's own constraint set is feasible, and the
+ * rounding within the band is then the optimizer's to find.
  */
 #ifndef BS_MISSION_BUILD_H
 #define BS_MISSION_BUILD_H
@@ -96,6 +112,12 @@ typedef struct {
 /* Upper bound on the block size for a mission of n_wp waypoints whose
  * polyline length is len_m at cruise v_cap.  Call before allocating. */
 size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms);
+
+/* host calibration hook: >0 caps every junction pace (target: unused) */
+extern double bs_mb_vj_cap;
+
+/* cold-injection admissible junction speed (the ingress budget) */
+double bs_mb_v_adm(double chi_deg);
 
 /* Build.  `mem` is one caller-owned block of `mem_len` bytes; `out`
  * points into it after success.  On failure nothing is published and

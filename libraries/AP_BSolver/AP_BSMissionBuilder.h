@@ -71,6 +71,9 @@ private:
     uint32_t _stamp_ms;            // mission.last_change_time_ms of build
     float _stamp_speed;
     uint32_t _txt_ms;              // refusal statustext throttle
+    uint8_t _fail_st;              // latched refusal (0 = none)
+    uint8_t _fail_gate;
+    float _fail_detail;
 
     // scan output
     double _vx[BS_MB_MAX_WP], _vy[BS_MB_MAX_WP];

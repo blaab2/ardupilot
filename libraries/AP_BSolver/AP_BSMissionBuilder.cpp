@@ -10,6 +10,18 @@
 
 void AP_BSMissionBuilder::poll(const AP_Mission &mission, float v_cap_ms)
 {
+    // re-broadcast a latched refusal every 10 s, for the same reason the
+    // solver re-broadcasts its own state: boot/upload-time text is lost
+    if (_fail_st != 0) {
+        const uint32_t now = AP_HAL::millis();
+        if (now - _txt_ms >= 10000) {
+            _txt_ms = now;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "BSLV mission: refused st%u G%u %.3g",
+                          (unsigned)_fail_st, (unsigned)_fail_gate,
+                          (double)_fail_detail);
+        }
+    }
     const uint32_t stamp = mission.last_change_time_ms();
     if (_valid || _failed) {
         if (stamp == _stamp_ms && fabsf(v_cap_ms - _stamp_speed) < 0.01f) {
@@ -130,13 +142,18 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
                                              &_mt, &_rep);
     const uint32_t dt_us = AP_HAL::micros() - t0;
     if (st != BS_MB_OK) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "BSLV mission: refused st%d G%d %.3g",
-                      (int)st, _rep.gate, _rep.detail);
+        // latch the reason: a refusal that fires before a ground station
+        // attaches is invisible otherwise, and then the only symptom is
+        // a solver that never engages (measured once, cost a full run)
+        _fail_st = (uint8_t)st;
+        _fail_gate = (uint8_t)_rep.gate;
+        _fail_detail = (float)_rep.detail;
+        _txt_ms = 0;
         return true;
     }
     _failed = false;
     _valid = true;
+    _fail_st = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                   "BSLV mission: %d ticks %d seams wp %u-%u %.1fms",
                   _rep.n_ticks, _rep.n_seam - 1,
