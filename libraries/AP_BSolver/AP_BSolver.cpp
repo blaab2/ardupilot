@@ -871,11 +871,21 @@ void AP_BSolver::solver_thread()
         }
         // Pace from the deadline, not from completion: if a solve overruns
         // the 4 Hz period the next one starts immediately rather than
-        // compounding the lag.  With the N = 30 corner tables the pinned
+        // compounding the lag.
+        //
+        // AND FROM THE DEADLINE MEANS THE OLD DEADLINE, NOT now: advancing
+        // from `now` re-anchors every tick to the thread's wake-up time, so
+        // each tick inherits the wake-up latency and the mission clock runs
+        // slow by that latency FOREVER (measured in SITL: 254.8 ms mean
+        // cadence, +5.2 s over the SN77 mission).  The deadline advances on
+        // its own 250 ms grid; only a true overrun re-anchors.  With the N = 30 corner tables the pinned
         // solve FITS -- 135.7 ms at q = 2 on the Cube against 250 ms -- so
         // unlike the record's N = 40 build (469.5 ms at q = 1, B3) this path
         // should stay cold; _overruns says whether it did.
-        _next_solve_ms = now + (uint32_t)(BS_TS * 1000.0);
+        _next_solve_ms += (uint32_t)(BS_TS * 1000.0);
+        if (now >= _next_solve_ms) {
+            _next_solve_ms = now;              // overrun: restart, don't chase
+        }
         _anchor_ms = now;
         // WALL TIME OF THE TICK.  micros() around the whole of solve_once():
         // the problem init, the shift-append warm start, the pinned Newton
