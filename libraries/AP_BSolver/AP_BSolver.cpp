@@ -1454,6 +1454,18 @@ void AP_BSolver::lift_prefix(Plan &plan) const
 // bs_newton_pinned at npin = M, which is what solve_once() runs 936 times out
 // of 937.  The ENGAGE SEED (the one full-horizon solve) is timed separately
 // as q = 0 in the report, because it happens once and off the deadline.
+#if BS_BENCH_WCET
+/* the demo mission (SN77 rows), embedded so the bench is SELF-HOSTING:
+ * on a bench boot no ground station ever uploads a mission, so the
+ * builder must be fed here or mt stays null and the ladder cannot run.
+ * Building on-target is itself the new bench item: the mission compile
+ * (including both DARE pairs) has only ever been timed on the host. */
+static const double BVX[40] = {
+    0.000, 0.000, 14.100, 14.100, 28.200, 28.200, 42.300, 42.300, 56.400, 56.400, 70.500, 70.500, 84.600, 84.600, 98.700, 98.700, 112.800, 112.800, 126.900, 126.900, 141.000, 141.000, 155.100, 155.100, 169.200, 169.200, 183.300, 183.300, 197.400, 197.400, 211.500, 211.500, 225.600, 225.600, 239.700, 239.700, 253.800, 253.800, 267.900, 267.900 };
+static const double BVY[40] = {
+    0.000, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684, 0.897, -99.561, -104.143, -3.684 };
+#endif
+
 void AP_BSolver::bench_thread()
 {
     double *bench_mem = bs_arena;
@@ -1468,6 +1480,60 @@ void AP_BSolver::bench_thread()
     struct { uint32_t mn, mx; uint64_t sum; uint16_t n; } r[2][4] = {};
     uint32_t high_water = 0;
     int status_ok = 1;
+
+    /* ---- on-target mission build: the upload-time cost, measured ----
+     * v_cap 11.8 is the deployment case; 6.0 is the DARE stress case
+     * (rho(A_cl) rises as cruise falls; the fixed point runs longest
+     * there).  The 11.8 tables are kept and published to mt for the
+     * ladder, so the ladder runs on exactly what a real upload yields. */
+    static bs_mission_tables bench_mt;
+    static bs_mission_report bench_rep;
+    uint32_t t_build[2] = {0, 0};
+    int32_t n_build[2] = {0, 0};
+    int8_t st_build[2] = {-1, -1};
+    {
+        double len = 0.0;
+        for (int i = 0; i + 1 < 40; ++i) {
+            const double dx = BVX[i + 1] - BVX[i];
+            const double dy = BVY[i + 1] - BVY[i];
+            len += sqrt(dx * dx + dy * dy);
+        }
+        const double caps[2] = {11.8, 6.0};
+        for (int c = 0; c < 2; ++c) {
+            const size_t need = bs_mission_size(40, len, caps[c]);
+            void *blk = calloc(1, need);
+            if (blk == nullptr) { status_ok = 0; break; }
+            bs_mission_params pp;
+            pp.v_cap_ms = caps[c];
+            const uint32_t b0 = AP_HAL::micros();
+            const bs_mb_status st = bs_mission_build(BVX, BVY, 40, &pp,
+                                                     blk, need,
+                                                     &bench_mt, &bench_rep);
+            t_build[c] = AP_HAL::micros() - b0;
+            n_build[c] = bench_rep.n_ticks;
+            st_build[c] = (int8_t)st;
+            if (st != BS_MB_OK) { status_ok = 0; free(blk); break; }
+            if (c == 1) {
+                free(blk);              /* stress case: timing only */
+            }
+        }
+        /* rebuild at 11.8 LAST so mt points at the deployment tables
+         * (the c-loop freed only the 6.0 block; bench_mt now holds the
+         * 6.0 build, so build 11.8 again into a fresh block) */
+        if (status_ok) {
+            const size_t need = bs_mission_size(40, len, 11.8);
+            void *blk = calloc(1, need);
+            bs_mission_params pp;
+            pp.v_cap_ms = 11.8;
+            if (blk == nullptr ||
+                bs_mission_build(BVX, BVY, 40, &pp, blk, need,
+                                 &bench_mt, &bench_rep) != BS_MB_OK) {
+                status_ok = 0;
+            } else {
+                mt = &bench_mt;
+            }
+        }
+    }
 
     const uint8_t REPS = 25;
     for (uint8_t rep = 0; rep < REPS && status_ok; ++rep) {
@@ -1533,14 +1599,21 @@ void AP_BSolver::bench_thread()
                           (unsigned long)(r[v][q].sum /
                                           (r[v][q].n ? r[v][q].n : 1)),
                           (unsigned long)r[v][q].mx);
-        } else {
+        } else if (line == 7) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSB arena hw %lu B of %lu, bss %u B",
                           (unsigned long)(high_water * sizeof(double)),
                           (unsigned long)(bs_workspace_size() * sizeof(double)),
                           (unsigned)BS_STATIC_BSS);
+        } else {
+            const uint8_t c = (uint8_t)(line - 8);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "BSB build v%u %lu us %ld ticks st%d",
+                          (unsigned)(c == 0 ? 118 : 60),
+                          (unsigned long)t_build[c],
+                          (long)n_build[c], (int)st_build[c]);
         }
-        line = (line + 1) % 8;
+        line = (line + 1) % 10;
         hal.scheduler->delay(5000 / 8);
     }
 }
