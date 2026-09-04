@@ -50,6 +50,14 @@ public:
 
     void invalidate() { _valid = false; _failed = false; _req = true; }
 
+    // init-time memory reservation (see AP_BSolver::init): builds go into
+    // this block instead of a per-upload calloc, which fragments out on
+    // the flight processor
+    void set_reserved(void *blk, size_t len) {
+        _reserved = blk;
+        _reserved_len = len;
+    }
+
     // mission bookkeeping for the AUTO layer
     uint16_t run_first_idx() const { return _run_first; }
     uint16_t run_last_idx() const { return _run_last; }
@@ -65,6 +73,8 @@ private:
     bs_mission_report _rep;
     void *_block;
     size_t _block_len;
+    void *_reserved;
+    size_t _reserved_len;
     bool _valid;
     bool _failed;
     bool _req;

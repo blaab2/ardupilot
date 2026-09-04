@@ -36,6 +36,16 @@ static size_t bs_arena_words;
 // thread while the solver is inactive, read by everything below.  NULL
 // until the first successful build; the READY gate requires it.
 static const bs_mission_tables *mt;
+
+// THE MISSION BLOCK, reserved ONCE at init beside the arena.  Measured
+// on the CubeOrange+: a per-upload calloc of the worst-case table block
+// (129 kB) FAILS at runtime -- 330 kB are free but fragmented across
+// the H7's RAM regions, and no single region still holds it once the
+// system is up.  At init, right after the arena, the big region is
+// intact.  The builder and the bench both build into this reservation.
+static void *bs_mb_block;
+static size_t bs_mb_block_len;
+static size_t bs_mb_largest;      // probed when the reservation fails
 static AP_BSMissionBuilder bs_mb;
 static AP_Mission *bs_mb_mission;      // captured at poll time
 
@@ -613,6 +623,32 @@ void AP_BSolver::init()
     }
     bs_arena_words = bs_workspace_size();
     bs_arena = (double *)calloc(bs_arena_words, sizeof(double));
+    if (bs_mb_block == nullptr) {
+        // worst case over speed and geometry: the tick cap dominates
+        bs_mb_block_len = bs_mission_size(BS_MB_MAX_WP, 1.0e9, 3.0);
+        bs_mb_block = calloc(1, bs_mb_block_len);
+        if (bs_mb_block == nullptr) {
+            // measure what IS available, then take it: a reservation of
+            // the largest contiguous block (minus a safety margin for the
+            // rest of boot) still serves every mission whose tables fit,
+            // and the builder refuses the rest with a number
+            size_t lo = 0, hi = bs_mb_block_len;
+            while (hi - lo > 1024) {
+                const size_t mid = (lo + hi) / 2;
+                void *t = calloc(1, mid);
+                if (t) { free(t); lo = mid; } else { hi = mid; }
+            }
+            bs_mb_largest = lo;
+            const size_t margin = 16u * 1024u;
+            bs_mb_block_len = (lo > margin) ? lo - margin : 0;
+            bs_mb_block = bs_mb_block_len
+                        ? calloc(1, bs_mb_block_len) : nullptr;
+            if (bs_mb_block == nullptr) {
+                bs_mb_block_len = 0;
+            }
+        }
+        bs_mb.set_reserved(bs_mb_block, bs_mb_block_len);
+    }
     if (bs_arena == nullptr) {
         // Turn the failure into a measurement: MEMINFO reports total free
         // across regions, but a single arena needs one CONTIGUOUS block, and
@@ -1491,6 +1527,10 @@ void AP_BSolver::bench_thread()
     uint32_t t_build[2] = {0, 0};
     int32_t n_build[2] = {0, 0};
     int8_t st_build[2] = {-1, -1};
+    uint32_t fail_need = 0;
+    int8_t fail_where = 0;          /* 1 calloc, 2 build, 3 rebuild, 4 ladder */
+    int16_t fail_gate = 0;
+    float fail_det = 0.0f;
     {
         double len = 0.0;
         for (int i = 0; i + 1 < 40; ++i) {
@@ -1499,10 +1539,19 @@ void AP_BSolver::bench_thread()
             len += sqrt(dx * dx + dy * dy);
         }
         const double caps[2] = {11.8, 6.0};
-        for (int c = 0; c < 2; ++c) {
-            const size_t need = bs_mission_size(40, len, caps[c]);
-            void *blk = calloc(1, need);
-            if (blk == nullptr) { status_ok = 0; break; }
+        for (int c = 0; c < 2 && status_ok; ++c) {
+            /* hand the builder the whole reservation: its TAKE macro
+             * bounds-checks the ACTUAL carve, and the loose sizing bound
+             * (129 kB) overstates the real need (82-99 kB) by more than
+             * the H7 has to spare */
+            void *blk = bs_mb_block;
+            const size_t need = bs_mb_block_len;
+            if (blk == nullptr) {
+                status_ok = 0; fail_where = 1;
+                fail_need = (uint32_t)bs_mission_size(40, len, caps[c]);
+                break;
+            }
+            memset(blk, 0, need);
             bs_mission_params pp;
             pp.v_cap_ms = caps[c];
             const uint32_t b0 = AP_HAL::micros();
@@ -1512,23 +1561,28 @@ void AP_BSolver::bench_thread()
             t_build[c] = AP_HAL::micros() - b0;
             n_build[c] = bench_rep.n_ticks;
             st_build[c] = (int8_t)st;
-            if (st != BS_MB_OK) { status_ok = 0; free(blk); break; }
-            if (c == 1) {
-                free(blk);              /* stress case: timing only */
+            if (st != BS_MB_OK) {
+                status_ok = 0; fail_where = 2;
+                fail_gate = (int16_t)bench_rep.gate;
+                fail_det = (float)bench_rep.detail;
+                break;
             }
         }
         /* rebuild at 11.8 LAST so mt points at the deployment tables
          * (the c-loop freed only the 6.0 block; bench_mt now holds the
          * 6.0 build, so build 11.8 again into a fresh block) */
         if (status_ok) {
-            const size_t need = bs_mission_size(40, len, 11.8);
-            void *blk = calloc(1, need);
+            const size_t need = bs_mb_block_len;
             bs_mission_params pp;
             pp.v_cap_ms = 11.8;
-            if (blk == nullptr ||
-                bs_mission_build(BVX, BVY, 40, &pp, blk, need,
+            memset(bs_mb_block, 0, need);
+            if (bs_mission_build(BVX, BVY, 40, &pp, bs_mb_block, need,
                                  &bench_mt, &bench_rep) != BS_MB_OK) {
                 status_ok = 0;
+                fail_where = 3;
+                fail_need = (uint32_t)need;
+                fail_gate = (int16_t)bench_rep.gate;
+                fail_det = (float)bench_rep.detail;
             } else {
                 mt = &bench_mt;
             }
@@ -1554,7 +1608,7 @@ void AP_BSolver::bench_thread()
                 if (bs_problem_init_pinned(&problem, &mt->sched, 0,
                                            v ? BS_M : 0, bench_mem,
                                            arena_words) != BS_OK) {
-                    status_ok = 0; break;
+                    status_ok = 0; fail_where = 4; break;
                 }
                 double U_shift[BS_NV];
                 bs_shift_append(&problem, U, xi, U_shift);
@@ -1584,7 +1638,18 @@ void AP_BSolver::bench_thread()
     uint8_t line = 0;
     while (true) {
         if (!status_ok) {
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSB: FAILED");
+            if (line & 1) {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSB: FAILED");
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "BSB fd w%d g%d d%.3g nd%lu av%lu lg%lu r%lu",
+                              (int)fail_where, (int)fail_gate,
+                              (double)fail_det,
+                              (unsigned long)fail_need,
+                              (unsigned long)hal.util->available_memory(),
+                              (unsigned long)bs_mb_largest,
+                              (unsigned long)bs_mb_block_len);
+            }
         } else if (line == 0) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSB: PINNED npin=%u, engage seed, n=%u/q, f64",

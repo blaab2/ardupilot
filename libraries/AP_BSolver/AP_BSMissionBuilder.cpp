@@ -122,8 +122,17 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
         len += sqrt(dx * dx + dy * dy);
     }
     const size_t need = bs_mission_size(_n_wp, len, (double)_v_cap);
-    if (_block == nullptr || _block_len < need) {
-        free(_block);
+    if (_reserved != nullptr) {
+        // the init-time reservation: on the flight processor a runtime
+        // calloc fails on fragmentation (measured: 127 kB largest at
+        // boot, less later), so builds go into the boot-time block
+        // regardless of the loose sizing bound -- the builder's own
+        // carve is bounds-checked against the ACTUAL need and refuses
+        // with the true number if the block is genuinely too small
+        _block = _reserved;
+        _block_len = _reserved_len;
+    } else if (_block == nullptr || _block_len < need) {
+        free(_block == _reserved ? nullptr : _block);
         _block = calloc(1, need);
         _block_len = _block ? need : 0;
         if (_block == nullptr) {
@@ -132,6 +141,7 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
             return true;
         }
     }
+    memset(_block, 0, (_block_len < need) ? _block_len : need);
 
     bs_mission_params pp;
     pp.v_cap_ms = (double)_stamp_speed;
