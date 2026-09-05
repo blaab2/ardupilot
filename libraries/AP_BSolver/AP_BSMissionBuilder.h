@@ -46,6 +46,14 @@ public:
     const bs_mission_tables *tables() const {
         return _valid ? &_mt : nullptr;
     }
+
+    // STREAMING: render the per-tick ring far enough that every read at
+    // mission tick `upto` (horizon tip inclusive) hits a valid slot.
+    // Solver-thread context, microseconds per call.  Returns false only
+    // on the impossible starvation case (ring smaller than the horizon).
+    bool render_to(int32_t upto);
+    int32_t rendered_to() const { return _cursor; }
+    void ring_reset();
     bool build_failed() const { return _failed; }
 
     void invalidate() { _valid = false; _failed = false; _req = true; }
@@ -71,6 +79,15 @@ private:
 
     bs_mission_tables _mt;
     bs_mission_report _rep;
+    // streaming state: the vertex plan and the ring live inside the
+    // boot-time reservation (see AP_BSolver::init); W is a power of two
+    bs_mission_plan *_plan;
+    double *_r_path, *_r_psi, *_r_ang;
+    int *_r_sfam, *_r_srot, *_r_soff;
+    signed char *_r_fam;
+    int _ring_w, _ring_mask;
+    int32_t _cursor;
+    int _next_leg;
     void *_block;
     size_t _block_len;
     void *_reserved;

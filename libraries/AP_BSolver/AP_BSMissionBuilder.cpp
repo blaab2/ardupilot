@@ -8,6 +8,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+// STREAMING BUILD (the deployed path since the ring-buffer fold).  The
+// batch builder remains the host-gate reference; on the aircraft the
+// mission is PLANNED at vertex level (bs_mission_plan_build, ~30 kB for
+// any length) and RENDERED leg by leg into a W-slot ring ahead of the
+// mission clock.  stream==batch is byte-exact by construction (one
+// renderer serves both) and verified end to end by tests/stream_gate.c,
+// including a closed-loop identity arm and a retard stress.  Mission
+// length is bounded by AP_Mission storage and battery, not RAM.
+#ifndef BS_STREAM_W
+#define BS_STREAM_W 512            /* 128 s of mission in the window */
+#endif
+#ifndef BS_STREAM_MAX_TICKS
+#define BS_STREAM_MAX_TICKS 28800  /* 2 h; a sanity cap, not a RAM one */
+#endif
+
+static double stream_scratch[1024];   /* one leg's unscaled arc staging */
+
 void AP_BSMissionBuilder::poll(const AP_Mission &mission, float v_cap_ms)
 {
     // re-broadcast a latched refusal every 10 s, for the same reason the
@@ -147,9 +164,84 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
     pp.v_cap_ms = (double)_stamp_speed;
     _v_cap = _stamp_speed;
     const uint32_t t0 = AP_HAL::micros();
-    const bs_mb_status st = bs_mission_build(_vx, _vy, _n_wp, &pp,
-                                             _block, _block_len,
-                                             &_mt, &_rep);
+    // carve plan + ring from the block: doubles first, ints, chars
+    const size_t need_stream = sizeof(bs_mission_plan)
+        + (size_t)BS_STREAM_W * (2 + 1 + 1) * sizeof(double)
+        + (size_t)BS_STREAM_W * 3 * sizeof(int)
+        + (size_t)BS_STREAM_W * sizeof(signed char) + 64;
+    bs_mb_status st;
+    if (_block_len < need_stream) {
+        st = BS_MB_ERR_MEM;
+        _rep.status = st;
+        _rep.gate = 9;
+        _rep.detail = (double)need_stream;
+    } else {
+        uint8_t *cur = (uint8_t *)_block;
+        _plan = (bs_mission_plan *)(void *)cur;
+        cur += sizeof(bs_mission_plan);
+        cur += ((size_t)cur & 7) ? (8 - ((size_t)cur & 7)) : 0;
+        _r_path = (double *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * 2 * sizeof(double);
+        _r_psi = (double *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(double);
+        _r_ang = (double *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(double);
+        _r_sfam = (int *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(int);
+        _r_srot = (int *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(int);
+        _r_soff = (int *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(int);
+        _r_fam = (signed char *)(void *)cur;
+        _ring_w = BS_STREAM_W;
+        _ring_mask = BS_STREAM_W - 1;
+        st = bs_mission_plan_build(_vx, _vy, _n_wp, &pp,
+                                   BS_STREAM_MAX_TICKS, _plan, &_rep);
+        if (st == BS_MB_OK) {
+            // the driver's view: scalars + wp map from the plan, the
+            // per-tick pointers at the RING, the core schedule wired
+            // with the ring mask (the accessors read it from here)
+            memset(&_mt, 0, sizeof(_mt));
+            _mt.n_path = _plan->n_path;
+            _mt.n_clk = _plan->n_clk;
+            _mt.node = _plan->node;
+            _mt.n_end = _plan->n_end;
+            _mt.hov_in = _plan->hov_in;
+            _mt.n_seam = _plan->n_seam;
+            _mt.v_leg = _plan->v_leg;
+            _mt.v_trim = _plan->v_trim;
+            _mt.cell_t = _plan->cell_t;
+            _mt.cell_min = _plan->cell_min;
+            _mt.hyst = _plan->hyst;
+            _mt.v0 = _plan->vb[0];
+            _mt.path = _r_path;
+            _mt.psi = _r_psi;
+            _mt.ang = _r_ang;
+            _mt.fam = _r_fam;
+            _mt.sfam = _r_sfam;
+            _mt.srot = _r_srot;
+            _mt.soff = _r_soff;
+            _mt.rows = _plan->rows;
+            _mt.P = _plan->P;
+            _mt.K = _plan->K;
+            _mt.rot = _plan->rot;
+            _mt.off = _plan->off;
+            memcpy(_mt.wp_tick, _plan->wp_tick, sizeof(_mt.wp_tick));
+            _mt.n_wp_in = _plan->n_wp_in;
+            _mt.sched.family = _r_sfam;
+            _mt.sched.rotation = _r_srot;
+            _mt.sched.offset = _r_soff;
+            _mt.sched.length = _plan->n_clk;
+            _mt.sched.periodic = 0;
+            _mt.sched.rows_tab = _plan->rows;
+            _mt.sched.P_tab = _plan->P;
+            _mt.sched.K_tab = _plan->K;
+            _mt.sched.rot_tab = _plan->rot;
+            _mt.sched.off_tab = _plan->off;
+            _mt.sched.ring_mask = _ring_mask;
+            ring_reset();
+        }
+    }
     const uint32_t dt_us = AP_HAL::micros() - t0;
     if (st != BS_MB_OK) {
         // latch the reason: a refusal that fires before a ground station
@@ -170,6 +262,38 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
                   (unsigned)_run_first, (unsigned)_run_last,
                   (double)dt_us * 1e-3);
     return true;
+}
+
+void AP_BSMissionBuilder::ring_reset()
+{
+    _cursor = 0;
+    _next_leg = 0;
+    render_to(BS_N + 2);
+}
+
+bool AP_BSMissionBuilder::render_to(int32_t upto)
+{
+    if (_plan == nullptr) {
+        return false;   /* validity is the caller's gate; the plan is ours */
+    }
+    while (_cursor < _plan->n_clk && _cursor <= upto) {
+        const int i = _next_leg;
+        if (i + 1 < _plan->n_v) {
+            if (bs_mission_render_unit(_plan, i, _r_path, _r_psi, _r_ang,
+                                       _r_fam, _r_sfam, _r_srot, _r_soff,
+                                       _ring_mask, stream_scratch,
+                                       (int)(sizeof(stream_scratch)
+                                             / sizeof(double))) != 0) {
+                return false;          /* leg exceeds scratch: refused */
+            }
+            _next_leg = i + 1;
+            _cursor = (i + 2 >= _plan->n_v) ? _plan->n_clk
+                                            : _plan->g_tick[i + 1];
+        } else {
+            _cursor = _plan->n_clk;
+        }
+    }
+    return _cursor > upto || _cursor >= _plan->n_clk;
 }
 
 int32_t AP_BSMissionBuilder::tau_vertex(uint16_t wp_idx) const

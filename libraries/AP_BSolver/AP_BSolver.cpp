@@ -247,7 +247,8 @@ static void ref_sample(int32_t tau, double *x, double *y)
         }
         tau = 0;
     }
-    const int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
     *x = mt->path[2 * i];
     *y = mt->path[2 * i + 1];
 }
@@ -267,7 +268,8 @@ static void ref_frame(int32_t tau, double *tx, double *ty)
         }
         tau = 0;
     }
-    const int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    int32_t i = (tau > mt->n_path - 1 ? mt->n_path - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
     const double a = mt->psi[i];
     *tx = cos(a);
     *ty = sin(a);
@@ -285,8 +287,9 @@ static double ang_at(int32_t tau)
         if (tau == 0) return ing_ang_deg;
         if (tau < 0) return 0.0;      // the leg is straight
     }
-    const int32_t i = (tau < 0) ? 0
-                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    int32_t i = (tau < 0) ? 0
+              : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
     return mt->ang[i];
 }
 
@@ -297,8 +300,9 @@ static int fam_at(int32_t tau)
     // confirmed as the intended mechanics by the wide-leg probe).
     if (mt == nullptr) return BS_MB_FAM_T;
     if (tau < 0 && ing_n > 0) return -1;
-    const int32_t i = (tau < 0) ? 0
-                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    int32_t i = (tau < 0) ? 0
+              : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
     return (int)mt->sfam[i];
 }
 
@@ -329,8 +333,9 @@ static const double *off_at(int32_t tau)
         if (tau == 0) return ing_offvec;   // the junction's affine kick
         if (tau < 0) return zero;          // constant pace on the leg
     }
-    const int32_t i = (tau < 0) ? 0
-                    : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    int32_t i = (tau < 0) ? 0
+              : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
     return &mt->off[(size_t)mt->soff[i] * BS_NX];
 }
 
@@ -870,6 +875,7 @@ void AP_BSolver::reset_mission()
     _overruns = 0;
     ing_n = 0;
     ing_climb_ok_ms = 0;
+    bs_mb.ring_reset();
     {
         WITH_SEMAPHORE(_plan_sem);
         _plan_valid = false;
@@ -1134,6 +1140,13 @@ bool AP_BSolver::solve_once()
     }
     const int32_t tau = (ing_n > 0) ? tau_raw
                        : ((tau_raw < 0) ? 0 : tau_raw);
+
+    if (!bs_mb.render_to(tau + BS_N + 2)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "BSLV: ring starved at %ld",
+                      (long)tau);
+        _active = false;
+        return false;
+    }
 
     if (!ensure_problem(tau)) {
         return false;
