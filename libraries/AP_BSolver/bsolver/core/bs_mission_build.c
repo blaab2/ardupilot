@@ -477,11 +477,24 @@ size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms)
     if (v_trim < 1.0) v_trim = 1.0;
     /* ramps cost ~44 extra ticks per breakpoint; cruise covers CELL_T
      * per tick.  Generous by design: this sizes an allocation, the
-     * build bounds-checks against it. */
-    int n_est = (int)(len_m / (BS_TS * v_trim * 0.35)) + 44 * (n_wp + 2)
-              + BS_MB_HOLD + BS_MB_PAD + 64;
-    if (n_est > BS_MB_MAX_TICKS + BS_MB_HOLD + BS_MB_PAD) {
-        n_est = BS_MB_MAX_TICKS + BS_MB_HOLD + BS_MB_PAD;
+     * build bounds-checks against it.
+     *
+     * Saturate BEFORE the double->int cast.  The worst-case caller
+     * (AP_BSolver::init, len_m = 1e9) used to overflow that cast: the
+     * result is UB, went to INT_MIN on both targets, the size_t product
+     * wrapped, and on a 64-bit host the driver's reservation search
+     * cycled forever (SITL hang, 2026-09-05).  The int path below is
+     * byte-identical to the old one for every in-range input. */
+    const int cap = BS_MB_MAX_TICKS + BS_MB_HOLD + BS_MB_PAD;
+    const double q = len_m / (BS_TS * v_trim * 0.35);
+    int n_est;
+    if (!(q < (double)cap)) {          /* huge, inf or NaN: the cap */
+        n_est = cap;
+    } else {
+        n_est = (int)q + 44 * (n_wp + 2) + BS_MB_HOLD + BS_MB_PAD + 64;
+        if (n_est > cap) {
+            n_est = cap;
+        }
     }
     return (size_t)n_est * (5 * sizeof(double) + 1 + 3 * sizeof(int))
          + (size_t)(2 * BS_NROW * 10 + 2 * 36 + 2 * 18) * sizeof(double)

@@ -10,6 +10,10 @@
 #endif
 
 #include <AP_MPCSolver/AP_MPCTurnPlanner.h>
+// AP_BSOLVER_ENABLED default (0). Copter.h includes this header BEFORE
+// <AP_BSolver/AP_BSolver.h>, so the macro must be self-provided here or the
+// AUTO_BSLV_ENABLED test below trips -Werror=undef on a plain configure.
+#include <AP_BSolver/bs_defs.h>
 
 // AUTO MpcTurn stage: the onboard turn MPC needs the solver library and the
 // shared MPCTrajReplay helper (which lives behind MODE_GUIDED_ENABLED)

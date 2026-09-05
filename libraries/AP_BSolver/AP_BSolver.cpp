@@ -45,7 +45,7 @@ static const bs_mission_tables *mt;
 // intact.  The builder and the bench both build into this reservation.
 static void *bs_mb_block;
 static size_t bs_mb_block_len;
-static size_t bs_mb_largest;      // probed when the reservation fails
+static size_t bs_mb_largest;      // largest allocatable block, probed at init (bounded by worst + margin)
 static AP_BSMissionBuilder bs_mb;
 static AP_Mission *bs_mb_mission;      // captured at poll time
 
@@ -630,27 +630,43 @@ void AP_BSolver::init()
     bs_arena = (double *)calloc(bs_arena_words, sizeof(double));
     if (bs_mb_block == nullptr) {
         // worst case over speed and geometry: the tick cap dominates
-        bs_mb_block_len = bs_mission_size(BS_MB_MAX_WP, 1.0e9, 3.0);
-        bs_mb_block = calloc(1, bs_mb_block_len);
+        // (bs_mission_size saturates at BS_MB_MAX_TICKS: 129442 B, gated
+        // by tests/size_gate.c)
+        const size_t worst = bs_mission_size(BS_MB_MAX_WP, 1.0e9, 3.0);
+        const size_t margin = 16u * 1024u;
+        // Measure what IS available -- the largest contiguous block, probed
+        // up to worst + margin -- and reserve min(largest - margin, worst):
+        // the margin stays free for the rest of boot, every mission whose
+        // tables fit is served, and the builder refuses the rest with a
+        // number.  Measured on the CubeOrange+: largest 127.0 kB after the
+        // arena -> ~111 kB reserved (unchanged by this form to within the
+        // 1 kB probe granularity); a 64-bit host reserves the worst case.
+        //   `volatile`: the probe is a MEASUREMENT.  GCC deletes a
+        //   calloc/free pair whose result is only null-tested and folds the
+        //   test as "succeeded", which made this search a call-free loop
+        //   that could only end by converging -- and with the old
+        //   overflowed bound (> 2^63) `(lo + hi) / 2` wrapped and it never
+        //   did: SITL's main thread spun here at 100 % (2026-09-05).
+        //   `lo + (hi - lo) / 2` cannot overflow.
+        size_t lo = 0, hi = worst + margin;
+        {   // the top of the range first: if worst + margin allocates, the
+            // search is moot and the reservation is exactly `worst` (the
+            // bisection alone stops up to 1 kB short of hi and could never
+            // reach it -- found in review)
+            void *volatile t = calloc(1, hi);
+            if (t) { free(t); lo = hi; }
+        }
+        while (hi - lo > 1024) {
+            const size_t mid = lo + (hi - lo) / 2;
+            void *volatile t = calloc(1, mid);
+            if (t) { free(t); lo = mid; } else { hi = mid; }
+        }
+        bs_mb_largest = lo;
+        bs_mb_block_len = (lo > margin) ? MIN(lo - margin, worst) : 0;
+        bs_mb_block = bs_mb_block_len
+                    ? calloc(1, bs_mb_block_len) : nullptr;
         if (bs_mb_block == nullptr) {
-            // measure what IS available, then take it: a reservation of
-            // the largest contiguous block (minus a safety margin for the
-            // rest of boot) still serves every mission whose tables fit,
-            // and the builder refuses the rest with a number
-            size_t lo = 0, hi = bs_mb_block_len;
-            while (hi - lo > 1024) {
-                const size_t mid = (lo + hi) / 2;
-                void *t = calloc(1, mid);
-                if (t) { free(t); lo = mid; } else { hi = mid; }
-            }
-            bs_mb_largest = lo;
-            const size_t margin = 16u * 1024u;
-            bs_mb_block_len = (lo > margin) ? lo - margin : 0;
-            bs_mb_block = bs_mb_block_len
-                        ? calloc(1, bs_mb_block_len) : nullptr;
-            if (bs_mb_block == nullptr) {
-                bs_mb_block_len = 0;
-            }
+            bs_mb_block_len = 0;
         }
         bs_mb.set_reserved(bs_mb_block, bs_mb_block_len);
     }
@@ -663,8 +679,8 @@ void AP_BSolver::init()
         if (largest == 0) {
             size_t lo = 0, hi = 512u * 1024u;
             while (hi - lo > 1024) {
-                const size_t mid = (lo + hi) / 2;
-                void *t = calloc(1, mid);
+                const size_t mid = lo + (hi - lo) / 2;
+                void *volatile t = calloc(1, mid);   // real probe, see above
                 if (t) { free(t); lo = mid; } else { hi = mid; }
             }
             largest = lo ? lo : 1;
