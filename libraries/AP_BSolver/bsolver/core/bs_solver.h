@@ -113,6 +113,13 @@ typedef struct {
     const bs_real *K_tab;
     const bs_real *rot_tab;
     const bs_real *off_tab;
+    /* RING WINDOW (streaming mission tables).  0 on every flat schedule
+     * -- flash initializers zero it positionally, and the lookup is then
+     * bit-identical to the pre-extension core.  Non-zero (W-1, W a power
+     * of two) wraps every per-tick array index into a W-slot ring after
+     * the length clamp: the renderer keeps [tau-margin, tau+N+1] valid
+     * and the horizon never reads outside it. */
+    int ring_mask;
 } bs_schedule;
 
 #ifdef BS_N_PHASE

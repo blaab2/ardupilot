@@ -66,8 +66,9 @@ static int tick_of(const bs_schedule *schedule, int t)
         if (wrapped < 0) wrapped += schedule->length;
         return wrapped;
     }
-    if (t < 0) return 0;
-    if (t >= schedule->length) return schedule->length - 1;
+    if (t < 0) t = 0;
+    if (t >= schedule->length) t = schedule->length - 1;
+    if (schedule->ring_mask) t &= schedule->ring_mask;
     return t;
 }
 
@@ -349,6 +350,13 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
                 problem->Dquad[a] += scaled * wcp;
             }
         }
+#ifdef BS_SPEED_TILT_W
+        /* gradient of the speed tilt: d/dU of -w delta_t is
+         * -w * (row 0 of Gam_t); a constant, so it lives in Dquad
+         * beside the affine drift. */
+        for (int a = qpin; a < width; ++a)
+            problem->Dquad[a] -= (bs_real)BS_SPEED_TILT_W * Gt[a];
+#endif
         memcpy(phi, next, sizeof(phi));    /* advance after Abar_t is used */
     }
     /* + 2 Rbar (block diagonal over the input stages), built rows only */
@@ -488,6 +496,16 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
         for (int i = 0; i < NX; ++i)
             for (int j = 0; j < NX; ++j)
                 quad += x[i] * W[(size_t)i * NX + j] * x[j];
+#ifdef BS_SPEED_TILT_W
+        /* SPEED TILT (experimental, compiled out by default): each stage
+         * cost gains -w * delta_t, a linear reward on the tangential
+         * pace, so the optimum moves from "match the published pace" to
+         * "ride the forward face".  Linear in the state: the Hessian --
+         * and with it the contraction machinery -- is untouched, exactly
+         * like the affine drift.  The matching gradient constant is
+         * accumulated into Dquad at build time. */
+        quad += -(bs_real)BS_SPEED_TILT_W * x[0];
+#endif
     }
 
     if (grad) {

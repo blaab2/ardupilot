@@ -58,10 +58,35 @@
 #define BS_VCAP_MIN 3.0
 #define BS_VCAP_MAX 11.8
 /* t-family margin recipe constants (rows_trim_aniso, m = 0.1) */
-#define BS_M_NU_FWD 1.00000000000000006e-01
+/* Forward speed-row margin: how far the model may exceed the
+ * published trim pace.  The physical headroom to the drag disc is
+ * VLEG - V_TRIM = 0.2888; 0.25 keeps 0.039 of that in reserve and
+ * buys measurably better tracking (SN77 ec_peak 1.61 -> 1.39,
+ * el_peak 1.42 -> 1.24) because corner recovery is faster.  The
+ * old 0.1 was a design margin with no physical basis. */
+/* SPEED REWARD (owner directive 2026-09-04): each stage cost gains
+ * -w_v * delta, a linear reward on the tangential pace, so the
+ * optimum moves from 'match the published pace' to 'ride the
+ * forward face'.  Linear in the state: the Hessian, the DARE
+ * machinery and the contraction argument are untouched.  Sweep
+ * clean at 3-11.8 m/s, identical tick counts, corner recovery
+ * visibly faster (post-corner catch-up at the full box). */
+#ifndef BS_SPEED_TILT_W
+#define BS_SPEED_TILT_W 0.15
+#endif
+#ifndef BS_M_NU_FWD
+#define BS_M_NU_FWD 0.25
+#endif
 #define BS_M_LAG 2.0
 #define BS_M_CORR 2.0
 /* published-arc shaping (ing_build lineage, flight-verified) */
+/* airframe drag: k/m, from the SN77 identification (drag accel =
+ * BS_DRAG_KM * v^2).  At cruise this consumes most of the tilt
+ * budget: available forward accel at 11.5 m/s is ~0.74 of the
+ * 3.119 face. */
+#ifndef BS_DRAG_KM
+#define BS_DRAG_KM 0.0180
+#endif
 #define BS_ARC_A_EFF (0.8 * BS_ACCF)
 #define BS_ARC_J_EFF BS_JBOX
 #define BS_KINK_K 3.50000000000000000e-02

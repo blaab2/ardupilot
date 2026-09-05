@@ -116,6 +116,51 @@ size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms);
 /* host calibration hook: >0 caps every junction pace (target: unused) */
 extern double bs_mb_vj_cap;
 
+/* ---- streaming (two-level) build ----------------------------------
+ * PLAN AT VERTEX LEVEL GLOBALLY, RENDER TO TICKS LOCALLY.  The plan is
+ * everything whole-mission (cleanup, junction paces, reachability,
+ * hover splice, per-vertex tick indices and integrator carry, deduped
+ * seam stores, families) and is small regardless of mission length.
+ * The per-tick tables render leg by leg from the stored carry -- into
+ * flat arrays (the batch builder, mask = 0x7fffffff) or into a W-slot
+ * ring (the streaming driver, mask = W-1).  One renderer serves both:
+ * the stream==batch byte-equality gate (tests/stream_gate.c) holds by
+ * construction and is verified anyway. */
+#define BS_MB_SEAM_CAP 48              /* deduped (chi, pace) seam slots */
+
+typedef struct {
+    int n_v;
+    double px[BS_MB_MAX_WP], py[BS_MB_MAX_WP];
+    double leg_len[BS_MB_MAX_WP], leg_hd[BS_MB_MAX_WP];
+    double chi[BS_MB_MAX_WP], vb[BS_MB_MAX_WP + 1];
+    double carry_v[BS_MB_MAX_WP + 1], carry_a[BS_MB_MAX_WP + 1];
+    int g_tick[BS_MB_MAX_WP + 1];
+    int vslot[BS_MB_MAX_WP + 1];
+    int node, n_end, n_clk, n_path, hov_in, n_seam;
+    double v_leg, v_trim, cell_t, cell_min, hyst, r_h, d_hov;
+    double rows[2 * BS_NROW * 10], P[2 * 36], K[2 * 18];
+    double rot[BS_MB_SEAM_CAP * 36], off[BS_MB_SEAM_CAP * 6];
+    int wp_tick[BS_MB_MAX_WP], n_wp_in;
+} bs_mission_plan;
+
+/* Build the vertex-level plan.  max_ticks: pass BS_MB_MAX_TICKS for the
+ * batch semantics (refusal at the classic cap); larger for streaming. */
+bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
+                                   int n_wp, const bs_mission_params *pp,
+                                   int max_ticks, bs_mission_plan *pl,
+                                   bs_mission_report *rep);
+
+/* Render one unit of the per-tick tables: unit i = leg i for
+ * i < n_v-2; unit n_v-2 = the last leg PLUS the hover splice, hold and
+ * pad (finalizes through n_clk-1).  Array indices are wrapped with
+ * `mask` (0x7fffffff = flat).  scratch stages one leg's unscaled arc;
+ * returns 0, or -1 if the leg exceeds scratch_len ticks. */
+int bs_mission_render_unit(const bs_mission_plan *pl, int leg_i,
+                           double *path, double *psi, double *ang,
+                           signed char *fam, int *sfam, int *srot,
+                           int *soff, int mask,
+                           double *scratch, int scratch_len);
+
 /* cold-injection admissible junction speed (the ingress budget) */
 double bs_mb_v_adm(double chi_deg);
 
