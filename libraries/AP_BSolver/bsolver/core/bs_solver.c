@@ -128,6 +128,16 @@ static int family_of(const bs_schedule *schedule, int t)
     return schedule->family[tick_of(schedule, t)];
 }
 
+#if BS_STAGE2_PACE_TAB
+/* Stage 2 (c): the published pace at tick t, or a negative sentinel when
+ * the schedule carries no pace table (flash schedules, ingress prefix). */
+static inline bs_real pace_of(const bs_schedule *schedule, int t)
+{
+    if (schedule->pace == NULL) return (bs_real)-1.0;
+    return schedule->pace[tick_of(schedule, t)];
+}
+#endif
+
 static const bs_real *rows_of(const bs_schedule *schedule, int t)
 {
     const int family = schedule->family[tick_of(schedule, t)];
@@ -439,14 +449,33 @@ static bs_real barrier_slope(bs_real z)
  * exact arithmetic, not equal in the last bits.  Matching the reference costs
  * one full value sweep and is worth it.
  */
-#if BS_STAGE2_HB
-/* Stage 2 (b): the acceleration rows of the bucketable family sit at the odd
- * indices 1,3,...,39 of the 50-row block (build_rows_t emits speed/accel
- * pairs per raster angle); the chart normal at raster index a carries the
- * vehicle-frame margin of index a - k. */
-static bs_real hb_margin(const bs_problem *problem, const bs_schedule *schedule,
-                         int phase, int t, int i, bs_real m0)
+#if BS_STAGE2_HB || BS_STAGE2_WIN
+/* Stage 2 (b)/(c): per-stage row margins of the builder's trim family.
+ * build_rows_t's layout: speed/accel pairs per raster angle at indices
+ * 2a / 2a+1 (a = 0..19), then +e_l, +e_c, +j_l, +j_c (40..43), the same
+ * with sign flipped (44..47), and the two clock rows (48, 49).
+ *   (b) the acceleration rows (odd i < 40) of the bucketable family read
+ *       the vehicle-frame margin of raster index a - k (bs_hb_buckets);
+ *   (c) the speed rows (even i < 40) of the pace family read the absolute
+ *       disc about the published pace, VLEG - pace(tau) c_a, with c_a the
+ *       row's own delta coefficient; the lag rows (40, 44) read the window
+ *       band on slow ticks. */
+static bs_real row_margin(const bs_problem *problem, const bs_schedule *schedule,
+                          int phase, int t, int i, const bs_real *row)
 {
+    bs_real m0 = row[9];
+#if BS_STAGE2_WIN
+    if (schedule->pace != NULL && phase + t >= schedule->pace_t0
+        && family_of(schedule, phase + t) == schedule->pace_fam) {
+        const bs_real pc = pace_of(schedule, phase + t);
+        if (i < 40 && (i & 1) == 0) {
+            m0 = schedule->pace_vleg - pc * row[0];
+        } else if ((i == 40 || i == 44) && pc < schedule->pace_vslow) {
+            m0 = (bs_real)BS_STAGE2_WIN_BAND;
+        }
+    }
+#endif
+#if BS_STAGE2_HB
     if (!problem->hb_on || (i & 1) == 0 || i >= 40) return m0;
     if (family_of(schedule, phase + t) != problem->hb_fam) return m0;
     {
@@ -454,7 +483,14 @@ static bs_real hb_margin(const bs_problem *problem, const bs_schedule *schedule,
         const int k = problem->hb_k[t];
         return (bs_real)bs_rc_aniso[((a - k) % 20 + 20) % 20];
     }
+#else
+    (void)problem;
+    return m0;
+#endif
 }
+#endif
+
+#if BS_STAGE2_HB
 
 void bs_hb_buckets(bs_problem *problem, const bs_real *U, const bs_real *xi,
                    bs_real v_ref, int fam_t)
@@ -466,8 +502,19 @@ void bs_hb_buckets(bs_problem *problem, const bs_real *U, const bs_real *xi,
     problem->hb_on = 1;
     problem->hb_fam = fam_t;
     for (int t = 0; t < NN; ++t) {
-        /* bucket of stage t from the state the row loop evaluates there */
-        const double psi = atan2((double)x[4], (double)(v_ref + x[0]));
+        /* bucket of stage t from the state the row loop evaluates there;
+         * with a pace table the along-track reference is the published
+         * pace of that tick (Stage 2 (c)), else the chart trim */
+        double vr = (double)v_ref;
+#if BS_STAGE2_PACE_TAB
+        if (schedule->pace != NULL && phase + t >= schedule->pace_t0) {
+            const bs_real pc = pace_of(schedule, phase + t);
+            if (family_of(schedule, phase + t) == schedule->pace_fam) {
+                vr = (double)pc;
+            }
+        }
+#endif
+        const double psi = atan2((double)x[4], vr + (double)x[0]);
         int k = (int)lround(psi * 180.0 / 3.14159265358979323846 / 18.0);
         k = ((k % 20) + 20) % 20;
         problem->hb_k[t] = k;
@@ -657,8 +704,8 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
             bs_real g_i = 0.0;
             for (int p = 0; p < NX; ++p) g_i += row[p] * state[p];
             for (int p = 0; p < NU; ++p) g_i += row[6 + p] * U[t * NU + p];
-#if BS_STAGE2_HB
-            const bs_real m = hb_margin(problem, schedule, phase, t, i, row[9]);
+#if BS_STAGE2_HB || BS_STAGE2_WIN
+            const bs_real m = row_margin(problem, schedule, phase, t, i, row);
 #else
             const bs_real m = row[9];
 #endif

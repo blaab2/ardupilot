@@ -54,6 +54,19 @@ public:
     bool render_to(int32_t upto);
     int32_t rendered_to() const { return _cursor; }
     void ring_reset();
+#if BS_STAGE2_REPACE
+    // Stage 2 (c): one slow tick's verdict inputs (model lead, clock input,
+    // worst face violation of the applied input; solver-thread context)
+    void repace_feed(double el, double nu, double viol) {
+        _rp_n++;
+        _rp_nu_sum += fabs(nu);
+        if (el > BS_STAGE2_REPACE_RIDE * BS_STAGE2_WIN_BAND) _rp_ride++;
+        if (viol > _rp_viol) _rp_viol = viol;
+    }
+    float repace_scale() const { return (float)_rp_scale; }
+    uint16_t repace_events() const { return _rp_events; }
+    uint16_t repace_refused() const { return _rp_refused; }
+#endif
     bool build_failed() const { return _failed; }
 
     void invalidate() { _valid = false; _failed = false; _req = true; }
@@ -85,6 +98,16 @@ private:
     double *_r_path, *_r_psi, *_r_ang;
     int *_r_sfam, *_r_srot, *_r_soff;
     signed char *_r_fam;
+#if BS_STAGE2_PACE_TAB
+    double *_r_pace;                  // published pace per tick (ring)
+#endif
+#if BS_STAGE2_REPACE
+    double _rp_scale;                 // current pace scale, [1, MAX]
+    double _rp_nu_sum, _rp_viol;      // accumulators since the last render
+    int _rp_n, _rp_ride;
+    uint16_t _rp_events, _rp_refused;
+    void refresh_clock();             // plan -> tables after a re-pace
+#endif
     int _ring_w, _ring_mask;
     int32_t _cursor;
     int _next_leg;

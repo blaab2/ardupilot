@@ -293,6 +293,20 @@ static double ang_at(int32_t tau)
     return mt->ang[i];
 }
 
+#if BS_STAGE2_PACE_TAB
+// Stage 2 (c): the published pace at a mission tick (ring-aware, like
+// ang_at); negative on the ingress leg, whose pace is the ramp's own.
+static double pace_at(int32_t tau)
+{
+    if (mt == nullptr) return -1.0;
+    if (ing_n > 0 && tau < 0) return -1.0;
+    int32_t i = (tau < 0) ? 0
+              : (tau > mt->n_clk - 1 ? mt->n_clk - 1 : tau);
+    if (mt->sched.ring_mask) i &= mt->sched.ring_mask;
+    return mt->pace[i];
+}
+#endif
+
 static int fam_at(int32_t tau)
 {
     // The ingress family is deliberately NOT the trim family: ledger_step's
@@ -439,11 +453,27 @@ static void plant_step(double *xi, const double *u, double seam_deg,
 // deviation e_l = xi[2], the axis the corridor faces are already written
 // on.  Host measurement at q=2 (face 1.60): 986 ticks / 58 retards /
 // 243.50 s / realized violation 0.0646  ->  928 / 0 / 229.00 / 0.0000.
+#if BS_STAGE2_WIN
+// a slow tick of the pace family past the engage ramp: the window band
+// and the absolute disc apply there, and the re-timing ledger does not
+// (F-LEDGER's family gate, in the runtime's per-tick form)
+static bool slow_at(int32_t tau)
+{
+    if (mt == nullptr) return false;
+    if (tau < mt->sched.pace_t0) return false;
+    if (fam_at(tau) != BS_MB_FAM_T) return false;
+    return pace_at(tau) < mt->sched.pace_vslow;
+}
+#endif
+
 static bool ledger_step(double *phase, int32_t *offset, int32_t tau,
                         double trig)
 {
     if (mt == nullptr) return false;
     if (!(fabs(trig) > mt->hyst)) return false;
+#if BS_STAGE2_WIN
+    if (slow_at(tau)) return false;                          // Stage 2 (c)
+#endif
     // exact zero test (see plant_step): the seam table holds exact values
     if (fabs(ang_at(tau)) > 0.0 || fabs(ang_at(tau + 1)) > 0.0) return false;
     if (fam_at(tau) != BS_MB_FAM_T) return false;          // F-LEDGER
@@ -800,6 +830,11 @@ void AP_BSolver::update(bool ingress_ready)
                           (unsigned)_render_n, (unsigned long)_render_us_max,
                           (unsigned long)(_render_n ? _render_us_sum / _render_n : 0),
                           (unsigned long)_render_noop_us_max);
+#if BS_STAGE2_REPACE
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: repace n %u ref %u s %.3f end %ld",
+                          (unsigned)bs_mb.repace_events(), (unsigned)bs_mb.repace_refused(),
+                          (double)bs_mb.repace_scale(), (long)(mt ? mt->n_end : -1));
+#endif
         } else if (_active) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: t %d off %+d %.0f ms ovr %u",
@@ -810,6 +845,11 @@ void AP_BSolver::update(bool ingress_ready)
                           (unsigned)_render_n, (unsigned long)_render_us_max,
                           (unsigned long)(_render_n ? _render_us_sum / _render_n : 0),
                           (unsigned long)_render_noop_us_max);
+#if BS_STAGE2_REPACE
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: repace n %u ref %u s %.3f end %ld",
+                          (unsigned)bs_mb.repace_events(), (unsigned)bs_mb.repace_refused(),
+                          (double)bs_mb.repace_scale(), (long)(mt ? mt->n_end : -1));
+#endif
         } else {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: armed-wait q%d ir%d arena %u B",
@@ -1212,6 +1252,30 @@ bool AP_BSolver::solve_once()
     if ((float)moved > _prefix_moved) _prefix_moved = (float)moved;
 
     _tau_pub = tau_raw;
+#if BS_STAGE2_REPACE
+    // Stage 2 (c): feed the re-pace verdict on slow ticks -- the model's
+    // lead, its clock input and the worst face violation of the applied
+    // input (chart-frame margins as the host gate reads them; seam ticks
+    // excluded, the frame rotation re-expresses the polygon there).
+    if (ing_n == 0 && slow_at(tau)) {
+        double viol = 0.0;
+        if (!(fabs(ang_at(tau)) > 0.0)) {
+            const double *rows = &mt->rows[(size_t)BS_MB_FAM_T * BS_NROW * 10];
+            const double pc = pace_at(tau);
+            for (int i = 0; i < BS_NROW; ++i) {
+                const double *r = &rows[(size_t)i * 10];
+                double g = 0.0;
+                for (int j = 0; j < 6; ++j) g += r[j] * _xi[j];
+                for (int j = 0; j < 3; ++j) g += r[6 + j] * _U[j];
+                const double v = g - bs_mb_win_margin(&mt->sched, BS_MB_FAM_T,
+                                                      tau, pc, i, r);
+                if (v > viol) viol = v;
+            }
+        }
+        bs_mb.repace_feed(_xi[2], _U[1], viol);
+    }
+#endif
+
     // (b) PUBLISH the standing commitment.  Node i of this plan is node i+1
     //     of the previous one, exactly: same inputs, same recursion, one tick
     //     on.  Nothing is re-anchored at a measurement.

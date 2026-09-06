@@ -94,6 +94,9 @@ typedef struct {
     double *ang;                   /* [n_clk] seam angle at DEST tick, deg */
     signed char *fam;              /* [n_clk] 0 = t, 1 = h               */
     int *sfam, *srot, *soff;       /* [n_clk] core schedule indices      */
+#if BS_STAGE2_PACE_TAB
+    double *pace;                  /* [n_clk] published pace, m/s (2c)   */
+#endif
     /* family tables (t = 0, h = 1) */
     double *rows;                  /* [2*BS_NROW*10]                     */
     double *P;                     /* [2*36]                             */
@@ -142,7 +145,130 @@ typedef struct {
     double rows[2 * BS_NROW * 10], P[2 * 36], K[2 * 18];
     double rot[BS_MB_SEAM_CAP * 36], off[BS_MB_SEAM_CAP * 6];
     int wp_tick[BS_MB_MAX_WP], n_wp_in;
+#if BS_STAGE2_PACE_TAB
+    int pace_t0;                   /* first tick of leg 0 at cruise pace */
+#endif
+#if BS_STAGE2_PAIR || BS_STAGE2_REPACE
+    /* Stage 2 (c): per-leg pace ceiling for the integrator (v_trim on
+     * every leg unless a corner pair holds its pace across the short
+     * leg between the two corners) */
+    double leg_cap[BS_MB_MAX_WP];
+#endif
+#if BS_STAGE2_REPACE
+    /* the authored (base) paces and ceilings the online re-pace scales,
+     * the current scale, and the input-waypoint -> cleaned-vertex map
+     * the tick map is refreshed from after a re-pace */
+    double vb_base[BS_MB_MAX_WP + 1], cap_base[BS_MB_MAX_WP];
+    double pace_scale;
+    int wp_ci[BS_MB_MAX_WP];
+#endif
 } bs_mission_plan;
+
+/* Stage 2 (c) re-pace tuning + the verdict helpers (always visible so the
+ * host gate's accumulators compile on every build; the API below is
+ * gated) */
+#ifndef BS_STAGE2_REPACE_MAX
+#define BS_STAGE2_REPACE_MAX 1.30   /* pace scale ceiling                */
+#endif
+#ifndef BS_STAGE2_REPACE_GAIN
+#define BS_STAGE2_REPACE_GAIN 0.15  /* scale step per unit verdict         */
+#endif
+#ifndef BS_STAGE2_REPACE_DB
+#define BS_STAGE2_REPACE_DB 0.10    /* verdict dead band: |u| below it holds */
+#endif
+#ifndef BS_STAGE2_REPACE_RIDE
+#define BS_STAGE2_REPACE_RIDE 0.8   /* band-riding: e_l above this x band   */
+#endif
+#ifndef BS_STAGE2_REPACE_MIN_N
+#define BS_STAGE2_REPACE_MIN_N 4    /* slow ticks needed for a verdict   */
+#endif
+#ifndef BS_STAGE2_REPACE_NU_REF
+#define BS_STAGE2_REPACE_NU_REF 0.5  /* mean |nu| that cancels a full-band lead */
+#endif
+#ifndef BS_STAGE2_REPACE_VIOL_REF
+#define BS_STAGE2_REPACE_VIOL_REF 1.0 /* face violation that cancels a full-band lead */
+#endif
+#ifndef BS_STAGE2_REPACE_VIOL_DZ
+#define BS_STAGE2_REPACE_VIOL_DZ 1.0  /* dead zone: the relaxed barrier's own
+                                       * small excursions (0.1-0.55 under the
+                                       * Stage-2 (a) cost) are not a pace signal */
+#endif
+/* THE RE-PACE VERDICT on the slow ticks since the previous leg render:
+ *     u = ride - mean|nu|/nu_ref - max(0, viol_max - dz)/viol_ref
+ * `ride` is the fraction of those ticks on which the plan sits at the
+ * lag band (e_l > 0.8 band): a frame the model can follow is led by
+ * 0.8-0.9 m on average but the band is touched only briefly (SN77 pair
+ * pace: ride 0.05), while a frame that is too slow has the plan parked
+ * at the band (the record's finding: every frontier rides the 3 m
+ * band).  The MEAN lead is not the signal -- it is +0.3 band at every
+ * pace under the Stage-2 (a) cost and drove a 1.0 <-> 1.07 flip-flop
+ * against the health terms.  The other two terms are the model's HEALTH: a
+ * frame the model cannot follow does not show up as lag -- the clock
+ * input nu (cheap, R = 0.01) absorbs it and e_l stays positive while
+ * the published track exceeds the disc (measured at scale 1.3 on SN77:
+ * mean|nu| 0.08 -> 0.9, published v_max 13.2 > VLEG, jerk faces
+ * violated).  So mean |nu| and the worst face violation of the applied
+ * input (seam ticks excluded: the frame rotation re-expresses the
+ * acceleration polygon there) vote AGAINST the pace.  The update is
+ * multiplicative and bounded to [1, BS_STAGE2_REPACE_MAX]. */
+static inline double bs_mission_repace_verdict(double ride, double nu_mean,
+                                               double viol_max)
+{
+    double vx = viol_max - BS_STAGE2_REPACE_VIOL_DZ;
+    if (vx < 0.0) vx = 0.0;
+    return ride
+         - nu_mean / BS_STAGE2_REPACE_NU_REF
+         - vx / BS_STAGE2_REPACE_VIOL_REF;
+}
+static inline double bs_mission_repace_scale(double s, double u)
+{
+    if (u > 1.0) u = 1.0;
+    if (u < -1.0) u = -1.0;
+    if (u > -BS_STAGE2_REPACE_DB && u < BS_STAGE2_REPACE_DB) return s;
+    s *= 1.0 + BS_STAGE2_REPACE_GAIN * u;
+    if (s < 1.0) s = 1.0;
+    if (s > BS_STAGE2_REPACE_MAX) s = BS_STAGE2_REPACE_MAX;
+    return s;
+}
+
+#if BS_STAGE2_REPACE
+/* Re-pace every not-yet-rendered leg (>= leg_i) and vertex (>= leg_i+1)
+ * to `scale` x the authored pace, then re-integrate the clock from the
+ * stored carry at vertex leg_i.  Call BEFORE rendering leg leg_i; every
+ * tick < g_tick[leg_i] and the seam at vertex leg_i are untouched.  On
+ * refusal (seam-slot table full, clock cap) the plan is restored and a
+ * negative code returned. */
+int bs_mission_plan_repace(bs_mission_plan *pl, int leg_i, double scale,
+                           int max_ticks);
+/* the batch builder's plan (host gates emulate the streaming driver
+ * on the batch tables) */
+bs_mission_plan *bs_mission_batch_plan(void);
+#endif
+
+#if BS_STAGE2_WIN
+/* the margin of row i of the pace family at a tick, as the core reads it
+ * (bs_solver.c row_margin, chart frame): shared by the driver's and the
+ * host gate's violation ledgers */
+static inline double bs_mb_win_margin(const bs_schedule *sch, int fam_tau,
+                                      int tau, double pace_tau, int i,
+                                      const double *r)
+{
+    if (tau >= sch->pace_t0 && fam_tau == sch->pace_fam) {
+        if (i < 40 && (i & 1) == 0) return sch->pace_vleg - pace_tau * r[0];
+        if ((i == 40 || i == 44) && pace_tau < sch->pace_vslow)
+            return BS_STAGE2_WIN_BAND;
+    }
+    return r[9];
+}
+#endif
+
+#if BS_STAGE2_PACE_TAB
+/* Stage 2 (c): the published pace per tick of unit leg_i, derived from
+ * the rendered path (|p(t+1) - p(t)| / Ts; 0 at rest), same mask/ring as
+ * the path.  Call after bs_mission_render_unit(leg_i). */
+void bs_mission_render_pace(const bs_mission_plan *pl, int leg_i,
+                            const double *path, double *pace, int mask);
+#endif
 
 /* Build the vertex-level plan.  max_ticks: pass BS_MB_MAX_TICKS for the
  * batch semantics (refusal at the classic cap); larger for streaming. */

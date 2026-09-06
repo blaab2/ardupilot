@@ -167,6 +167,9 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
     // carve plan + ring from the block: doubles first, ints, chars
     const size_t need_stream = sizeof(bs_mission_plan)
         + (size_t)BS_STREAM_W * (2 + 1 + 1) * sizeof(double)
+#if BS_STAGE2_PACE_TAB
+        + (size_t)BS_STREAM_W * sizeof(double)          /* the pace ring */
+#endif
         + (size_t)BS_STREAM_W * 3 * sizeof(int)
         + (size_t)BS_STREAM_W * sizeof(signed char) + 64;
     bs_mb_status st;
@@ -186,6 +189,10 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
         cur += (size_t)BS_STREAM_W * sizeof(double);
         _r_ang = (double *)(void *)cur;
         cur += (size_t)BS_STREAM_W * sizeof(double);
+#if BS_STAGE2_PACE_TAB
+        _r_pace = (double *)(void *)cur;
+        cur += (size_t)BS_STREAM_W * sizeof(double);
+#endif
         _r_sfam = (int *)(void *)cur;
         cur += (size_t)BS_STREAM_W * sizeof(int);
         _r_srot = (int *)(void *)cur;
@@ -239,6 +246,20 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
             _mt.sched.rot_tab = _plan->rot;
             _mt.sched.off_tab = _plan->off;
             _mt.sched.ring_mask = _ring_mask;
+#if BS_STAGE2_PACE_TAB
+            _mt.pace = _r_pace;
+            _mt.sched.pace = _r_pace;
+            _mt.sched.pace_fam = BS_MB_FAM_T;
+            _mt.sched.pace_t0 = _plan->pace_t0;
+            _mt.sched.pace_vleg = _plan->v_leg;
+            _mt.sched.pace_vslow = _plan->v_trim - BS_STAGE2_WIN_SLOW;
+#endif
+#if BS_STAGE2_REPACE
+            _rp_scale = 1.0;
+            _rp_nu_sum = _rp_viol = 0.0;
+            _rp_n = _rp_ride = 0;
+            _rp_events = _rp_refused = 0;
+#endif
             ring_reset();
         }
     }
@@ -279,6 +300,33 @@ bool AP_BSMissionBuilder::render_to(int32_t upto)
     while (_cursor < _plan->n_clk && _cursor <= upto) {
         const int i = _next_leg;
         if (i + 1 < _plan->n_v) {
+#if BS_STAGE2_REPACE
+            // Stage 2 (c): the verdict on the slow ticks since the last
+            // render moves the pace scale of every leg from this one on;
+            // this leg's first tick is N+2 ahead of the horizon tip, so
+            // nothing the solver has read or committed is touched.
+            if (i >= 1) {
+                double u = 0.0;
+                if (_rp_n >= BS_STAGE2_REPACE_MIN_N) {
+                    u = bs_mission_repace_verdict((double)_rp_ride / _rp_n,
+                                                  _rp_nu_sum / _rp_n, _rp_viol);
+                }
+                const double s_new = bs_mission_repace_scale(_rp_scale, u);
+                const int rc = bs_mission_plan_repace(_plan, i, s_new,
+                                                      BS_STREAM_MAX_TICKS);
+                if (rc == 0) {
+                    if (fabs(s_new - _rp_scale) > 1e-12) {
+                        _rp_scale = s_new;
+                        _rp_events++;
+                        refresh_clock();
+                    }
+                } else {
+                    _rp_refused++;
+                }
+                _rp_nu_sum = _rp_viol = 0.0;
+                _rp_n = _rp_ride = 0;
+            }
+#endif
             if (bs_mission_render_unit(_plan, i, _r_path, _r_psi, _r_ang,
                                        _r_fam, _r_sfam, _r_srot, _r_soff,
                                        _ring_mask, stream_scratch,
@@ -286,6 +334,9 @@ bool AP_BSMissionBuilder::render_to(int32_t upto)
                                              / sizeof(double))) != 0) {
                 return false;          /* leg exceeds scratch: refused */
             }
+#if BS_STAGE2_PACE_TAB
+            bs_mission_render_pace(_plan, i, _r_path, _r_pace, _ring_mask);
+#endif
             _next_leg = i + 1;
             _cursor = (i + 2 >= _plan->n_v) ? _plan->n_clk
                                             : _plan->g_tick[i + 1];
@@ -295,6 +346,23 @@ bool AP_BSMissionBuilder::render_to(int32_t upto)
     }
     return _cursor > upto || _cursor >= _plan->n_clk;
 }
+
+#if BS_STAGE2_REPACE
+// the whole-mission scalars the driver reads from the tables, refreshed
+// from the plan after an online re-pace (solver-thread context; every
+// field is a naturally aligned int the main thread reads atomically)
+void AP_BSMissionBuilder::refresh_clock()
+{
+    _mt.n_path = _plan->n_path;
+    _mt.n_clk = _plan->n_clk;
+    _mt.node = _plan->node;
+    _mt.n_end = _plan->n_end;
+    _mt.hov_in = _plan->hov_in;
+    _mt.n_seam = _plan->n_seam;
+    _mt.sched.length = _plan->n_clk;
+    memcpy(_mt.wp_tick, _plan->wp_tick, sizeof(_mt.wp_tick));
+}
+#endif
 
 int32_t AP_BSMissionBuilder::tau_vertex(uint16_t wp_idx) const
 {

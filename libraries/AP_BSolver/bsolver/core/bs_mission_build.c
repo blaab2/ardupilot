@@ -476,6 +476,159 @@ static void seam_off(double *c6, double chi_deg, double v_trim)
     c6[4] = -v_trim * s;
 }
 
+/* the integrator's per-leg pace ceiling: trim, or the pair pace a corner
+ * pair holds across its short leg (Stage 2 (c)) */
+static inline double leg_vmax(const bs_mission_plan *pl, int leg_i)
+{
+#if BS_STAGE2_PAIR || BS_STAGE2_REPACE
+    return pl->leg_cap[leg_i];
+#else
+    (void)leg_i;
+    return pl->v_trim;
+#endif
+}
+
+/* seam store slot of interior vertex i: one slot per distinct (chi,
+ * crossing pace), deduped on the affine kick; -1 when the table is full */
+static int seam_slot_assign(bs_mission_plan *pl, int i)
+{
+    double c6[6];
+    seam_off(c6, pl->chi[i], pl->vb[i]);
+    int slot = -1;
+    for (int k = 1; k < pl->n_seam; ++k) {
+        if (fabs(pl->off[k * 6 + 0] - c6[0]) < 1e-12 &&
+            fabs(pl->off[k * 6 + 4] - c6[4]) < 1e-12) {
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (pl->n_seam >= BS_MB_SEAM_CAP) return -1;
+        slot = pl->n_seam++;
+        seam_rot(&pl->rot[(size_t)slot * 36], pl->chi[i]);
+        memcpy(&pl->off[(size_t)slot * 6], c6, sizeof(c6));
+    }
+    pl->vslot[i] = slot;
+    return slot;
+}
+
+/* THE PACE TAIL: hover splice, reachability over the breakpoints, the
+ * pass-1 tick integration from the stored carry at vertex i0, and the
+ * clock fields.  i0 = 0 is the build (the whole mission); i0 > 0 is an
+ * online re-pace (Stage 2 (c)) of the legs >= i0 -- vertex i0's pace and
+ * carry are data there, so the backward reachability pass stops at
+ * i0 + 1.  Requires pl->n_v, leg_len, vb, v_trim (and leg_cap). */
+static bs_mb_status plan_pace_tail(bs_mission_plan *pl, int i0,
+                                   int max_ticks, bs_mission_report *rep)
+{
+#define FAIL(st, g, d) do { rep->status = (st); rep->gate = (g); \
+                            rep->detail = (d); return (st); } while (0)
+    const int n_v = pl->n_v;
+    const double v_trim = pl->v_trim;
+    const double *leg_len = pl->leg_len;
+    double *vb = pl->vb;
+    /* hover splice: r_h fixed point on the final leg */
+    const int last = n_v - 2;       /* index of the final leg */
+    double r_h = 1.0;
+    for (int it = 0; it < 6; ++it) {
+        const double d_h = -bs_rc_hov_x[0] * r_h;    /* 20*r_h */
+        double avail = leg_len[last] - d_h;
+        if (avail < 0.0) avail = 0.0;
+        const double v_in = (last == 0) ? vb[0] : vb[last];
+        double v_reach = arc_reach_fwd(v_in, avail);
+        if (v_reach > v_trim) v_reach = v_trim;
+        double r_new = v_reach / BS_HOV_PACE_REF;
+        if (r_new > 1.0) r_new = 1.0;
+        r_h = r_new;
+    }
+    const double v_entry = r_h * BS_HOV_PACE_REF;
+    if (v_entry < 1.0) FAIL(BS_MB_ERR_HOVER, 8, v_entry);
+    vb[n_v - 1] = v_entry;          /* target at the splice breakpoint */
+    const double d_hov = -bs_rc_hov_x[0] * r_h;
+
+    /* forward + backward reachability over breakpoints (splice-aware:
+     * the final leg's cruise portion ends d_hov early) */
+    for (int i = i0 + 1; i < n_v; ++i) {
+        const double L = leg_len[i - 1] - ((i == n_v - 1) ? d_hov : 0.0);
+        const double vmax = arc_reach_fwd(vb[i - 1], (L > 0 ? L : 0));
+        if (vb[i] > vmax) vb[i] = vmax;
+    }
+    for (int i = n_v - 2; i >= ((i0 > 0) ? i0 + 1 : 0); --i) {
+        const double L = leg_len[i] - ((i == n_v - 2) ? d_hov : 0.0);
+        const double vmax = arc_reach_fwd(vb[i + 1], (L > 0 ? L : 0));
+        if (vb[i] > vmax) vb[i] = vmax;
+    }
+
+    /* ---- pass 1: integrate the published profile, count ticks, and
+     * record the integrator carry at every vertex (the renderer re-runs
+     * the same recursion per leg from this carry) ---- */
+    const int cap_ticks = max_ticks + BS_MB_HOLD + BS_MB_PAD;
+    int *g_tick = pl->g_tick;       /* tick of each cleaned vertex */
+    int n_tick;                     /* ticks BEFORE the hover splice */
+    {
+        if (i0 == 0) {
+            g_tick[0] = 0;
+            pl->carry_v[0] = vb[0];
+            pl->carry_a[0] = 0.0;
+#if BS_STAGE2_PACE_TAB
+            pl->pace_t0 = -1;
+#endif
+        }
+        double v = pl->carry_v[i0], a = pl->carry_a[i0];
+        n_tick = g_tick[i0];
+        for (int i = i0; i + 1 < n_v; ++i) {
+            const double L = leg_len[i] - ((i == n_v - 2) ? d_hov : 0.0);
+            const double vt = vb[i + 1];
+            const double vmx = leg_vmax(pl, i);
+            double arc = 0.0;
+            int nt = 0;
+            while (arc < L && nt < cap_ticks) {
+                bs_arc_step(&v, &a, &arc, L, vt, vmx);
+                nt++;
+#if BS_STAGE2_PACE_TAB
+                if (i == 0 && pl->pace_t0 < 0
+                    && v >= v_trim - BS_STAGE2_WIN_SLOW) {
+                    pl->pace_t0 = nt;       /* the tick that arrives at cruise */
+                }
+#endif
+                if (arc <= 0.0 && nt > 8) {
+                    FAIL(BS_MB_ERR_GEOM, 2, (double)i);  /* stalled */
+                }
+            }
+            if (arc < L) FAIL(BS_MB_ERR_TICKS, 9, (double)n_tick + nt);
+            n_tick += nt;
+            g_tick[i + 1] = n_tick;    /* vertex i+1 (or splice) tick */
+            pl->carry_v[i + 1] = v;
+            pl->carry_a[i + 1] = a;
+            if (n_tick > max_ticks) {
+                FAIL(BS_MB_ERR_TICKS, 9, (double)n_tick);
+            }
+        }
+    }
+#if BS_STAGE2_PACE_TAB
+    if (i0 == 0 && pl->pace_t0 < 0) pl->pace_t0 = n_tick + BS_HOV_TICKS + BS_MB_HOLD + BS_MB_PAD;
+#endif
+    pl->node = n_tick + BS_HOV_TICKS;
+    pl->n_end = pl->node + BS_MB_HOLD;
+    pl->n_clk = pl->n_end + BS_MB_PAD;
+    pl->n_path = pl->node + 1;
+    pl->hov_in = pl->node - BS_HOV_TICKS;
+    if (pl->node > max_ticks) FAIL(BS_MB_ERR_TICKS, 9, (double)pl->node);
+    pl->r_h = r_h;
+    pl->d_hov = d_hov;
+#if BS_STAGE2_REPACE
+    if (i0 > 0) {                   /* refresh the input-waypoint map */
+        for (int i = 0; i < pl->n_wp_in; ++i) {
+            const int ci = pl->wp_ci[i];
+            pl->wp_tick[i] = (ci == n_v - 1) ? pl->node : g_tick[ci];
+        }
+        pl->wp_tick[pl->n_wp_in - 1] = pl->node;
+    }
+#endif
+    return BS_MB_OK;
+#undef FAIL
+}
+
 /* ---------------------------------------------------------------- sizing */
 size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms)
 {
@@ -503,6 +656,9 @@ size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms)
         }
     }
     return (size_t)n_est * (5 * sizeof(double) + 1 + 3 * sizeof(int))
+#if BS_STAGE2_PACE_TAB
+         + (size_t)n_est * sizeof(double)             /* the pace column */
+#endif
          + (size_t)(2 * BS_NROW * 10 + 2 * 36 + 2 * 18) * sizeof(double)
          + (size_t)MB_MAX_SEAM * (36 + 6) * sizeof(double)
          + 1024;
@@ -649,77 +805,69 @@ bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
             if (vb[i] < BS_VJ_FLOOR) vb[i] = BS_VJ_FLOOR;
         }
     }
-    /* hover splice: r_h fixed point on the final leg */
-    const int last = n_v - 2;       /* index of the final leg */
-    double r_h = 1.0;
-    for (int it = 0; it < 6; ++it) {
-        const double d_h = -bs_rc_hov_x[0] * r_h;    /* 20*r_h */
-        double avail = leg_len[last] - d_h;
-        if (avail < 0.0) avail = 0.0;
-        const double v_in = (last == 0) ? vb[0] : vb[last];
-        double v_reach = arc_reach_fwd(v_in, avail);
-        if (v_reach > v_trim) v_reach = v_trim;
-        double r_new = v_reach / BS_HOV_PACE_REF;
-        if (r_new > 1.0) r_new = 1.0;
-        r_h = r_new;
-    }
-    const double v_entry = r_h * BS_HOV_PACE_REF;
-    if (v_entry < 1.0) FAIL(BS_MB_ERR_HOVER, 8, v_entry);
-    vb[n_v - 1] = v_entry;          /* target at the splice breakpoint */
-    const double d_hov = -bs_rc_hov_x[0] * r_h;
-
-    /* forward + backward reachability over breakpoints (splice-aware:
-     * the final leg's cruise portion ends d_hov early) */
-    for (int i = 1; i < n_v; ++i) {
-        const double L = leg_len[i - 1] - ((i == n_v - 1) ? d_hov : 0.0);
-        const double vmax = arc_reach_fwd(vb[i - 1], (L > 0 ? L : 0));
-        if (vb[i] > vmax) vb[i] = vmax;
-    }
-    for (int i = n_v - 2; i >= 0; --i) {
-        const double L = leg_len[i] - ((i == n_v - 2) ? d_hov : 0.0);
-        const double vmax = arc_reach_fwd(vb[i + 1], (L > 0 ? L : 0));
-        if (vb[i] > vmax) vb[i] = vmax;
-    }
-
-    /* ---- pass 1: integrate the published profile, count ticks, and
-     * record the integrator carry at every vertex (the renderer re-runs
-     * the same recursion per leg from this carry) ---- */
-    const int cap_ticks = max_ticks + BS_MB_HOLD + BS_MB_PAD;
-    int *g_tick = pl->g_tick;       /* tick of each cleaned vertex */
-    int n_tick = 0;                 /* ticks BEFORE the hover splice */
+#if BS_STAGE2_PAIR || BS_STAGE2_REPACE
+    for (int i = 0; i + 1 < n_v; ++i) pl->leg_cap[i] = v_trim;
+#endif
+#if BS_STAGE2_PAIR
+    /* ---- Stage 2 (c), pair-aware pace.  Two consecutive corners whose
+     * brake/accelerate ramps overlap on the leg between them are ONE
+     * manoeuvre: the vehicle flies a U-turn arc of radius L/2 + d_corr
+     * that uses the corridor on both corners, not two isolated corners
+     * whose per-vertex table (calibrated on 140 m legs) prices the
+     * second one at 4 m/s.  Its pace is sqrt(kappa a_lat (L/2 + d)),
+     * held across the short leg (the integrator's ceiling), and both
+     * vertices take the larger of table and pair pace.  A vertex on two
+     * short legs takes the smaller pair pace. ---- */
     {
-        double v = vb[0], a = 0.0;
-        g_tick[0] = 0;
-        pl->carry_v[0] = v;
-        pl->carry_a[0] = a;
-        for (int i = 0; i + 1 < n_v; ++i) {
-            const double L = leg_len[i] - ((i == n_v - 2) ? d_hov : 0.0);
-            const double vt = vb[i + 1];
-            double arc = 0.0;
-            int nt = 0;
-            while (arc < L && nt < cap_ticks) {
-                bs_arc_step(&v, &a, &arc, L, vt, v_trim);
-                nt++;
-                if (arc <= 0.0 && nt > 8) {
-                    FAIL(BS_MB_ERR_GEOM, 2, (double)i);  /* stalled */
-                }
-            }
-            if (arc < L) FAIL(BS_MB_ERR_TICKS, 9, (double)n_tick + nt);
-            n_tick += nt;
-            g_tick[i + 1] = n_tick;    /* vertex i+1 (or splice) tick */
-            pl->carry_v[i + 1] = v;
-            pl->carry_a[i + 1] = a;
-            if (n_tick > max_ticks) {
-                FAIL(BS_MB_ERR_TICKS, 9, (double)n_tick);
-            }
+        double vpair[BS_MB_MAX_WP];
+        for (int i = 0; i < n_v; ++i) vpair[i] = -1.0;
+        for (int i = 1; i + 2 < n_v; ++i) {     /* leg i joins vertices i, i+1 */
+            /* THE PAIR IS A REVERSAL: same turning sense, the two angles
+             * adding to (nearly) a half turn -- two parallel long legs
+             * joined by a short cross leg, the row-end geometry the
+             * U-turn radius L/2 + d describes.  A zigzag or a dog-leg of
+             * two short legs is not that manoeuvre (measured on the
+             * mixed-angle synthetic without this test: face violation
+             * 1.65, corridor 2.0-2.3 m). */
+            if (chi[i] * chi[i + 1] <= 0.0) continue;
+            if (fabs(chi[i]) + fabs(chi[i + 1]) < 150.0) continue;
+            const double d_ramp =
+                  (v_trim * v_trim - vb[i] * vb[i]) / (2.0 * BS_ARC_A_EFF)
+                + (v_trim * v_trim - vb[i + 1] * vb[i + 1]) / (2.0 * BS_ARC_A_EFF);
+            if (leg_len[i] >= d_ramp) continue;
+            double vp = sqrt(MB_CORNER_KAPPA * MB_A_LAT
+                             * (0.5 * leg_len[i] + MB_CORNER_D));
+            vp *= bs_mb_vj_scale;
+            if (vp > v_trim) vp = v_trim;
+            if (vpair[i] < 0.0 || vp < vpair[i]) vpair[i] = vp;
+            if (vpair[i + 1] < 0.0 || vp < vpair[i + 1]) vpair[i + 1] = vp;
+            if (vp < pl->leg_cap[i]) pl->leg_cap[i] = vp;
+        }
+        for (int i = 1; i + 1 < n_v; ++i) {
+            if (vpair[i] > vb[i]) vb[i] = vpair[i];
+        }
+        /* the ceiling can never sit below the leg's entry pace: the
+         * integrator clips to it, and a clip below the entry pace is a
+         * one-tick brake */
+        for (int i = 1; i + 2 < n_v; ++i) {
+            if (pl->leg_cap[i] < vb[i]) pl->leg_cap[i] = vb[i];
         }
     }
-    pl->node = n_tick + BS_HOV_TICKS;
-    pl->n_end = pl->node + BS_MB_HOLD;
-    pl->n_clk = pl->n_end + BS_MB_PAD;
-    pl->n_path = pl->node + 1;
-    pl->hov_in = pl->node - BS_HOV_TICKS;
-    if (pl->node > max_ticks) FAIL(BS_MB_ERR_TICKS, 9, (double)pl->node);
+#endif
+    pl->n_v = n_v;
+    pl->v_trim = v_trim;
+    {
+        const bs_mb_status tst = plan_pace_tail(pl, 0, max_ticks, rep);
+        if (tst != BS_MB_OK) return tst;
+    }
+    const double r_h = pl->r_h;
+    const double d_hov = pl->d_hov;
+    int *g_tick = pl->g_tick;       /* tick of each cleaned vertex */
+#if BS_STAGE2_REPACE
+    memcpy(pl->vb_base, pl->vb, sizeof(pl->vb_base));
+    memcpy(pl->cap_base, pl->leg_cap, sizeof(pl->cap_base));
+    pl->pace_scale = 1.0;
+#endif
 
     /* seam stores: slot 0 identity/zero, then one slot per distinct
      * (chi, crossing pace), with each interior vertex's slot in
@@ -737,25 +885,9 @@ bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
     memset(pl->off, 0, sizeof(double) * 6);
     memset(pl->vslot, 0, sizeof(pl->vslot));
     for (int i = 1; i + 1 < n_v; ++i) {
-        double c6[6];
-        seam_off(c6, chi[i], vb[i]);
-        int slot = -1;
-        for (int k = 1; k < pl->n_seam; ++k) {
-            if (fabs(pl->off[k * 6 + 0] - c6[0]) < 1e-12 &&
-                fabs(pl->off[k * 6 + 4] - c6[4]) < 1e-12) {
-                slot = k;
-                break;
-            }
+        if (seam_slot_assign(pl, i) < 0) {
+            FAIL(BS_MB_ERR_GEOM, 5, pl->n_seam);
         }
-        if (slot < 0) {
-            if (pl->n_seam >= BS_MB_SEAM_CAP) {
-                FAIL(BS_MB_ERR_GEOM, 5, pl->n_seam);
-            }
-            slot = pl->n_seam++;
-            seam_rot(&pl->rot[(size_t)slot * 36], chi[i]);
-            memcpy(&pl->off[(size_t)slot * 6], c6, sizeof(c6));
-        }
-        pl->vslot[i] = slot;
     }
 
     /* ---- families ---- */
@@ -796,6 +928,9 @@ bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
         for (int i = 0; i < n_wp; ++i) {
             while (ci + 1 < n_v && src[ci + 1] <= i) ci++;
             pl->wp_tick[i] = (ci == n_v - 1) ? pl->node : g_tick[ci];
+#if BS_STAGE2_REPACE
+            pl->wp_ci[i] = ci;
+#endif
         }
         pl->wp_tick[n_wp - 1] = pl->node;
     }
@@ -852,9 +987,10 @@ int bs_mission_render_unit(const bs_mission_plan *pl, int leg_i,
     const double L = pl->leg_len[leg_i]
                    - ((leg_i == pl->n_v - 2) ? pl->d_hov : 0.0);
     const double vt = pl->vb[leg_i + 1];
+    const double vmx = leg_vmax(pl, leg_i);
     double v = pl->carry_v[leg_i], a = pl->carry_a[leg_i], arc = 0.0;
     for (int k = 0; k < nt; ++k) {
-        bs_arc_step(&v, &a, &arc, L, vt, pl->v_trim);
+        bs_arc_step(&v, &a, &arc, L, vt, vmx);
         scratch[k] = arc;
     }
     const double scale = (arc > 0.0) ? (L / arc) : 0.0;
@@ -914,7 +1050,82 @@ int bs_mission_render_unit(const bs_mission_plan *pl, int leg_i,
     return 0;
 }
 
+#if BS_STAGE2_PACE_TAB
+void bs_mission_render_pace(const bs_mission_plan *pl, int leg_i,
+                            const double *path, double *pace, int mask)
+{
+    const int t0 = pl->g_tick[leg_i];
+    const int t1 = (leg_i + 2 >= pl->n_v) ? pl->n_clk : pl->g_tick[leg_i + 1];
+    for (int t = t0; t < t1; ++t) {
+        double v = 0.0;
+        if (t + 1 <= pl->node) {         /* path holds samples 0..node */
+            const int s0 = t & mask, s1 = (t + 1) & mask;
+            v = hypot(path[2 * s1] - path[2 * s0],
+                      path[2 * s1 + 1] - path[2 * s0 + 1]) / BS_TS;
+        }
+        pace[t & mask] = v;
+    }
+}
+#endif
+
+#if BS_STAGE2_REPACE
+/* the whole-plan backup a refused re-pace restores from (file-scope: the
+ * plan is ~30 kB, the solver thread's stack 8 kB; re-paces are serialized
+ * with builds by construction) */
+static bs_mission_plan repace_backup;
+
+int bs_mission_plan_repace(bs_mission_plan *pl, int leg_i, double scale,
+                           int max_ticks)
+{
+    if (leg_i < 0 || leg_i + 1 >= pl->n_v) return -1;
+    if (scale < 1.0) scale = 1.0;
+    if (scale > BS_STAGE2_REPACE_MAX) scale = BS_STAGE2_REPACE_MAX;
+    if (fabs(scale - pl->pace_scale) < 1e-12) {
+        /* the paces stand, but vertex leg_i+1's pace may have been
+         * scaled by an EARLIER re-pace: its seam slot is (re)assigned at
+         * every render so the kick is at the pace the frame crosses at */
+        if (leg_i + 1 <= pl->n_v - 2 && seam_slot_assign(pl, leg_i + 1) < 0) {
+            return -3;
+        }
+        return 0;
+    }
+    memcpy(&repace_backup, pl, sizeof(*pl));
+    for (int j = leg_i + 1; j + 1 < pl->n_v; ++j) {
+        double v = pl->vb_base[j] * scale;
+        if (v > pl->v_trim) v = pl->v_trim;
+        pl->vb[j] = v;
+    }
+    for (int k = leg_i; k + 1 < pl->n_v; ++k) {
+        double c = pl->cap_base[k] * scale;
+        if (c > pl->v_trim) c = pl->v_trim;
+        if (c < pl->vb[k]) c = pl->vb[k];   /* never below the entry pace */
+        pl->leg_cap[k] = c;
+    }
+    {
+        bs_mission_report rep;
+        memset(&rep, 0, sizeof(rep));
+        if (plan_pace_tail(pl, leg_i, max_ticks, &rep) != BS_MB_OK) {
+            memcpy(pl, &repace_backup, sizeof(*pl));
+            return -2;
+        }
+    }
+    if (leg_i + 1 <= pl->n_v - 2) {       /* the next seam's (chi, pace) */
+        if (seam_slot_assign(pl, leg_i + 1) < 0) {
+            memcpy(pl, &repace_backup, sizeof(*pl));
+            return -3;
+        }
+    }
+    pl->pace_scale = scale;
+    return 0;
+}
+#endif
+
 /* ----------------------------------------------------------------- build */
+static bs_mission_plan batch_plan;     /* see the note in bs_mission_build */
+#if BS_STAGE2_REPACE
+bs_mission_plan *bs_mission_batch_plan(void) { return &batch_plan; }
+#endif
+
 bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
                               const bs_mission_params *pp,
                               void *mem, size_t mem_len,
@@ -927,8 +1138,7 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
      * lives in a file-scope static.  Builds are serialized by
      * construction: bs_mission_build runs only in solver-thread context
      * while the solver is idle (see AP_BSMissionBuilder). */
-    static bs_mission_plan plan;
-    bs_mission_plan *const pl = &plan;
+    bs_mission_plan *const pl = &batch_plan;
 
     const bs_mb_status pst =
         bs_mission_plan_build(vx, vy, n_wp, pp, BS_MB_MAX_TICKS, pl, rep);
@@ -963,6 +1173,10 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
     TAKE(path, double, 2 * n_path);
     TAKE(psi, double, n_path);
     TAKE(angt, double, n_clk);
+#if BS_STAGE2_PACE_TAB
+    double *pace;
+    TAKE(pace, double, n_clk);
+#endif
     TAKE(rows, double, 2 * BS_NROW * 10);
     TAKE(P, double, 2 * 36);
     TAKE(K, double, 2 * 18);
@@ -992,6 +1206,9 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
             != 0) {
             FAIL(BS_MB_ERR_GEOM, 2, (double)i);      /* unreachable */
         }
+#if BS_STAGE2_PACE_TAB
+        bs_mission_render_pace(pl, i, path, pace, 0x7fffffff);
+#endif
     }
 
     /* ---- acceptance gates ---- */
@@ -1048,6 +1265,9 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
     out->sfam = sfam;
     out->srot = srot;
     out->soff = soff;
+#if BS_STAGE2_PACE_TAB
+    out->pace = pace;
+#endif
     out->rows = rows;
     out->P = P;
     out->K = K;
@@ -1070,6 +1290,13 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
     out->sched.K_tab = K;
     out->sched.rot_tab = rot;
     out->sched.off_tab = off;
+#if BS_STAGE2_PACE_TAB
+    out->sched.pace = pace;
+    out->sched.pace_fam = BS_MB_FAM_T;
+    out->sched.pace_t0 = pl->pace_t0;
+    out->sched.pace_vleg = pl->v_leg;
+    out->sched.pace_vslow = pl->v_trim - BS_STAGE2_WIN_SLOW;
+#endif
 
     rep->status = BS_MB_OK;
     rep->n_ticks = n_clk;

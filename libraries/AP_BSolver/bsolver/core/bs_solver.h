@@ -81,6 +81,67 @@ typedef enum {
  * clamped not wrapped -- the same indexing `rotation` already uses.  A
  * schedule with no affine part sets `offset` to NULL, which off_of() reads as
  * the zero vector; that is the record's plain linear step. */
+/* ---- Stage-2 experiment switches (host gate / SITL builds; every default
+ * is OFF and the default build is byte-identical):
+ *   BS_STAGE2_HB=1      heading-bucketed acceleration faces: the family's
+ *                       20-gon rotated by k*18 deg per stage = the same rows
+ *                       with bs_rc_aniso rolled by k, k from the warm start's
+ *                       predicted heading (bs_hb_buckets); terminal pair of
+ *                       the unrotated family.
+ *   BS_STAGE2_QD=<x>    Q_delta override (stage cost AND the DARE pairs).
+ *   BS_SPEED_TILT_W=<w> the linear progress reward (header default 0.15).
+ *   BS_STAGE2_VJ_SCALE  junction-pace multiplier applied at driver init.
+ *
+ * Stage 2 (c), the three enabling pieces (2026-09-06).  The shipped trim
+ * family's speed rows are the disc |v| <= VLEG written about the CHART
+ * trim, (V_TRIM + delta) c_k + edot_c s_k <= VLEG, while the published
+ * track moves at pace(tau) + delta.  Through a corner the frame pace is
+ * 4-7 m/s and the chart still carries trim, so the forward face pins
+ * delta at +0.15 above the AUTHORED pace: measured on SN77, 0 % of ticks
+ * at the face and |e_l| <= 1.26 of the 2.0 m band -- the plan is the
+ * frame.  The record's corner windows carry the absolute disc about the
+ * segment pace and a 3 m lag band, and ride both.
+ *   BS_STAGE2_WIN=1     per-tick faces: the builder renders the published
+ *                       pace per tick (schedule->pace); on the pace family
+ *                       the speed rows read m_k = VLEG - pace(tau) c_k
+ *                       (the absolute disc about the published pace) and
+ *                       the lag rows read BS_STAGE2_WIN_BAND wherever
+ *                       pace(tau) < v_trim - BS_STAGE2_WIN_SLOW.  The
+ *                       re-timing ledger is gated OFF on those slow ticks
+ *                       (the runtime analogue of F-LEDGER's family gate:
+ *                       inside a window nothing re-times), so the advance
+ *                       branch stays unreachable on the 2.0 m trim band.
+ *   BS_STAGE2_PAIR=1    pair-aware authored pace: two consecutive corners
+ *                       whose brake/accelerate ramps overlap get ONE pace,
+ *                       v = sqrt(kappa a_lat (L/2 + d_corr)), the U-turn
+ *                       radius of the pair, held across the short leg.
+ *   BS_STAGE2_REPACE=1  online re-pace of the not-yet-rendered legs at
+ *                       every leg render: the mean lag band occupancy on
+ *                       the slow ticks since the previous render moves a
+ *                       bounded pace scale in [1, BS_STAGE2_REPACE_MAX];
+ *                       the committed prefix and every rendered tick are
+ *                       untouched (the render happens N+2 ticks ahead). */
+#ifndef BS_STAGE2_HB
+#define BS_STAGE2_HB 0
+#endif
+#ifndef BS_STAGE2_WIN
+#define BS_STAGE2_WIN 0
+#endif
+#ifndef BS_STAGE2_PAIR
+#define BS_STAGE2_PAIR 0
+#endif
+#ifndef BS_STAGE2_REPACE
+#define BS_STAGE2_REPACE 0
+#endif
+/* the per-tick pace table exists whenever a piece reads it */
+#define BS_STAGE2_PACE_TAB (BS_STAGE2_WIN || BS_STAGE2_REPACE)
+#ifndef BS_STAGE2_WIN_BAND
+#define BS_STAGE2_WIN_BAND 3.0     /* lag band on slow ticks, m (record) */
+#endif
+#ifndef BS_STAGE2_WIN_SLOW
+#define BS_STAGE2_WIN_SLOW 0.5     /* slow tick: pace < v_trim - this  */
+#endif
+
 typedef struct {
     const int *family;
     const int *rotation;
@@ -120,6 +181,22 @@ typedef struct {
      * the length clamp: the renderer keeps [tau-margin, tau+N+1] valid
      * and the horizon never reads outside it. */
     int ring_mask;
+#if BS_STAGE2_PACE_TAB
+    /* STAGE 2 (c): the published pace per tick (m/s), same indexing and
+     * ring as the per-tick arrays above; NULL on every flash schedule and
+     * on the ingress prefix (positional initializers / static zero), and
+     * then the row margins are the family's own.  pace_fam is the family
+     * whose rows are written about the pace (the builder's trim family);
+     * pace_vleg the disc radius; pace_vslow the slow-tick threshold. */
+    const bs_real *pace;
+    int pace_fam;
+    int pace_t0;               /* first cruise tick: before it (the engage
+                                * ramp from rest) the rows and the ledger
+                                * are the shipped ones -- the chart's
+                                * rest state is delta = -v_trim there */
+    bs_real pace_vleg;
+    bs_real pace_vslow;
+#endif
 } bs_schedule;
 
 #ifdef BS_N_PHASE
@@ -131,19 +208,6 @@ extern const bs_schedule bs_sched_periodic;
 extern const bs_schedule bs_sched_mission;
 
 /* Everything that depends only on the phase, built once per solve. */
-/* ---- Stage-2 experiment switches (host gate / SITL builds; every default
- * is OFF and the default build is byte-identical):
- *   BS_STAGE2_HB=1      heading-bucketed acceleration faces: the family's
- *                       20-gon rotated by k*18 deg per stage = the same rows
- *                       with bs_rc_aniso rolled by k, k from the warm start's
- *                       predicted heading (bs_hb_buckets); terminal pair of
- *                       the unrotated family.
- *   BS_STAGE2_QD=<x>    Q_delta override (stage cost AND the DARE pairs).
- *   BS_SPEED_TILT_W=<w> the linear progress reward (header default 0.15).
- *   BS_STAGE2_VJ_SCALE  junction-pace multiplier applied at driver init. */
-#ifndef BS_STAGE2_HB
-#define BS_STAGE2_HB 0
-#endif
 
 typedef struct {
     const bs_schedule *schedule;
