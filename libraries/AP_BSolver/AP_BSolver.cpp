@@ -626,6 +626,9 @@ void AP_BSolver::init()
     if (_inited || _enable == 0) {
         return;
     }
+#ifdef BS_STAGE2_VJ_SCALE
+    bs_mb_vj_scale = BS_STAGE2_VJ_SCALE;   // Stage-2 experiment builds only
+#endif
     bs_arena_words = bs_workspace_size();
     bs_arena = (double *)calloc(bs_arena_words, sizeof(double));
     if (bs_mb_block == nullptr) {
@@ -1058,6 +1061,9 @@ void AP_BSolver::seed_once()
     const uint32_t t0 = AP_HAL::micros();
     int it = 0;
     const int cap = (int)_qe > 0 ? (int)_qe : 1;
+#if BS_STAGE2_HB
+    bs_hb_buckets(&bs_driver_problem, _U, _xi, mt->v_trim, BS_MB_FAM_T);
+#endif
     static double grad[BS_NV];
     for (; it < cap; ++it) {
         double value = 0.0;
@@ -1236,6 +1242,9 @@ bool AP_BSolver::solve_once()
     if (!ensure_problem(tau_next)) {
         return false;
     }
+#if BS_STAGE2_HB
+    bs_hb_buckets(&bs_driver_problem, U_shift, _xi, mt->v_trim, BS_MB_FAM_T);
+#endif
     double lambda0 = 0.0;
     bs_newton_stats stats = {};
     if (bs_newton_pinned(&bs_driver_problem, U_shift, _xi, (int)_q,

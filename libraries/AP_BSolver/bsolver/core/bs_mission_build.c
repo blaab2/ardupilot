@@ -411,7 +411,11 @@ static int family_dare(const double *rows, double *P6, double *K36)
             }
         }
     }
+#ifdef BS_STAGE2_QD
+    double QL[9] = { BS_STAGE2_QD, 0, 0, 0, BS_W_QA, 0, 0, 0, BS_W_RL };
+#else
     double QL[9] = { BS_W_QD, 0, 0, 0, BS_W_QA, 0, 0, 0, BS_W_RL };
+#endif
     double QT[9] = { BS_W_RC, 0, 0, 0, BS_W_REG, 0, 0, 0, BS_W_REG };
     double RLm[4] = { BS_W_RJ, 0, 0, BS_W_RNU };
     double RTm[1] = { BS_W_RJ };
@@ -776,7 +780,11 @@ bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
             const double d = fabs(pl->K[18 + i] - bs_rc_Kh[i]);
             if (d > dmax) dmax = d;
         }
+#ifndef BS_STAGE2_QD
         if (dmax > 1e-7) FAIL(BS_MB_ERR_DARE, 10, dmax);
+#else
+        (void)dmax;   /* Stage-2 Q_delta override: the pair cannot reproduce the record's table by construction */
+#endif
     }
 
     /* input waypoint -> vertex tick; merged/dropped inputs inherit the

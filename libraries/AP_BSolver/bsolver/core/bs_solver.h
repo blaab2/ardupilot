@@ -131,6 +131,20 @@ extern const bs_schedule bs_sched_periodic;
 extern const bs_schedule bs_sched_mission;
 
 /* Everything that depends only on the phase, built once per solve. */
+/* ---- Stage-2 experiment switches (host gate / SITL builds; every default
+ * is OFF and the default build is byte-identical):
+ *   BS_STAGE2_HB=1      heading-bucketed acceleration faces: the family's
+ *                       20-gon rotated by k*18 deg per stage = the same rows
+ *                       with bs_rc_aniso rolled by k, k from the warm start's
+ *                       predicted heading (bs_hb_buckets); terminal pair of
+ *                       the unrotated family.
+ *   BS_STAGE2_QD=<x>    Q_delta override (stage cost AND the DARE pairs).
+ *   BS_SPEED_TILT_W=<w> the linear progress reward (header default 0.15).
+ *   BS_STAGE2_VJ_SCALE  junction-pace multiplier applied at driver init. */
+#ifndef BS_STAGE2_HB
+#define BS_STAGE2_HB 0
+#endif
+
 typedef struct {
     const bs_schedule *schedule;
     int phase;
@@ -161,6 +175,11 @@ typedef struct {
     bs_real *nt_grad;      /* BS_NV */
     bs_real *nt_dir;       /* BS_NV */
     bs_real *nt_trial;     /* BS_NV */
+#if BS_STAGE2_HB
+    int hb_on;                 /* buckets valid for this phase */
+    int hb_fam;                /* the family whose accel rows roll */
+    int hb_k[BS_N];            /* bucket per stage, 0..19 */
+#endif
 } bs_problem;
 
 /* Workspace sizing, in bs_real units. */
@@ -257,5 +276,14 @@ void bs_shift_append(const bs_problem *problem, const bs_real *U,
  * (lower triangle), then solve.  Exposed for the parity harness. */
 bs_status bs_chol_factor(bs_real *A, int n);
 void bs_chol_solve(const bs_real *L, int n, bs_real *b);
+
+#if BS_STAGE2_HB
+/* Stage 2 (b): set the per-stage heading buckets from the states the plant
+ * recursion predicts along U from xi (the warm start), for the family fam_t;
+ * v_ref is the chart pace the deviation delta is measured against.  Call
+ * after every bs_problem_init*() and before the Newton steps. */
+void bs_hb_buckets(bs_problem *problem, const bs_real *U, const bs_real *xi,
+                   bs_real v_ref, int fam_t);
+#endif
 
 #endif /* BS_SOLVER_H */

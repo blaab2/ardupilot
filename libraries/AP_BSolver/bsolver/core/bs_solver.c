@@ -59,6 +59,26 @@ const bs_schedule bs_sched_mission = {
  * schedule->offset == NULL, so every plant recursion is written once. */
 static const bs_real bs_off_zero[NX] = { 0.0 };
 
+/* Stage 2 (a): Q_delta override.  bs_Q is a const table; the override is a
+ * mutable copy with slot (0,0) replaced, used everywhere the stage cost is
+ * read.  Absent the define, BS_QMAT is bs_Q itself. */
+#ifdef BS_STAGE2_QD
+static const bs_real *bs_stage2_q(void)
+{
+    static bs_real q[NX * NX];
+    static int init = 0;
+    if (!init) {
+        memcpy(q, bs_Q, sizeof(q));
+        q[0] = (bs_real)BS_STAGE2_QD;
+        init = 1;
+    }
+    return q;
+}
+#define BS_QMAT bs_stage2_q()
+#else
+#define BS_QMAT bs_Q
+#endif
+
 static int tick_of(const bs_schedule *schedule, int t)
 {
     if (schedule->periodic) {
@@ -308,7 +328,7 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
 
         /* Accumulate the quadratic half against this block row only:
          *   Hquad += 2 Gam_t' W_t Gam_t,   Cquad += 2 Gam_t' W_t Abar_t. */
-        const bs_real *W = (t == NN - 1) ? Pterm : bs_Q;
+        const bs_real *W = (t == NN - 1) ? Pterm : BS_QMAT;
         const bs_real *Gt = problem->gam;
         const bs_real *At = next;      /* = Abar_t, this iteration only */
         const int width = NU * (t + 1);      /* causality: zero beyond this */
@@ -419,6 +439,60 @@ static bs_real barrier_slope(bs_real z)
  * exact arithmetic, not equal in the last bits.  Matching the reference costs
  * one full value sweep and is worth it.
  */
+#if BS_STAGE2_HB
+/* Stage 2 (b): the acceleration rows of the bucketable family sit at the odd
+ * indices 1,3,...,39 of the 50-row block (build_rows_t emits speed/accel
+ * pairs per raster angle); the chart normal at raster index a carries the
+ * vehicle-frame margin of index a - k. */
+static bs_real hb_margin(const bs_problem *problem, const bs_schedule *schedule,
+                         int phase, int t, int i, bs_real m0)
+{
+    if (!problem->hb_on || (i & 1) == 0 || i >= 40) return m0;
+    if (family_of(schedule, phase + t) != problem->hb_fam) return m0;
+    {
+        const int a = i >> 1;
+        const int k = problem->hb_k[t];
+        return (bs_real)bs_rc_aniso[((a - k) % 20 + 20) % 20];
+    }
+}
+
+void bs_hb_buckets(bs_problem *problem, const bs_real *U, const bs_real *xi,
+                   bs_real v_ref, int fam_t)
+{
+    const bs_schedule *schedule = problem->schedule;
+    const int phase = problem->phase;
+    bs_real x[NX], ax[NX];
+    memcpy(x, xi, sizeof(x));
+    problem->hb_on = 1;
+    problem->hb_fam = fam_t;
+    for (int t = 0; t < NN; ++t) {
+        /* bucket of stage t from the state the row loop evaluates there */
+        const double psi = atan2((double)x[4], (double)(v_ref + x[0]));
+        int k = (int)lround(psi * 180.0 / 3.14159265358979323846 / 18.0);
+        k = ((k % 20) + 20) % 20;
+        problem->hb_k[t] = k;
+        {
+            const bs_real *T = rot_of(schedule, phase + t + 1);
+            const bs_real *c = off_of(schedule, phase + t + 1);
+            for (int i = 0; i < NX; ++i) {
+                bs_real acc = 0.0;
+                for (int j = 0; j < NX; ++j)
+                    acc += bs_A[(size_t)i * NX + j] * x[j];
+                for (int j = 0; j < NU; ++j)
+                    acc += bs_B[(size_t)i * NU + j] * U[t * NU + j];
+                ax[i] = acc;
+            }
+            for (int i = 0; i < NX; ++i) {
+                bs_real acc = 0.0;
+                for (int j = 0; j < NX; ++j)
+                    acc += T[(size_t)i * NX + j] * ax[j];
+                x[i] = acc + c[i];
+            }
+        }
+    }
+}
+#endif
+
 static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
                            const bs_real *xi, int npin, bs_real *value,
                            bs_real *grad, bs_real *hess)
@@ -477,7 +551,7 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
     bs_real quad = 0.0;
     for (int i = 0; i < NX; ++i)
         for (int j = 0; j < NX; ++j)
-            quad += xi[i] * bs_Q[(size_t)i * NX + j] * xi[j];
+            quad += xi[i] * BS_QMAT[(size_t)i * NX + j] * xi[j];
     for (int t = 0; t < NN; ++t)
         for (int i = 0; i < NU; ++i)
             for (int j = 0; j < NU; ++j)
@@ -491,7 +565,7 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
         : schedule->P_tab;        /* unreachable by construction */
 #endif
     for (int t = 0; t < NN; ++t) {
-        const bs_real *W = (t == NN - 1) ? Pterm : bs_Q;
+        const bs_real *W = (t == NN - 1) ? Pterm : BS_QMAT;
         const bs_real *x = &states[t * NX];
         for (int i = 0; i < NX; ++i)
             for (int j = 0; j < NX; ++j)
@@ -583,7 +657,11 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
             bs_real g_i = 0.0;
             for (int p = 0; p < NX; ++p) g_i += row[p] * state[p];
             for (int p = 0; p < NU; ++p) g_i += row[6 + p] * U[t * NU + p];
+#if BS_STAGE2_HB
+            const bs_real m = hb_margin(problem, schedule, phase, t, i, row[9]);
+#else
             const bs_real m = row[9];
+#endif
             const bs_real z = m - g_i;
 
             barrier += BS_EPS * (barrier_value(z) - barrier_value(m)
