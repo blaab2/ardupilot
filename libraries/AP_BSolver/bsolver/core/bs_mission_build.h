@@ -115,6 +115,7 @@ size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms);
 
 /* host calibration hook: >0 caps every junction pace (target: unused) */
 extern double bs_mb_vj_cap;
+extern double bs_mb_vj_scale;   /* host experiments: scale the junction pace (1.0 = shipped) */
 
 /* ---- streaming (two-level) build ----------------------------------
  * PLAN AT VERTEX LEVEL GLOBALLY, RENDER TO TICKS LOCALLY.  The plan is

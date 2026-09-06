@@ -91,6 +91,7 @@
  * junction angle in the CLOSED LOOP, which is what produces the
  * calibrated table this law is then checked against. */
 double bs_mb_vj_cap = 0.0;
+double bs_mb_vj_scale = 1.0;
 
 /* ------------------------------------------------------------------ util */
 static double wrap180(double a)
@@ -239,6 +240,7 @@ static double v_junction(double chi_deg, double v_trim)
         if (vs < v) v = vs;
     }
     if (bs_mb_vj_cap > 0.0) v = bs_mb_vj_cap;   /* calibration override */
+    v *= bs_mb_vj_scale;                        /* sweep knob (tests/sweep_junction_pace.py) */
 #if MB_NO_CORNER_PACE
     v = v_trim;                    /* uniform arc: the loop paces itself */
 #endif
