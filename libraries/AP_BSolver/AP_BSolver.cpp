@@ -708,6 +708,8 @@ void AP_BSolver::init()
     _problem_npin = -1;
     _prefix_moved = 0.0f;
     _overruns = 0;
+    _render_n = 0;
+    _render_us_max = _render_us_sum = _render_noop_us_max = 0;
     _bcast_ms = 0;
     _plan_valid = false;
     ing_n = 0;
@@ -790,11 +792,21 @@ void AP_BSolver::update(bool ingress_ready)
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: done %d ticks off %+d ovr %u",
                           (int)_tick, (int)_offset, (unsigned)_overruns);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "BSLV: rnd n %u max %lu us mean %lu noop %lu",
+                          (unsigned)_render_n, (unsigned long)_render_us_max,
+                          (unsigned long)(_render_n ? _render_us_sum / _render_n : 0),
+                          (unsigned long)_render_noop_us_max);
         } else if (_active) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: t %d off %+d %.0f ms ovr %u",
                           (int)_tick, (int)_offset, (double)_solve_ms,
                           (unsigned)_overruns);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "BSLV: rnd n %u max %lu us mean %lu noop %lu",
+                          (unsigned)_render_n, (unsigned long)_render_us_max,
+                          (unsigned long)(_render_n ? _render_us_sum / _render_n : 0),
+                          (unsigned long)_render_noop_us_max);
         } else {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: armed-wait q%d ir%d arena %u B",
@@ -1157,11 +1169,25 @@ bool AP_BSolver::solve_once()
     const int32_t tau = (ing_n > 0) ? tau_raw
                        : ((tau_raw < 0) ? 0 : tau_raw);
 
-    if (!bs_mb.render_to(tau + BS_N + 2)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "BSLV: ring starved at %ld",
-                      (long)tau);
-        _active = false;
-        return false;
+    {   // render slice, timed: the one per-tick cost the bench ladder
+        // does not cover (leg renders happen ~n_v times per mission)
+        const int32_t r_before = bs_mb.rendered_to();
+        const uint32_t r0 = AP_HAL::micros();
+        const bool r_ok = bs_mb.render_to(tau + BS_N + 2);
+        const uint32_t r_us = AP_HAL::micros() - r0;
+        if (bs_mb.rendered_to() != r_before) {
+            _render_n++;
+            _render_us_sum += r_us;
+            if (r_us > _render_us_max) _render_us_max = r_us;
+        } else if (r_us > _render_noop_us_max) {
+            _render_noop_us_max = r_us;
+        }
+        if (!r_ok) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "BSLV: ring starved at %ld",
+                          (long)tau);
+            _active = false;
+            return false;
+        }
     }
 
     if (!ensure_problem(tau)) {

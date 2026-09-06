@@ -253,6 +253,12 @@ private:
     // the bench number IS the preemption cost, and it is the only way to
     // answer whether 4 Hz holds.
     float _solve_ms;
+    // render-slice instrumentation (solver thread): time spent in
+    // AP_BSMissionBuilder::render_to per tick.  _render_n / _max / _sum
+    // count only calls that rendered a leg; _render_noop_us_max is the
+    // check-only cost of the other calls.  Broadcast every 5 s.
+    uint32_t _render_us_max, _render_us_sum, _render_noop_us_max;
+    uint16_t _render_n;
     // Ticks whose wall time exceeded the 250 ms period.  Cumulative, logged
     // every tick, so the record carries both the event and its ordinal.  An
     // overrun is NOT a failure by itself: the committed prefix is M = 10
