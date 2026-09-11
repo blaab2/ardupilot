@@ -25,6 +25,18 @@
 
 static double stream_scratch[1024];   /* one leg's unscaled arc staging */
 
+#if BS_ARC
+// ARC-CELL CLOCK: the fillet chart replaces the streaming tick tables.
+// The chart (compact cells) and the per-solve schedule block are carved
+// from the same boot-time reservation the streaming plan used.
+extern "C" {
+#include "bsolver/core/bs_arc.h"
+}
+static bs_arc_chart arc_chart_s;
+static bs_arc_sched *arc_sched_s;
+static bool arc_valid;
+#endif
+
 void AP_BSMissionBuilder::poll(const AP_Mission &mission, float v_cap_ms)
 {
     // re-broadcast a latched refusal every 10 s, for the same reason the
@@ -138,6 +150,54 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
         const double dx = _vx[i + 1] - _vx[i], dy = _vy[i + 1] - _vy[i];
         len += sqrt(dx * dx + dy * dy);
     }
+#if BS_ARC
+    {
+        // the fillet chart: cells first, the per-solve schedule block
+        // behind them (8-byte aligned), both inside the reservation
+        arc_valid = false;
+        _v_cap = _stamp_speed;
+        void *blk = _reserved ? _reserved : _block;
+        size_t blk_len = _reserved ? _reserved_len : _block_len;
+        if (blk == nullptr) {
+            blk = calloc(1, 96 * 1024);
+            blk_len = blk ? 96 * 1024 : 0;
+            _block = blk; _block_len = blk_len;
+        }
+        const size_t sched_sz = (sizeof(bs_arc_sched) + 7u) & ~(size_t)7u;
+        if (blk == nullptr || blk_len <= sched_sz + 64) {
+            _fail_st = 200; _fail_gate = 0; _fail_detail = (float)blk_len; _txt_ms = 0;
+            return true;
+        }
+        const uint32_t t0 = AP_HAL::micros();
+        uint8_t *base = (uint8_t *)blk;
+        arc_sched_s = (bs_arc_sched *)(void *)(base + blk_len - sched_sz);
+        const size_t cells_len = (blk_len - sched_sz) & ~(size_t)7u;
+        const int rc = bs_arc_chart_build(_vx, _vy, _n_wp, base, cells_len,
+                                          &arc_chart_s);
+        const uint32_t dt_us = AP_HAL::micros() - t0;
+        if (rc != 0) {
+            _fail_st = (uint8_t)(200 - rc);
+            _fail_gate = 0;
+            _fail_detail = (float)arc_chart_s.n_cells;
+            _txt_ms = 0;
+            return true;
+        }
+        arc_valid = true;
+        _failed = false;
+        _valid = true;
+        _fail_st = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "BSLV mission: arc %d cells end %d wp %u-%u %.1fms",
+                      arc_chart_s.n_cells, arc_chart_s.k_end,
+                      (unsigned)_run_first, (unsigned)_run_last,
+                      (double)dt_us * 1e-3);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "BSLV mission: arc %u B cells + %u B sched of %u B",
+                      (unsigned)((size_t)arc_chart_s.n_cells * sizeof(bs_arc_cell)),
+                      (unsigned)sched_sz, (unsigned)blk_len);
+        return true;
+    }
+#endif
     const size_t need = bs_mission_size(_n_wp, len, (double)_v_cap);
     if (_reserved != nullptr) {
         // the init-time reservation: on the flight processor a runtime
@@ -363,6 +423,46 @@ void AP_BSMissionBuilder::refresh_clock()
     memcpy(_mt.wp_tick, _plan->wp_tick, sizeof(_mt.wp_tick));
 }
 #endif
+
+const void *AP_BSMissionBuilder::arc_chart() const
+{
+#if BS_ARC
+    return (_valid && arc_valid) ? (const void *)&arc_chart_s : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void *AP_BSMissionBuilder::arc_sched() const
+{
+#if BS_ARC
+    return (_valid && arc_valid) ? (void *)arc_sched_s : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+int32_t AP_BSMissionBuilder::arc_tau_vertex(uint16_t wp_idx) const
+{
+#if BS_ARC
+    if (!_valid || !arc_valid) {
+        return -1;
+    }
+    for (int i = 0; i < _n_wp; ++i) {
+        if (_wp_idx[i] == wp_idx) {
+            // vertex i is passed once the vehicle's cell reaches the first
+            // straight cell of leg i (after the fillet); the last vertex
+            // is the arrival cell
+            if (i + 1 >= _n_wp) return (int32_t)arc_chart_s.k_end;
+            return (int32_t)arc_chart_s.leg_first[i];
+        }
+    }
+    return -1;
+#else
+    (void)wp_idx;
+    return -1;
+#endif
+}
 
 int32_t AP_BSMissionBuilder::tau_vertex(uint16_t wp_idx) const
 {

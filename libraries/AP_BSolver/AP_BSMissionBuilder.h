@@ -69,6 +69,14 @@ public:
 #endif
     bool build_failed() const { return _failed; }
 
+    // ARC-CELL CLOCK (BS_ARC=1 builds): the fillet chart built from the
+    // same scanned run, and the cell at which each mission item's vertex
+    // is passed.  nullptr / -1 on every other build.  Declared
+    // unconditionally so the class layout does not depend on BS_ARC.
+    const void *arc_chart() const;
+    void *arc_sched() const;
+    int32_t arc_tau_vertex(uint16_t wp_idx) const;
+
     void invalidate() { _valid = false; _failed = false; _req = true; }
 
     // init-time memory reservation (see AP_BSolver::init): builds go into

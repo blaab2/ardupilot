@@ -21,6 +21,39 @@ extern "C" {
 
 extern const AP_HAL::HAL &hal;
 
+#if BS_ARC
+// ---------------------------------------------------------------- arc mode
+//
+// THE ARC-CELL CLOCK RUNTIME (BS_ARC=1 builds; scripts/mpc/bsolver/core/
+// bs_arc.h).  The mission is a fillet chart of cells; the vehicle's cell
+// advances only when the model state has earned it, every tick re-derives
+// the horizon's stage->cell assignment from the shifted warm start and
+// solves K rounds of the pinned Newton step on that schedule.  There is no
+// mission clock tau, no ledger and no re-timing: mission_tau() reports the
+// vehicle's CELL, and the AUTO layer's per-item progress compares it with
+// the first straight cell after each vertex.  Everything else -- the READY
+// gate, the plan hand-over through MPCTrajReplay, the publish layer's
+// differencing and lag feed-forward -- is the flown fixed-clock path.
+extern "C" {
+#include "bsolver/core/bs_arc.h"
+}
+static const bs_arc_chart *arc_ch;        // the builder's chart (valid = ready)
+static bs_arc_driver arc_d;
+// on-target timing of the multi-round tick: whole-tick wall time (the
+// bench quantity plus the plan hand-over), its split (assignment + render,
+// problem init, Newton), and a 10 ms histogram for the percentiles the
+// paper's tick table needs
+static uint32_t arc_us_max, arc_us_sum;
+static uint32_t arc_asg_max, arc_ini_max, arc_nwt_max;
+static uint32_t arc_asg_sum, arc_ini_sum, arc_nwt_sum;
+static uint16_t arc_hist[60];              // 10 ms bins, 0..600 ms
+static uint16_t arc_n_ticks, arc_incons, arc_reassign;
+static float arc_viol_max;
+static uint32_t arc_seed_ms;
+static void arc_yield(void) { hal.scheduler->delay(1); }
+static unsigned long arc_micros(void) { return (unsigned long)AP_HAL::micros(); }
+#endif
+
 // Arena, sized from the core's own requirement rather than guessed.  The
 // first version reserved 64*1024 doubles (524,288 B) — about 2.6x what
 // bs_workspace_size() asks for, and more static RAM than the board has heap.
@@ -189,6 +222,15 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
 
     // (param index 5 was BSLV_INGRESS, retired 2026-09-02: the ingress
     // leg is now the unconditional AUTO approach — do not reuse the slot)
+
+    // @Param: K
+    // @DisplayName: Arc-cell clock: assignment/solve rounds per tick
+    // @Range: 1 3
+    // @User: Advanced
+    // BS_ARC builds only: K = 3 is the reference budget of the P4
+    // manuscript ((q, K) = (2, 3)); (1, 3) and (1, 2) are the budgets its
+    // tick table estimates to fit the 250 ms period.  Read at engage.
+    AP_GROUPINFO("K", 6, AP_BSolver, _k, 3),
 
     AP_GROUPEND
 };
@@ -799,6 +841,39 @@ void AP_BSolver::mission_poll(AP_Mission &mission, float v_cap_ms)
     bs_mb.poll(mission, v_cap_ms);
 }
 
+#if BS_ARC
+// THE ON-TARGET TICK TABLE: whole-tick wall time percentiles from the
+// 10 ms histogram, the split (assignment+render / init / Newton), the
+// assignment fixed point and the applied row excess.  Re-broadcast with
+// the done line so a late-attaching ground station still gets it.
+static void arc_broadcast_timing(void)
+{
+    uint32_t n = 0;
+    for (int b = 0; b < 60; ++b) n += arc_hist[b];
+    uint32_t p50 = 0, p95 = 0, p99 = 0, acc = 0;
+    for (int b = 0; b < 60 && n > 0; ++b) {
+        acc += arc_hist[b];
+        if (!p50 && acc * 100u >= n * 50u) p50 = (uint32_t)b * 10u + 5u;
+        if (!p95 && acc * 100u >= n * 95u) p95 = (uint32_t)b * 10u + 5u;
+        if (!p99 && acc * 100u >= n * 99u) p99 = (uint32_t)b * 10u + 5u;
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "BSLV: arc tick ms mean %lu p50 %lu p95 %lu p99 %lu max %lu n %lu",
+                  (unsigned long)(n ? arc_us_sum / n / 1000u : 0), (unsigned long)p50,
+                  (unsigned long)p95, (unsigned long)p99,
+                  (unsigned long)(arc_us_max / 1000u), (unsigned long)n);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "BSLV: arc split ms asg %lu/%lu ini %lu/%lu nwt %lu/%lu (mean/max)",
+                  (unsigned long)(n ? arc_asg_sum / n / 1000u : 0), (unsigned long)(arc_asg_max / 1000u),
+                  (unsigned long)(n ? arc_ini_sum / n / 1000u : 0), (unsigned long)(arc_ini_max / 1000u),
+                  (unsigned long)(n ? arc_nwt_sum / n / 1000u : 0), (unsigned long)(arc_nwt_max / 1000u));
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "BSLV: arc incons %u reasg %u viol %.4f seed %lu ms holds %d skips %d",
+                  (unsigned)arc_incons, (unsigned)arc_reassign, (double)arc_viol_max,
+                  (unsigned long)arc_seed_ms, arc_d.holds, arc_d.skips);
+}
+#endif
+
 void AP_BSolver::update(bool ingress_ready)
 {
     if (_enable == 0) {
@@ -825,6 +900,9 @@ void AP_BSolver::update(bool ingress_ready)
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: done %d ticks off %+d ovr %u",
                           (int)_tick, (int)_offset, (unsigned)_overruns);
+#if BS_ARC
+            arc_broadcast_timing();
+#endif
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: rnd n %u max %lu us mean %lu noop %lu",
                           (unsigned)_render_n, (unsigned long)_render_us_max,
@@ -840,6 +918,15 @@ void AP_BSolver::update(bool ingress_ready)
                           "BSLV: t %d off %+d %.0f ms ovr %u",
                           (int)_tick, (int)_offset, (double)_solve_ms,
                           (unsigned)_overruns);
+#if BS_ARC
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "BSLV: arc cell %d/%d max %lu ms asg %lu ini %lu nwt %lu",
+                          (int)arc_d.k, (int)(arc_ch ? arc_ch->k_end : 0),
+                          (unsigned long)(arc_us_max / 1000u),
+                          (unsigned long)(arc_asg_max / 1000u),
+                          (unsigned long)(arc_ini_max / 1000u),
+                          (unsigned long)(arc_nwt_max / 1000u));
+#endif
             GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                           "BSLV: rnd n %u max %lu us mean %lu noop %lu",
                           (unsigned)_render_n, (unsigned long)_render_us_max,
@@ -874,6 +961,33 @@ void AP_BSolver::update(bool ingress_ready)
 // the pre-engage desired state) followed by engage().
 bool AP_BSolver::engage_try()
 {
+#if BS_ARC
+    // arc mode: the classic rest-engage at the first vertex only.  The
+    // ingress leg is a fixed-clock construction (negative tau on a runtime
+    // prefix schedule) and has no counterpart on the cell chart.
+    if (_enable == 0 || !_inited || _active || _finished ||
+        arc_ch == nullptr) {
+        return false;
+    }
+    {
+        Vector3p p;
+        Vector3f v;
+        if (!(hal.util->get_soft_armed() &&
+              AP::ahrs().get_relative_position_NED_origin(p) &&
+              AP::ahrs().get_velocity_NED(v) && (-p.z) > 2.0)) {
+            return false;
+        }
+        const double dn = (double)p.x - arc_ch->vx[0];
+        const double de = (double)p.y - arc_ch->vy[0];
+        const float speed = v.xy().length();
+        if (dn * dn + de * de <= (double)READY_RADIUS_M * READY_RADIUS_M &&
+            speed <= READY_SPEED_MS) {
+            ing_n = 0;
+            return true;
+        }
+        return false;
+    }
+#endif
     if (_enable == 0 || !_inited || _active || _finished ||
         mt == nullptr) {
         return false;
@@ -946,7 +1060,18 @@ void AP_BSolver::reset_mission()
     _overruns = 0;
     ing_n = 0;
     ing_climb_ok_ms = 0;
+#if BS_ARC
+    arc_d.engaged = 0;
+    arc_d.finished = 0;
+    arc_us_max = arc_us_sum = 0;
+    arc_asg_max = arc_ini_max = arc_nwt_max = 0;
+    arc_asg_sum = arc_ini_sum = arc_nwt_sum = 0;
+    memset(arc_hist, 0, sizeof(arc_hist));
+    arc_n_ticks = arc_incons = arc_reassign = 0;
+    arc_viol_max = 0.0f;
+#else
     bs_mb.ring_reset();
+#endif
     {
         WITH_SEMAPHORE(_plan_sem);
         _plan_valid = false;
@@ -967,7 +1092,12 @@ void AP_BSolver::solver_thread()
             if (bs_mb_mission != nullptr) {
                 const bool ran = bs_mb.build_pending(*bs_mb_mission);
                 if (ran) {
+#if BS_ARC
+                    arc_ch = (const bs_arc_chart *)bs_mb.arc_chart();
+                    mt = nullptr;
+#else
                     mt = bs_mb.tables();
+#endif
                 }
             }
             continue;
@@ -1012,6 +1142,16 @@ void AP_BSolver::solver_thread()
         const uint32_t tick_us = AP_HAL::micros() - tick_us0;
         if (ok) {
             _solve_ms = (float)tick_us * 1e-3f;
+#if BS_ARC
+            if (tick_us > arc_us_max) arc_us_max = tick_us;
+            arc_us_sum += tick_us;
+            if (arc_n_ticks < 65535) arc_n_ticks++;
+            {
+                uint32_t b = tick_us / 10000u;
+                if (b > 59) b = 59;
+                if (arc_hist[b] < 65535) arc_hist[b]++;
+            }
+#endif
             if (tick_us > (uint32_t)(BS_TS * 1e6)) {
                 // Not a failure on its own: the M-input committed prefix is
                 // 2.5 s of standing plan and replay keeps publishing from it.
@@ -1080,6 +1220,47 @@ bool AP_BSolver::ensure_problem(int32_t tau_raw)
 // (BSLV_QE) is a firmware safety choice, not a certified schedule.
 void AP_BSolver::seed_once()
 {
+#if BS_ARC
+    // ARC ENGAGE: at rest on the first vertex, three unpinned assignment /
+    // full-Newton rounds (tol 1e-7, <= 300 steps each), then the first M
+    // inputs are committed -- tooling/current_evidence.py::run_case's
+    // initialization, verbatim in bs_arc_engage.
+    if (arc_ch == nullptr || bs_arena == nullptr) {
+        return;
+    }
+    {
+        bs_arc_sched *S = (bs_arc_sched *)bs_mb.arc_sched();
+        if (S == nullptr) return;
+        int rounds = (int)_k;
+        if (rounds < 1) rounds = 1;
+        if (rounds > 3) rounds = 3;
+        int q = (int)_q;
+        if (q < 1) q = 1;
+        bs_arc_driver_init(&arc_d, arc_ch, S, bs_arena, bs_arena_words,
+                           q, rounds, BS_ARC_TRUST);
+        arc_d.yield = arc_yield;
+        arc_d.micros = arc_micros;
+        _tick = 0;
+        _offset = 0;
+        _phase_ledger = 0.0;
+        const uint32_t t0 = AP_HAL::micros();
+        const int rc = bs_arc_engage(&arc_d);
+        _solve_ms = (AP_HAL::micros() - t0) * 1e-3f;
+        arc_seed_ms = (uint32_t)_solve_ms;
+        if (rc != 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "BSLV: arc engage failed %d", rc);
+            _active = false;
+            return;
+        }
+        memcpy(_xi, arc_d.xi, sizeof(_xi));
+        memcpy(_U, arc_d.U, sizeof(_U));
+        memcpy(_committed, arc_d.committed, sizeof(_committed));
+        _seeded = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc seed %d steps, %.0f ms (q%d K%d)",
+                      arc_d.seed_iters, (double)_solve_ms, q, rounds);
+        return;
+    }
+#endif
     // With an ingress leg the seed problem sits at tau = -ing_n on the
     // runtime schedule; classic keeps tau = 0 on the flash schedule.  The
     // NOMINAL IC is the same rest-engage state either way -- read #2 below
@@ -1194,6 +1375,57 @@ void AP_BSolver::seed_once()
 // runs them.  Nothing here reads the vehicle.
 bool AP_BSolver::solve_once()
 {
+#if BS_ARC
+    // ARC TICK (ac.run's loop body): publish the standing commitment from
+    // the current model state, then plant step + clock rule, shift-append,
+    // K x (assignment, render, pinned solve), commit stage M-1.
+    if (arc_ch == nullptr || !arc_d.engaged) {
+        return false;
+    }
+    if (arc_d.finished || arc_d.k >= arc_ch->k_end) {
+        if (!_finished) {
+            _finished = true;
+            _active = false;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                          "BSLV: mission complete, %d ticks, cell %d",
+                          (int)_tick, (int)arc_d.k);
+        }
+        return false;
+    }
+    _tau_pub = arc_d.k;
+    {
+        WITH_SEMAPHORE(_plan_sem);
+        lift_prefix(_plan);
+        _plan_valid = true;
+    }
+    double u0[3];
+    const int r = bs_arc_tick(&arc_d, u0);
+    if (r != 0) {
+        if (r < 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "BSLV: arc tick failed %d", r);
+            _active = false;
+        }
+        return false;
+    }
+    memcpy(_xi, arc_d.xi, sizeof(_xi));
+    memcpy(_U, arc_d.U, sizeof(_U));
+    memcpy(_committed, arc_d.committed, sizeof(_committed));
+    _lambda0 = (float)arc_d.lambda0;
+    _bt = (uint8_t)MIN(arc_d.bt, 255);
+    _armijo_fail = (uint8_t)MIN(arc_d.armijo_fail, 255);
+    _no_step = (uint8_t)MIN(arc_d.no_step, 255);
+    if (!arc_d.consistent) arc_incons++;
+    arc_reassign += (uint16_t)arc_d.reassign;
+    if ((float)arc_d.viol > arc_viol_max) arc_viol_max = (float)arc_d.viol;
+    if (arc_d.us_assign > arc_asg_max) arc_asg_max = arc_d.us_assign;
+    if (arc_d.us_init > arc_ini_max) arc_ini_max = arc_d.us_init;
+    if (arc_d.us_newton > arc_nwt_max) arc_nwt_max = arc_d.us_newton;
+    arc_asg_sum += arc_d.us_assign;
+    arc_ini_sum += arc_d.us_init;
+    arc_nwt_sum += arc_d.us_newton;
+    _tick++;
+    return true;
+#endif
     // The ingress prefix shifts the clock start: at engage, tau = -ing_n.
     // No re-timing can fire on the leg (fam_at returns the non-trim
     // sentinel there), so tau is non-decreasing and crosses 0 exactly once,
@@ -1392,12 +1624,31 @@ bool AP_BSolver::solve_once()
 //     changes there; through the corner windows the two are different objects
 //     entirely, because the arc lift interpolated across the polyline kinks
 //     and this one never leaves the published samples.
+static void publish_ff(AP_BSolver::Plan &plan, const double *pn,
+                       const double *pe, const int32_t *tau_of);
+
 void AP_BSolver::lift_prefix(Plan &plan) const
 {
     plan.n = PLAN_NODES;
     plan.dt_ms = (uint16_t)(BS_TS * 1000.0);
     plan.anchor_ms = _anchor_ms;
     plan.drag_k = BS_DRAG_K;
+#if BS_ARC
+    // ARC LIFT: node i is the committed prefix's state i in ITS cell,
+    // p = p_cell + e_l t_hat + e_c n_hat (bs_arc_world), the chart of the
+    // cell the rollout assigns -- the fillet chord's own frame through a
+    // corner.  Every node is a distinct sample (no clock holds), so the
+    // inherited feed-forward derivation runs on the plain node axis.
+    {
+        double pn[PLAN_NODES], pe[PLAN_NODES];
+        int32_t tau_of[PLAN_NODES];
+        int kn[PLAN_NODES];
+        bs_arc_lift(&arc_d, pn, pe, kn);
+        for (uint8_t i = 0; i < PLAN_NODES; ++i) tau_of[i] = i;
+        publish_ff(plan, pn, pe, tau_of);
+        return;
+    }
+#endif
 
     // Roll the model state, the ledger and the clock forward through the
     // committed inputs, exactly as the maintained tick will.  `phase` is
@@ -1432,6 +1683,18 @@ void AP_BSolver::lift_prefix(Plan &plan) const
         ledger_step(&phase, &off, tau, trig_el_i);
         tick += 1;
     }
+    publish_ff(plan, pn, pe, tau_of);
+}
+
+// The velocity / acceleration feed-forward of the published positions
+// (shared by the fixed-clock lift above and the arc lift): hold-aware
+// central differences on the distinct-tau axis, second differences for
+// the acceleration, the lag pre-compensation a + tau_a da/dt.  Positions
+// are copied untouched.
+static void publish_ff(AP_BSolver::Plan &plan, const double *pn,
+                       const double *pe, const int32_t *tau_of)
+{
+    constexpr uint8_t PLAN_NODES = AP_BSolver::PLAN_NODES;
 
     // ---------------------------------------------- feed-forward derivation
     //
@@ -1836,6 +2099,18 @@ void AP_BSolver::write_log() const
         (float)_xi[2], (float)_xi[3], (float)_xi[0], (float)_phase_ledger,
         _bt, _armijo_fail, _no_step, _overruns,
         _plan.pos_n[0], _plan.pos_e[0]);
+#if BS_ARC
+    // the arc tick's own record: the vehicle cell, the assignment fixed
+    // point, the applied row excess and the per-tick split
+    AP::logger().WriteStreaming(
+        "BSLA",
+        "TimeUS,Cell,Cons,Reas,Viol,Asg,Ini,Nwt",
+        "s-------", "F-------", "QiBBfIII",
+        AP_HAL::micros64(),
+        (int32_t)arc_d.k, (uint8_t)arc_d.consistent, (uint8_t)arc_d.reassign,
+        (float)arc_d.viol, (uint32_t)arc_d.us_assign, (uint32_t)arc_d.us_init,
+        (uint32_t)arc_d.us_newton);
+#endif
 }
 #endif
 
@@ -1851,12 +2126,20 @@ uint16_t AP_BSolver::run_last_idx() const
 
 int32_t AP_BSolver::tau_vertex(uint16_t wp_idx) const
 {
+#if BS_ARC
+    return bs_mb.arc_tau_vertex(wp_idx);
+#else
     return bs_mb.tau_vertex(wp_idx);
+#endif
 }
 
 bool AP_BSolver::mission_ready() const
 {
+#if BS_ARC
+    return arc_ch != nullptr;
+#else
     return mt != nullptr;
+#endif
 }
 
 bool AP_BSolver::take_plan(Plan &out)

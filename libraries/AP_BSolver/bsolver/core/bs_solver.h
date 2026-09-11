@@ -124,6 +124,16 @@ typedef enum {
 #ifndef BS_STAGE2_HB
 #define BS_STAGE2_HB 0
 #endif
+/* BS_ARC=1: the arc-cell clock runtime (bs_arc.h) -- per-stage margin
+ * table in the schedule, the re-priced stage cost (Q_delta = Q_el = 0)
+ * and the 1.5 progress reward.  Default OFF, default build byte-identical. */
+#ifndef BS_ARC
+#define BS_ARC 0
+#endif
+#if BS_ARC
+#undef BS_SPEED_TILT_W
+#define BS_SPEED_TILT_W 1.5
+#endif
 #ifndef BS_STAGE2_WIN
 #define BS_STAGE2_WIN 0
 #endif
@@ -181,6 +191,13 @@ typedef struct {
      * the length clamp: the renderer keeps [tau-margin, tau+N+1] valid
      * and the horizon never reads outside it. */
     int ring_mask;
+#if BS_ARC
+    /* ARC-CELL CLOCK: per-tick row margins, [length x BS_NROW], same
+     * clamp as the per-tick arrays; NULL = the family's own margins
+     * (row[9]).  The arc layer renders every stage's margins here (the
+     * cell's family with the schedule trust region applied). */
+    const bs_real *mstk;
+#endif
 #if BS_STAGE2_PACE_TAB
     /* STAGE 2 (c): the published pace per tick (m/s), same indexing and
      * ring as the per-tick arrays above; NULL on every flash schedule and

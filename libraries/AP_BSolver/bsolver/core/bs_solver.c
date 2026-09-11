@@ -62,7 +62,24 @@ static const bs_real bs_off_zero[NX] = { 0.0 };
 /* Stage 2 (a): Q_delta override.  bs_Q is a const table; the override is a
  * mutable copy with slot (0,0) replaced, used everywhere the stage cost is
  * read.  Absent the define, BS_QMAT is bs_Q itself. */
-#ifdef BS_STAGE2_QD
+#if BS_ARC
+/* the arc-cell clock's re-priced stage cost: Q_delta = 0 and Q_el = 0
+ * (so.Q6[0,0] = so.Q6[2,2] = 0 in the runtime of record); the DARE pairs
+ * are the arc layer's own and keep RL. */
+static const bs_real *bs_arc_q(void)
+{
+    static bs_real q[NX * NX];
+    static int init = 0;
+    if (!init) {
+        memcpy(q, bs_Q, sizeof(q));
+        q[0] = 0.0;
+        q[2 * NX + 2] = 0.0;
+        init = 1;
+    }
+    return q;
+}
+#define BS_QMAT bs_arc_q()
+#elif defined(BS_STAGE2_QD)
 static const bs_real *bs_stage2_q(void)
 {
     static bs_real q[NX * NX];
@@ -704,7 +721,11 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
             bs_real g_i = 0.0;
             for (int p = 0; p < NX; ++p) g_i += row[p] * state[p];
             for (int p = 0; p < NU; ++p) g_i += row[6 + p] * U[t * NU + p];
-#if BS_STAGE2_HB || BS_STAGE2_WIN
+#if BS_ARC
+            const bs_real m = schedule->mstk
+                ? schedule->mstk[(size_t)tick_of(schedule, phase + t) * NR + i]
+                : row[9];
+#elif BS_STAGE2_HB || BS_STAGE2_WIN
             const bs_real m = row_margin(problem, schedule, phase, t, i, row);
 #else
             const bs_real m = row[9];

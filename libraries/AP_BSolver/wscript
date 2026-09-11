@@ -41,6 +41,14 @@ def configure(cfg):
         '-DBS_DATA_HEADER="../model/generated/bs_model_runtime_const.h"',
         '-DBS_DRV_NV=90',
     ]
+    # ARC-CELL CLOCK build (BSLV_ARC=1 in the environment at configure
+    # time): the fillet-chart runtime of the P4 manuscript replaces the
+    # fixed-clock mission tables (bsolver/core/bs_arc.c; AP_BSolver's arc
+    # mode).  Default OFF; the default build is byte-identical.
+    import os
+    if os.environ.get('BSLV_ARC', '0') == '1':
+        corner_flags.append('-DBS_ARC=1')
+        cfg.msg('AP_BSolver arc-cell clock runtime', 'BS_ARC=1')
 
     # DOUBLE_PRECISION_LIBRARIES patches CXXFLAGS only, and the vendored core
     # is compiled as C through bs_build_solver.c, so the C path needs it too.
