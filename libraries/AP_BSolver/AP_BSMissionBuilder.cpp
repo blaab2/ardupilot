@@ -23,7 +23,9 @@
 #define BS_STREAM_MAX_TICKS 28800  /* 2 h; a sanity cap, not a RAM one */
 #endif
 
+#if BS_NU == 3
 static double stream_scratch[1024];   /* one leg's unscaled arc staging */
+#endif
 
 #if BS_ARC
 // ARC-CELL CLOCK: the fillet chart replaces the streaming tick tables.
@@ -204,6 +206,21 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
         return true;
     }
 #endif
+#if BS_NU != 3
+    // THE FIXED-CLOCK (STREAMING) BUILD EXISTS UNDER THE v1 MODEL ONLY:
+    // its families carry the clock rows and its schedule is consumed
+    // through the clock input, so under a header without one (the v2
+    // arc model, BS_NU == 2) bs_mission_build.c compiles to refusing
+    // stubs and this path -- unreachable behind the arc block above, but
+    // compiled -- refuses the same way rather than carving a ring for a
+    // plan that cannot be built.
+    (void)len;
+    _fail_st = (uint8_t)BS_MB_ERR_GEOM;
+    _fail_gate = 0;
+    _fail_detail = 0.0f;
+    _txt_ms = 0;
+    return true;
+#else
     const size_t need = bs_mission_size(_n_wp, len, (double)_v_cap);
     if (_reserved != nullptr) {
         // the init-time reservation: on the flight processor a runtime
@@ -349,6 +366,7 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
                   (unsigned)_run_first, (unsigned)_run_last,
                   (double)dt_us * 1e-3);
     return true;
+#endif /* BS_NU == 3 */
 }
 
 void AP_BSMissionBuilder::ring_reset()
@@ -360,6 +378,10 @@ void AP_BSMissionBuilder::ring_reset()
 
 bool AP_BSMissionBuilder::render_to(int32_t upto)
 {
+#if BS_NU != 3
+    (void)upto;         /* no fixed-clock plan under the v2 model */
+    return false;
+#else
     if (_plan == nullptr) {
         return false;   /* validity is the caller's gate; the plan is ours */
     }
@@ -411,6 +433,7 @@ bool AP_BSMissionBuilder::render_to(int32_t upto)
         }
     }
     return _cursor > upto || _cursor >= _plan->n_clk;
+#endif /* BS_NU == 3 */
 }
 
 #if BS_STAGE2_REPACE

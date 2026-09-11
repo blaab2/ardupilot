@@ -19,7 +19,20 @@
  * the state through the seam map T_switch(chi), off_vec(pace_k, pace_k+1,
  * chi); otherwise the frame point stays and the transition carries +l_k on
  * e_l.  Nothing advances because time has elapsed; there is no ledger and
- * no clock input (nu is pinned to |nu| <= 0.01).
+ * no clock input (v1: nu is pinned to |nu| <= 0.01; v2: nu does not exist).
+ *
+ * MODEL VERSIONS.  The layer is dimension-generic and follows the generated
+ * header selected at compile time (BS_DATA_HEADER):
+ *   v1  bs_model_runtime_const.h     u = (j_l, nu, j_c), BS_NU 3, BS_NV 90,
+ *                                    BS_NROW 50, forward-Euler e_l
+ *                                    (the P4 archive data/derived/p4-current)
+ *   v2  bs_model_runtime_const_v2.h  u = (j_l, j_c), BS_NU 2, BS_NV 60,
+ *                                    BS_NROW 48, exact zero-order-hold e_l
+ *                                    (e_l+ = e_l + Ts delta + Ts^2/2 a_l +
+ *                                    Ts^3/6 j_l), BS_MODEL_V2 defined
+ * Everything else -- chart, crossing rule, seam maps, margins, trust
+ * region, reward, engage, rounds, shift-append -- is identical; the v1
+ * build is bit-identical to the pre-v2 layer.
  *
  * WHAT A SOLVE IS.  Before each solve the shifted warm start is rolled out
  * with the same rule to produce the stage -> cell assignment, the composed
@@ -61,7 +74,7 @@
 #define BS_ARC_MAX_DPSI 18.0         /* chord angle cap, deg                */
 #define BS_ARC_VERTEX_BOX 2.0        /* capsule disc at a vertex, m         */
 #define BS_ARC_ACCC 5.66             /* iso acceleration tier, m/s^2        */
-#define BS_ARC_M_NU 0.01             /* clock input pin, both sides         */
+#define BS_ARC_M_NU 0.01             /* v1 only: clock input pin, both sides */
 #define BS_ARC_SEED_MAXIT 300        /* engage: unpinned Newton cap         */
 #define BS_ARC_SEED_TOL 1e-7         /* engage: gradient tolerance          */
 #define BS_ARC_SEED_ROUNDS 3         /* engage: assignment fixed-point rounds */

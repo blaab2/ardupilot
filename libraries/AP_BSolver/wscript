@@ -40,15 +40,41 @@ def configure(cfg):
     corner_flags = [
         '-DBS_DATA_HEADER="../model/generated/bs_model_runtime_const.h"',
         '-DBS_DRV_NV=90',
+        '-DBS_DRV_NU=3',
     ]
     # ARC-CELL CLOCK build (BSLV_ARC=1 in the environment at configure
     # time): the fillet-chart runtime of the P4 manuscript replaces the
     # fixed-clock mission tables (bsolver/core/bs_arc.c; AP_BSolver's arc
     # mode).  Default OFF; the default build is byte-identical.
+    #
+    # MODEL VERSION (2026-09-11).  The arc build selects the v2 runtime
+    # constants: u = (j_l, j_c) without the auxiliary clock input, exact
+    # zero-order-hold e_l, BS_NU 2 / BS_NV 60 / BS_NROW 48
+    # (model/gen_runtime_const.py --v2; archive data/derived/p4-v2).  The
+    # driver's mirrored dimensions BS_DRV_NV / BS_DRV_NU follow the header
+    # (AP_BSolver.cpp static_asserts them against BS_NV / BS_NU).
+    # BSLV_ARC_V1=1 selects the v1 header instead (u = (j_l, nu, j_c),
+    # NU 3 / NV 90 / 50 rows: the P4 archive data/derived/p4-current and
+    # the 2026-09-11 flights) for reproducibility.  Under the v2 header
+    # the fixed-clock mission builder compiles to stubs, so a v2 build
+    # without BS_ARC has no mission layer at all -- refused at compile
+    # time by AP_BSolver.cpp (#error).
     import os
-    if os.environ.get('BSLV_ARC', '0') == '1':
+    arc = os.environ.get('BSLV_ARC', '0') == '1'
+    arc_v1 = os.environ.get('BSLV_ARC_V1', '0') == '1'
+    if arc or arc_v1:
+        if arc_v1:
+            cfg.msg('AP_BSolver arc-cell clock runtime',
+                    'BS_ARC=1, model v1 (NU 3, NV 90)')
+        else:
+            corner_flags = [
+                '-DBS_DATA_HEADER="../model/generated/bs_model_runtime_const_v2.h"',
+                '-DBS_DRV_NV=60',
+                '-DBS_DRV_NU=2',
+            ]
+            cfg.msg('AP_BSolver arc-cell clock runtime',
+                    'BS_ARC=1, model v2 (NU 2, NV 60)')
         corner_flags.append('-DBS_ARC=1')
-        cfg.msg('AP_BSolver arc-cell clock runtime', 'BS_ARC=1')
 
     # DOUBLE_PRECISION_LIBRARIES patches CXXFLAGS only, and the vendored core
     # is compiled as C through bs_build_solver.c, so the C path needs it too.

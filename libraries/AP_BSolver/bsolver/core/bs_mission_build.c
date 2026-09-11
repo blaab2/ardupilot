@@ -86,6 +86,21 @@
 #define MB_NO_CORNER_PACE 0
 #endif
 
+/* MODEL DIMENSION GATE.  This builder is the v1 FIXED-CLOCK builder: its
+ * families carry the two clock rows (|nu| <= m_nu at indices 48/49), its
+ * DARE pair is the 3x2 longitudinal one with RNU, and its schedule is
+ * consumed through the clock input.  It is compiled in every firmware
+ * build, so under a header without the clock input (the v2 model,
+ * BS_NU == 2 / BS_NROW == 48, bs_model_runtime_const_v2.h) the whole
+ * body compiles out and the exported symbols become stubs that refuse
+ * every build (BS_MB_ERR_GEOM) -- the arc-cell clock runtime (bs_arc.c)
+ * is the only mission layer of the v2 model.  Under the v1 header this
+ * file is byte-identical to the pre-gate builder. */
+#if BS_NU == 3
+#if BS_NROW < 50
+#error "bs_mission_build: the v1 fixed-clock builder needs BS_NROW >= 50"
+#endif
+
 /* HOST CALIBRATION HOOK.  Zero on the target (never written); the host
  * calibration driver sets it to bisect the admissible crossing pace per
  * junction angle in the CLOSED LOOP, which is what produces the
@@ -1306,3 +1321,90 @@ bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
     return BS_MB_OK;
 #undef FAIL
 }
+
+#else /* BS_NU != 3: the v2 model has no clock input; the fixed-clock
+       * builder does not exist.  Link-compatible stubs only. */
+
+double bs_mb_vj_cap = 0.0;
+double bs_mb_vj_scale = 1.0;
+
+/* the cold-injection admissible speed table is model-independent */
+double bs_mb_v_adm(double chi_deg)
+{
+    const double c = fabs(chi_deg);
+    if (c <= bs_rc_adm_chi[0]) return bs_rc_adm_v[0];
+    for (int i = 1; i < BS_NADM; ++i) {
+        if (c <= bs_rc_adm_chi[i]) {
+            const double t = (c - bs_rc_adm_chi[i - 1])
+                           / (bs_rc_adm_chi[i] - bs_rc_adm_chi[i - 1]);
+            return bs_rc_adm_v[i - 1]
+                 + t * (bs_rc_adm_v[i] - bs_rc_adm_v[i - 1]);
+        }
+    }
+    return bs_rc_adm_v[BS_NADM - 1];
+}
+
+/* a small non-zero block so a caller that reserves before it asks the
+ * builder does not allocate zero bytes; the build itself is refused */
+size_t bs_mission_size(int n_wp, double len_m, double v_cap_ms)
+{
+    (void)n_wp; (void)len_m; (void)v_cap_ms;
+    return (size_t)1024;
+}
+
+bs_mb_status bs_mission_plan_build(const double *vx, const double *vy,
+                                   int n_wp, const bs_mission_params *pp,
+                                   int max_ticks, bs_mission_plan *pl,
+                                   bs_mission_report *rep)
+{
+    (void)vx; (void)vy; (void)n_wp; (void)pp; (void)max_ticks; (void)pl;
+    memset(rep, 0, sizeof(*rep));
+    rep->status = BS_MB_ERR_GEOM;
+    return BS_MB_ERR_GEOM;
+}
+
+int bs_mission_render_unit(const bs_mission_plan *pl, int leg_i,
+                           double *path, double *psi, double *ang,
+                           signed char *fam, int *sfam, int *srot,
+                           int *soff, int mask,
+                           double *scratch, int scratch_len)
+{
+    (void)pl; (void)leg_i; (void)path; (void)psi; (void)ang; (void)fam;
+    (void)sfam; (void)srot; (void)soff; (void)mask; (void)scratch;
+    (void)scratch_len;
+    return -1;
+}
+
+#if BS_STAGE2_PACE_TAB
+void bs_mission_render_pace(const bs_mission_plan *pl, int leg_i,
+                            const double *path, double *pace, int mask)
+{
+    (void)pl; (void)leg_i; (void)path; (void)pace; (void)mask;
+}
+#endif
+
+#if BS_STAGE2_REPACE
+int bs_mission_plan_repace(bs_mission_plan *pl, int leg_i, double scale,
+                           int max_ticks)
+{
+    (void)pl; (void)leg_i; (void)scale; (void)max_ticks;
+    return -1;
+}
+static bs_mission_plan batch_plan;
+bs_mission_plan *bs_mission_batch_plan(void) { return &batch_plan; }
+#endif
+
+bs_mb_status bs_mission_build(const double *vx, const double *vy, int n_wp,
+                              const bs_mission_params *pp,
+                              void *mem, size_t mem_len,
+                              bs_mission_tables *out,
+                              bs_mission_report *rep)
+{
+    (void)vx; (void)vy; (void)n_wp; (void)pp; (void)mem; (void)mem_len;
+    (void)out;
+    memset(rep, 0, sizeof(*rep));
+    rep->status = BS_MB_ERR_GEOM;
+    return BS_MB_ERR_GEOM;
+}
+
+#endif /* BS_NU == 3 */

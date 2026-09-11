@@ -52,3 +52,10 @@
 #ifndef BS_DRV_M
 #define BS_DRV_M 10
 #endif
+/* The input dimension, mirrored the same way (checked against BS_NU in
+ * AP_BSolver.cpp).  3 for every fixed-clock table pair and the v1 arc
+ * runtime (u = (j_l, nu, j_c)); the v2 arc runtime has no clock input
+ * (u = (j_l, j_c)) and wscript overrides it to 2 next to the header. */
+#ifndef BS_DRV_NU
+#define BS_DRV_NU 3
+#endif

@@ -240,7 +240,7 @@ private:
     // pinned solve provably cannot move it (B1p/B2i measure 0.0e+00), so
     // replaying it into _U is an identity — this array exists so the identity
     // is CHECKED each tick (_prefix_moved) rather than assumed.
-    double _committed[3 * BS_DRV_M];
+    double _committed[BS_DRV_NU * BS_DRV_M];
     float _prefix_moved;
     float _lambda0;
     // WALL TIME OF THE WHOLE TICK, not of the Newton call alone: micros()

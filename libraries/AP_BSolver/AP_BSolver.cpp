@@ -153,6 +153,21 @@ static_assert(BS_DRV_NV == BS_NV,
 static_assert(BS_DRV_M == BS_M_COMMIT,
               "BS_DRV_M must equal BS_M_COMMIT of the selected "
               "BS_DATA_HEADER");
+// The input dimension is mirrored the same way: 3 under every fixed-clock
+// pair and the v1 arc runtime (u = (j_l, nu, j_c)), 2 under the v2 arc
+// runtime (u = (j_l, j_c), no clock input).  The committed prefix
+// _committed[BS_DRV_NU * BS_DRV_M] and every stride below follow it.
+static_assert(BS_DRV_NU == BS_NU,
+              "BS_DRV_NU (AP_BSolver.h committed prefix) must equal BS_NU "
+              "of the selected BS_DATA_HEADER");
+static_assert(BS_NV == BS_NU * BS_N,
+              "the decision vector is BS_N stages of BS_NU inputs");
+// The v2 model has no fixed-clock mission layer (bs_mission_build.c
+// compiles to refusing stubs under BS_NU == 2): a v2 header without the
+// arc runtime would boot, refuse every mission and never engage.
+#if BS_NU != 3 && !BS_ARC
+#error "a model without the clock input (BS_NU == 2) is served by the arc-cell clock runtime only: configure with BSLV_ARC=1"
+#endif
 // The old model/reference cross-header asserts are gone with the flash
 // reference header; the equivalent invariants are now runtime gates in
 // bs_mission_build (G1-G10), checked per uploaded mission.
@@ -207,13 +222,13 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
 
     // @Param: IR
     // @DisplayName: Restrict the per-tick setup to the pinned rows
-    // @Values: 0:Build the whole quadratic half,1:Build only rows >= 3*M
+    // @Values: 0:Build the whole quadratic half,1:Build only rows >= NU*M
     // @User: Advanced
     // bs_problem_init does NOT shrink when the SOLVE is pinned -- it still
     // assembles the full BS_NV x BS_NV quadratic half -- on target that setup
-    // is a third of the pinned cycle.  Rows below 3*M are dead on the pinned
+    // is a third of the pinned cycle.  Rows below NU*M are dead on the pinned
     // path (the value never reads Hquad/Cquad and the derivatives visit only
-    // rows >= 3*M), so not writing them is EXACT: measured 0.000e+00 on the
+    // rows >= NU*M), so not writing them is EXACT: measured 0.000e+00 on the
     // tail gradient and the tail Hessian over 21 draws / 7 phases, with the
     // core refusing an npin = 0 evaluation of a restricted problem rather
     // than silently returning zeros.  Kept switchable because it is the one
@@ -406,11 +421,23 @@ static void plant_step(double *xi, const double *u, double seam_deg,
     const double Ts = BS_TS;
     const double d0 = xi[0], a0 = xi[1], el0 = xi[2];
     const double ec0 = xi[3], ed0 = xi[4], an0 = xi[5];
+    // j_l is input 0 and j_c input BS_NU-1 under both model versions
+#if BS_NU == 3
     const double j = u[0], nu = u[1], jn = u[2];
+#else
+    const double j = u[0], jn = u[BS_NU - 1];
+#endif
 
     double y0 = d0 + Ts * a0 + 0.5 * Ts * Ts * j;
     double y1 = a0 + Ts * j;
+#if BS_NU == 3
+    // v1: forward-Euler e_l with the clock input
     double y2 = el0 + Ts * d0 - Ts * nu;
+#else
+    // v2: the exact zero-order-hold e_l (bs_arc_plant's row; this
+    // fixed-clock step is compiled but never run under the v2 header)
+    double y2 = el0 + Ts * d0 + 0.5 * Ts * Ts * a0 + (Ts * Ts * Ts / 6.0) * j;
+#endif
     double y3 = ec0 + Ts * ed0 + 0.5 * Ts * Ts * an0 + (Ts * Ts * Ts / 6.0) * jn;
     double y4 = ed0 + Ts * an0 + 0.5 * Ts * Ts * jn;
     double y5 = an0 + Ts * jn;
@@ -1254,9 +1281,16 @@ void AP_BSolver::seed_once()
             _active = false;
             return;
         }
+        // the driver's prefix and the arc layer's are the same object
+        // (BS_NU * BS_M_COMMIT doubles): checked, not assumed -- the
+        // mirror BS_DRV_NU is what makes the two sizes agree
+        static_assert(sizeof(_committed) == sizeof(arc_d.committed),
+                      "committed prefix: driver and arc layer disagree");
+        static_assert(sizeof(_U) == sizeof(arc_d.U),
+                      "decision vector: driver and arc layer disagree");
         memcpy(_xi, arc_d.xi, sizeof(_xi));
         memcpy(_U, arc_d.U, sizeof(_U));
-        memcpy(_committed, arc_d.committed, sizeof(_committed));
+        memcpy(_committed, arc_d.committed, sizeof(arc_d.committed));
         _seeded = true;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc seed %d steps, %.0f ms (q%d K%d)",
                       arc_d.seed_iters, (double)_solve_ms, q, rounds);
@@ -1364,7 +1398,7 @@ void AP_BSolver::seed_once()
         }
     }
 
-    memcpy(_committed, _U, sizeof(double) * 3 * BS_M);
+    memcpy(_committed, _U, sizeof(_committed));
     _seeded = true;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: seed %d steps, %.0f ms", it,
                   (double)_solve_ms);
@@ -1400,7 +1434,7 @@ bool AP_BSolver::solve_once()
         lift_prefix(_plan);
         _plan_valid = true;
     }
-    double u0[3];
+    double u0[BS_NU];
     const int r = bs_arc_tick(&arc_d, u0);
     if (r != 0) {
         if (r < 0) {
@@ -1411,7 +1445,7 @@ bool AP_BSolver::solve_once()
     }
     memcpy(_xi, arc_d.xi, sizeof(_xi));
     memcpy(_U, arc_d.U, sizeof(_U));
-    memcpy(_committed, arc_d.committed, sizeof(_committed));
+    memcpy(_committed, arc_d.committed, sizeof(arc_d.committed));
     _lambda0 = (float)arc_d.lambda0;
     _bt = (uint8_t)MIN(arc_d.bt, 255);
     _armijo_fail = (uint8_t)MIN(arc_d.armijo_fail, 255);
@@ -1475,10 +1509,10 @@ bool AP_BSolver::solve_once()
     }
 
     // (a) REPLAY the committed prefix.  The pinned solve provably cannot have
-    //     moved it (causality: no stage t < M reaches a column >= 3M), so
+    //     moved it (causality: no stage t < M reaches a column >= NU*M), so
     //     this is an identity — measure it rather than trust it.
     double moved = 0.0;
-    for (int i = 0; i < 3 * BS_M; ++i) {
+    for (int i = 0; i < BS_NU * BS_M; ++i) {
         const double dev = fabs(_U[i] - _committed[i]);
         if (dev > moved) moved = dev;
         _U[i] = _committed[i];
@@ -1500,13 +1534,14 @@ bool AP_BSolver::solve_once()
                 const double *r = &rows[(size_t)i * 10];
                 double g = 0.0;
                 for (int j = 0; j < 6; ++j) g += r[j] * _xi[j];
-                for (int j = 0; j < 3; ++j) g += r[6 + j] * _U[j];
+                for (int j = 0; j < BS_NU; ++j) g += r[6 + j] * _U[j];
                 const double v = g - bs_mb_win_margin(&mt->sched, BS_MB_FAM_T,
                                                       tau, pc, i, r);
                 if (v > viol) viol = v;
             }
         }
-        bs_mb.repace_feed(_xi[2], _U[1], viol);
+        // the clock input nu exists under the v1 model only (input 1)
+        bs_mb.repace_feed(_xi[2], (BS_NU == 3) ? _U[1] : 0.0, viol);
     }
 #endif
 
@@ -1558,9 +1593,10 @@ bool AP_BSolver::solve_once()
     // (f) exactly ONE input becomes data per tick: stage M-1 of the new plan,
     //     which is the input that will be flown M ticks from now.  The window
     //     slides by one.
-    memmove(_committed, _committed + 3, sizeof(double) * 3 * (BS_M - 1));
-    memcpy(_committed + 3 * (BS_M - 1), _U + 3 * (BS_M - 1),
-           sizeof(double) * 3);
+    memmove(_committed, _committed + BS_NU,
+            sizeof(double) * BS_NU * (BS_M - 1));
+    memcpy(_committed + BS_NU * (BS_M - 1), _U + BS_NU * (BS_M - 1),
+           sizeof(double) * BS_NU);
 
     _tick++;
     return true;
@@ -1681,7 +1717,7 @@ void AP_BSolver::lift_prefix(Plan &plan) const
 
         phase += BS_TS * xi[0];
         const double trig_el_i = xi[2];
-        plant_step(xi, &_U[3 * i], ang_at(tau + 1), off_at(tau + 1));
+        plant_step(xi, &_U[BS_NU * i], ang_at(tau + 1), off_at(tau + 1));
         ledger_step(&phase, &off, tau, trig_el_i);
         tick += 1;
     }

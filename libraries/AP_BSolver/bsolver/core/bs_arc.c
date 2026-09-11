@@ -16,6 +16,34 @@
 #define NR BS_NROW
 #define MM BS_M_COMMIT
 
+/* MODEL DIMENSIONS, decided by the generated header at compile time.
+ *   v1 (bs_model_runtime_const.h):    u = (j_l, nu, j_c), NU 3, 50 rows
+ *                                     (the two |nu| <= 0.01 clock rows last)
+ *   v2 (bs_model_runtime_const_v2.h): u = (j_l, j_c),     NU 2, 48 rows
+ *                                     (exact-ZOH e_l, no clock input)
+ * The row template is one layout: the (speed, accel) pairs, then +e_l,
+ * +e_c, +j_l, +j_c, -e_l, -e_c, -j_l, -j_c (indices 40..47), and the
+ * nu pair (48, 49) only when the input exists.  j_l is input 0 and j_c
+ * input NU-1 in both.  The row stride the core reads is 10 in both
+ * (h[0..5], e[6..6+NU-1], margin at [9]); under NU == 2 slot 8 is
+ * zero. */
+#if NU == 3
+#if NR != 50
+#error "bs_arc: NU == 3 (v1, clock input nu) needs BS_NROW == 50"
+#endif
+#elif NU == 2
+#if NR != 48
+#error "bs_arc: NU == 2 (v2, no clock input) needs BS_NROW == 48"
+#endif
+#else
+#error "bs_arc: BS_NU must be 3 (v1) or 2 (v2)"
+#endif
+#if NV != NU * NN
+#error "bs_arc: BS_NV must equal BS_NU * BS_N"
+#endif
+#define ARC_JL 0            /* input index of j_l */
+#define ARC_JC (NU - 1)     /* input index of j_c */
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -265,9 +293,9 @@ int bs_arc_fam_key(const bs_arc_chart *ch, int k)
 }
 
 /* ha.rows_corner_m layout: (speed_a, accel_a) pairs for a = 0..19, then
- * +e_l, +e_c, +j_l, +j_c, -e_l, -e_c, -j_l, -j_c, +nu, -nu.  Every family
- * of the fillet chart has all 50 rows (the disc row with margin < 1e-9
- * would need pace >= VLEG, which no cell has). */
+ * +e_l, +e_c, +j_l, +j_c, -e_l, -e_c, -j_l, -j_c, and (v1 only) +nu, -nu.
+ * Every family of the fillet chart has all NR rows (the disc row with
+ * margin < 1e-9 would need pace >= VLEG, which no cell has). */
 static void template_rows(double *rows)
 {
     memset(rows, 0, sizeof(double) * NR * 10);
@@ -286,12 +314,14 @@ static void template_rows(double *rows)
         r = &rows[(size_t)(41 + 4 * q) * 10];
         r[3] = sgn[q]; r[9] = 1.0;                 /* +-e_c */
         r = &rows[(size_t)(42 + 4 * q) * 10];
-        r[6] = sgn[q]; r[9] = 1.0;                 /* +-j_l */
+        r[6 + ARC_JL] = sgn[q]; r[9] = 1.0;        /* +-j_l */
         r = &rows[(size_t)(43 + 4 * q) * 10];
-        r[8] = sgn[q]; r[9] = 1.0;                 /* +-j_c */
+        r[6 + ARC_JC] = sgn[q]; r[9] = 1.0;        /* +-j_c */
     }
+#if NU == 3
     rows[(size_t)48 * 10 + 7] = 1.0;  rows[(size_t)48 * 10 + 9] = 1.0;
     rows[(size_t)49 * 10 + 7] = -1.0; rows[(size_t)49 * 10 + 9] = 1.0;
+#endif
 }
 
 void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
@@ -320,15 +350,23 @@ void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
         m[41] = ch->w; m[45] = ch->w;
     }
     m[42] = BS_JBOX; m[43] = BS_JBOX; m[46] = BS_JBOX; m[47] = BS_JBOX;
+#if NU == 3
     m[48] = BS_ARC_M_NU; m[49] = BS_ARC_M_NU;
+#endif
 }
 
 /* so.dare_pair on the template rows with the given margins, QD = 0 (the
- * Python zeroes NS["QD"]; RL stays) */
+ * Python zeroes NS["QD"]; RL stays).  The pair splits into the
+ * longitudinal DARE on (delta, a_l, e_l) with the ML = NU-1 longitudinal
+ * inputs -- (j_l, nu) with RL_ = diag(RJ, RNU) + Mu[0:2,0:2] under v1,
+ * j_l alone with RL_ = RJ + Mu[0,0] under v2 -- and the lateral DARE on
+ * (e_c, v_c, a_c) with j_c, RT_ = RJ + Mu[NU-1,NU-1].  K is NU x 6:
+ * rows 0..NU-2 carry KL on columns 0..2, row NU-1 carries KT on 3..5. */
+#define ARC_ML (NU - 1)
 static int arc_dare(const double *rows, const double *m, double *P6,
                     double *K36)
 {
-    double Mx[36], Mu[9];
+    double Mx[36], Mu[NU * NU];
     memset(Mx, 0, sizeof(Mx));
     memset(Mu, 0, sizeof(Mu));
     for (int i = 0; i < NR; ++i) {
@@ -337,13 +375,17 @@ static int arc_dare(const double *rows, const double *m, double *P6,
         for (int a = 0; a < 6; ++a)
             for (int b = 0; b < 6; ++b)
                 Mx[a * 6 + b] += wgt * r[a] * r[b];
-        for (int a = 0; a < 3; ++a)
-            for (int b = 0; b < 3; ++b)
-                Mu[a * 3 + b] += wgt * r[6 + a] * r[6 + b];
+        for (int a = 0; a < NU; ++a)
+            for (int b = 0; b < NU; ++b)
+                Mu[a * NU + b] += wgt * r[6 + a] * r[6 + b];
     }
     double QL[9] = { 0.0, 0, 0, 0, BS_W_QA, 0, 0, 0, BS_W_RL };
     double QT[9] = { BS_W_RC, 0, 0, 0, BS_W_REG, 0, 0, 0, BS_W_REG };
+#if NU == 3
     double RLm[4] = { BS_W_RJ, 0, 0, BS_W_RNU };
+#else
+    double RLm[1] = { BS_W_RJ };
+#endif
     double RTm[1] = { BS_W_RJ };
     for (int a = 0; a < 3; ++a) {
         for (int b = 0; b < 3; ++b) {
@@ -351,23 +393,24 @@ static int arc_dare(const double *rows, const double *m, double *P6,
             QT[a * 3 + b] += Mx[(a + 3) * 6 + (b + 3)];
         }
     }
-    RLm[0] += Mu[0]; RLm[1] += Mu[1]; RLm[2] += Mu[3]; RLm[3] += Mu[4];
-    RTm[0] += Mu[8];
-    double PL[9], KL[6], PT[9], KT[3];
-    if (bs_dare_solve(bs_rc_AL, bs_rc_BL, QL, RLm, 3, 2, PL, KL, 20000, 1e-14) != 0)
+    for (int a = 0; a < ARC_ML; ++a)
+        for (int b = 0; b < ARC_ML; ++b) RLm[a * ARC_ML + b] += Mu[a * NU + b];
+    RTm[0] += Mu[(NU - 1) * NU + (NU - 1)];
+    double PL[9], KL[3 * ARC_ML], PT[9], KT[3];
+    if (bs_dare_solve(bs_rc_AL, bs_rc_BL, QL, RLm, 3, ARC_ML, PL, KL, 20000, 1e-14) != 0)
         return -1;
     if (bs_dare_solve(bs_rc_AT, bs_rc_BT, QT, RTm, 3, 1, PT, KT, 20000, 1e-14) != 0)
         return -1;
     memset(P6, 0, sizeof(double) * 36);
-    memset(K36, 0, sizeof(double) * 18);
+    memset(K36, 0, sizeof(double) * NU * NX);
     for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) {
             P6[a * 6 + b] = PL[a * 3 + b];
             P6[(a + 3) * 6 + (b + 3)] = PT[a * 3 + b];
         }
-    for (int a = 0; a < 2; ++a)
+    for (int a = 0; a < ARC_ML; ++a)
         for (int b = 0; b < 3; ++b) K36[a * 6 + b] = KL[a * 3 + b];
-    for (int b = 0; b < 3; ++b) K36[2 * 6 + 3 + b] = KT[b];
+    for (int b = 0; b < 3; ++b) K36[(NU - 1) * 6 + 3 + b] = KT[b];
     return 0;
 }
 
@@ -378,7 +421,7 @@ static int terminal_pair(const bs_arc_chart *ch, bs_arc_sched *S, int k,
     for (int i = 0; i < S->dare_n; ++i) {
         if (S->dare[i].key == key) {
             memcpy(P6, S->dare[i].P, sizeof(double) * 36);
-            memcpy(K36, S->dare[i].K, sizeof(double) * 18);
+            memcpy(K36, S->dare[i].K, sizeof(double) * NU * NX);
             return 0;
         }
     }
@@ -390,7 +433,7 @@ static int terminal_pair(const bs_arc_chart *ch, bs_arc_sched *S, int k,
     if (S->dare_next < 2) S->dare_next = 2;    /* keep ta / ca resident */
     S->dare[slot].key = key;
     memcpy(S->dare[slot].P, P6, sizeof(double) * 36);
-    memcpy(S->dare[slot].K, K36, sizeof(double) * 18);
+    memcpy(S->dare[slot].K, K36, sizeof(double) * NU * NX);
     return 0;
 }
 
@@ -657,9 +700,11 @@ int bs_arc_engage(bs_arc_driver *d)
             bs_eval(&d->prob, d->U, d->xi, &v0, NULL, NULL);
             printf("seed round %d: J0 %.10g ks[N] %d n_rot %d n_off %d\n", r, v0, d->S->ks[NN], d->S->n_rot, d->S->n_off);
             printf("  P diag %.6g %.6g %.6g %.6g %.6g %.6g  P01 %.6g\n", d->S->P[0], d->S->P[7], d->S->P[14], d->S->P[21], d->S->P[28], d->S->P[35], d->S->P[1]);
-            printf("  mstk[0][0..4] %.6g %.6g %.6g %.6g %.6g  [40..49] %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+            printf("  mstk[0][0..4] %.6g %.6g %.6g %.6g %.6g  [40..47] %.6g %.6g %.6g %.6g %.6g %.6g %.6g %.6g",
                    d->S->mstk[0], d->S->mstk[1], d->S->mstk[2], d->S->mstk[3], d->S->mstk[4],
-                   d->S->mstk[40], d->S->mstk[41], d->S->mstk[42], d->S->mstk[43], d->S->mstk[44], d->S->mstk[45], d->S->mstk[46], d->S->mstk[47], d->S->mstk[48], d->S->mstk[49]);
+                   d->S->mstk[40], d->S->mstk[41], d->S->mstk[42], d->S->mstk[43], d->S->mstk[44], d->S->mstk[45], d->S->mstk[46], d->S->mstk[47]);
+            for (int i = 48; i < NR; ++i) printf(" %.6g", d->S->mstk[i]);
+            printf("\n");
             printf("  off[1] %.6g %.6g %.6g %.6g %.6g %.6g  xi0 %.6g\n", d->S->off[6], d->S->off[7], d->S->off[8], d->S->off[9], d->S->off[10], d->S->off[11], d->xi[0]);
         }
         int iters_r = 0;
@@ -689,7 +734,7 @@ int bs_arc_engage(bs_arc_driver *d)
         {
             double v1 = 0.0;
             bs_eval(&d->prob, d->U, d->xi, &v1, NULL, NULL);
-            printf("  -> %d iters, J1 %.10g, U[0:3] %.8g %.8g %.3g, U[87] %.8g\n", iters_r, v1, d->U[0], d->U[1], d->U[2], d->U[87]);
+            printf("  -> %d iters, J1 %.10g, U[0] %.8g U[NU-1] %.8g, U[NV-NU] %.8g\n", iters_r, v1, d->U[0], d->U[NU - 1], d->U[NV - NU]);
         }
 #endif
     }
@@ -741,7 +786,7 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
     const unsigned long t_shift = clock_us(d);
     {
         bs_arc_assign(ch, S, k_prev, xi_prev, d->U);
-        double P6[36], K36[18];
+        double P6[36], K36[NU * NX];
         if (terminal_pair(ch, S, S->ks[NN], P6, K36) != 0) return -2;
         double Us[NV];
         for (int i = 0; i < NV - NU; ++i) Us[i] = d->U[i + NU];
