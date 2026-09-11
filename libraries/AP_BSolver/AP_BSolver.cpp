@@ -731,10 +731,32 @@ void AP_BSolver::init()
     bs_arena_words = bs_workspace_size();
     bs_arena = (double *)calloc(bs_arena_words, sizeof(double));
     if (bs_mb_block == nullptr) {
+#if BS_ARC
+        // THE ARC CHART'S BLOCK: the cells plus the per-solve schedule
+        // block (AP_BSMissionBuilder carves the schedule at the aligned
+        // end), for a run of BS_ARC_MAX_WP vertices as long as the
+        // fixed-clock tick cap's worth of trim cells (BS_MB_MAX_TICKS x
+        // Ts x V_TRIM at the 11.8 m/s cruise, ~5.1 km); the chart builder
+        // checks its ACTUAL cell count against whatever was reserved.  On
+        // the Cube the reservation is bounded by the largest free block
+        // (min(largest - margin, worst), below) exactly as before, so this
+        // only moves the probe's upper end.
+        //
+        // Sizing from the fixed-clock bound is WRONG here: bs_mission_size
+        // is the v1 builder's, and under the v2 header (no clock input)
+        // that builder is a stub returning 1 kB -- the first v2 SITL
+        // flight reserved 1024 B and refused every mission (st200).
+        const double len_cap = (double)BS_MB_MAX_TICKS * BS_TS
+                             * (BS_VCAP_MAX * BS_COS_PI20 - BS_VTRIM_STANDOFF);
+        const size_t worst = bs_arc_chart_size(BS_ARC_MAX_WP, len_cap)
+                           + ((sizeof(bs_arc_sched) + 7u) & ~(size_t)7u)
+                           + 64u;
+#else
         // worst case over speed and geometry: the tick cap dominates
         // (bs_mission_size saturates at BS_MB_MAX_TICKS: 129442 B, gated
         // by tests/size_gate.c)
         const size_t worst = bs_mission_size(BS_MB_MAX_WP, 1.0e9, 3.0);
+#endif
         const size_t margin = 16u * 1024u;
         // Measure what IS available -- the largest contiguous block, probed
         // up to worst + margin -- and reserve min(largest - margin, worst):
