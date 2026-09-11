@@ -247,6 +247,20 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
     // tick table estimates to fit the 250 ms period.  Read at engage.
     AP_GROUPINFO("K", 6, AP_BSolver, _k, 3),
 
+    // @Param: SEED
+    // @DisplayName: Arc-cell clock: engage seed
+    // @Values: 0:U = 0 (the v1 / v2 archives),1:Jerk-limited acceleration ramp (v2b)
+    // @User: Advanced
+    // BS_ARC builds only, read at engage into the driver's seed_ramp.  With
+    // U = 0 the first engage rollout assigns every stage to cell 0 and the
+    // plan backs up 2-3 m from rest before accelerating (the archives'
+    // pre-arrival corridor maxima are that back-up; scripts/mpc/bsolver/
+    // doc/ARC-FLIGHTS-2026-09-11.md section 8).  1 = v2b, the ramp to the
+    // first cell's pace (bs_arc_ramp_seed): no back-up, the engage's
+    // schedule fixed point at pass 2.  0 reproduces the v1 (p4-current)
+    // and v2 (p4-v2) archives and the flights scored against them.
+    AP_GROUPINFO("SEED", 7, AP_BSolver, _seed, 1),
+
     AP_GROUPEND
 };
 
@@ -1289,6 +1303,9 @@ void AP_BSolver::seed_once()
         if (q < 1) q = 1;
         bs_arc_driver_init(&arc_d, arc_ch, S, bs_arena, bs_arena_words,
                            q, rounds, BS_ARC_TRUST);
+        // the engage seed (BSLV_SEED): the driver defaults to the v2b
+        // ramp; 0 keeps the archives' U = 0 for comparison flights
+        arc_d.seed_ramp = (_seed != 0) ? 1 : 0;
         arc_d.yield = arc_yield;
         arc_d.micros = arc_micros;
         _tick = 0;
@@ -1314,8 +1331,11 @@ void AP_BSolver::seed_once()
         memcpy(_U, arc_d.U, sizeof(_U));
         memcpy(_committed, arc_d.committed, sizeof(arc_d.committed));
         _seeded = true;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc seed %d steps, %.0f ms (q%d K%d)",
-                      arc_d.seed_iters, (double)_solve_ms, q, rounds);
+        // (<= 50 characters: "BSLV: arc seed 300 steps, 12345 ms (q2 K3 ramp)"
+        // is 47)
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc seed %d steps, %.0f ms (q%d K%d %s)",
+                      arc_d.seed_iters, (double)_solve_ms, q, rounds,
+                      arc_d.seed_ramp ? "ramp" : "zero");
         return;
     }
 #endif

@@ -654,8 +654,36 @@ void bs_arc_driver_init(bs_arc_driver *d, const bs_arc_chart *ch,
     d->q = q;
     d->rounds = rounds;
     d->trust = trust;
+    d->seed_ramp = 1;                         /* v2b: the ramp seed */
     memset(S, 0, sizeof(*S));
     template_rows(S->rows);
+}
+
+/* doc section 8, the ramp verbatim: JB = BS_JBOX, AF = the forward face
+ * of cell 0's family (template row 1 = the acceleration row at raster
+ * index 0), v_target = cells[0].l / BS_TS; only j_l (input 0) is set. */
+void bs_arc_ramp_seed(const bs_arc_chart *ch, double *U)
+{
+    const double JB = BS_JBOX, Ts = BS_TS;
+    const double v_target = ch->cells[0].l / Ts;
+    double m[NR];
+    bs_arc_margins(ch, 0, m);
+    const double AF = m[1];
+    memset(U, 0, sizeof(double) * NV);
+    double v = 0.0, a = 0.0;
+    for (int t = 0; t < NN; ++t) {
+        double j;
+        if (v + a * a / (2.0 * JB) < v_target - 1e-9) {
+            j = (a < AF - 1e-9) ? JB : 0.0;
+            if (a + j * Ts > AF) j = (AF - a) / Ts;
+        } else {
+            j = (a > 1e-9) ? -JB : 0.0;
+            if (a + j * Ts < 0.0) j = -a / Ts;
+        }
+        U[NU * t + ARC_JL] = j;
+        v += a * Ts + 0.5 * j * Ts * Ts;
+        a += j * Ts;
+    }
 }
 
 static unsigned long clock_us(const bs_arc_driver *d)
@@ -685,7 +713,8 @@ int bs_arc_engage(bs_arc_driver *d)
     d->kw = 0;
     memset(d->xi, 0, sizeof(d->xi));
     d->xi[0] = -(ch->cells[0].l / BS_TS);          /* at rest on vertex 0 */
-    memset(d->U, 0, sizeof(d->U));
+    if (d->seed_ramp) bs_arc_ramp_seed(ch, d->U);  /* v2b */
+    else memset(d->U, 0, sizeof(d->U));            /* the archives' U = 0 */
     d->seed_iters = 0;
     for (int r = 0; r < BS_ARC_SEED_ROUNDS; ++r) {
         bs_arc_assign(ch, d->S, d->k, d->xi, d->U);

@@ -34,6 +34,15 @@
  * region, reward, engage, rounds, shift-append -- is identical; the v1
  * build is bit-identical to the pre-v2 layer.
  *
+ * ENGAGE SEED (v2b).  The engage's three fixed-point rounds start from a
+ * seed U.  With U = 0 the first rollout assigns every stage to cell 0 and
+ * the terminal e_l weight makes the plan back up 2-3 m from rest before
+ * accelerating (the archives' pre-arrival corridor maxima are that
+ * back-up; doc/ARC-FLIGHTS-2026-09-11.md section 8).  The driver's
+ * `seed_ramp` (1 by default = v2b) seeds the jerk-limited acceleration
+ * ramp to the first cell's pace instead (bs_arc_ramp_seed); 0 keeps
+ * U = 0, which reproduces the v1 (p4-current) and v2 (p4-v2) archives.
+ *
  * WHAT A SOLVE IS.  Before each solve the shifted warm start is rolled out
  * with the same rule to produce the stage -> cell assignment, the composed
  * per-stage transitions (T_t, c_t) and the rollout's within-cell progress
@@ -176,6 +185,8 @@ typedef struct {
     bs_problem prob;
     int q, rounds;
     double trust;
+    int seed_ramp;            /* engage seed: 1 = jerk-limited ramp (v2b,
+                               * the default), 0 = U = 0 (v1 / v2 archives) */
     /* loop state */
     int k;                    /* the vehicle's cell                        */
     int kw;                   /* applied ticks so far                      */
@@ -206,9 +217,20 @@ void bs_arc_driver_init(bs_arc_driver *d, const bs_arc_chart *ch,
                         bs_arc_sched *S, double *arena, size_t arena_len,
                         int q, int rounds, double trust);
 
+/* The v2b engage seed (doc/ARC-FLIGHTS-2026-09-11.md section 8): the
+ * jerk-limited acceleration ramp from rest to the first cell's chart pace
+ * v_target = cells[0].l / BS_TS -- j_l = +BS_JBOX until a_l reaches the
+ * forward face AF of cell 0's family (bs_arc_margins at raster index 0:
+ * bs_rc_aniso[0] = 3.119 for a trim cell, BS_ARC_ACCC = 5.66 for a
+ * corner / fillet cell), hold, j_l = -BS_JBOX so that a_l returns to 0 as
+ * the speed arrives at v_target; every other input 0.  Writes all BS_NV
+ * entries of U. */
+void bs_arc_ramp_seed(const bs_arc_chart *ch, double *U);
+
 /* The engage: at rest on the first vertex, three unpinned fixed-point
- * rounds (assignment + full Newton, <= 300 steps, tol 1e-7), commits the
- * first M inputs.  Returns 0 on success. */
+ * rounds (assignment + full Newton, <= 300 steps, tol 1e-7) from the
+ * seed U (d->seed_ramp: the ramp; else U = 0), commits the first M
+ * inputs.  Returns 0 on success. */
 int bs_arc_engage(bs_arc_driver *d);
 
 /* One maintained tick, in the order of ac.run: publish (the caller lifts

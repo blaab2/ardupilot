@@ -219,6 +219,7 @@ private:
     AP_Int16 _qe;                // cap on the engage seed's Newton steps
     AP_Int8  _ir;                // restrict the setup to the pinned rows
     AP_Int8  _k;                 // arc-cell clock: assignment/solve rounds per tick
+    AP_Int8  _seed;              // arc-cell clock: engage seed (1 ramp = v2b, 0 U = 0)
 
     bool _inited;
     bool _thread_created;
