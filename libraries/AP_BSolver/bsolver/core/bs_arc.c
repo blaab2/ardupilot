@@ -825,10 +825,10 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
     {
         int ks_solved[NN + 1];
         memcpy(ks_solved, S->ks, sizeof(ks_solved));
-        bs_arc_sched tmp_unused;
-        (void)tmp_unused;
-        /* re-assign into a scratch copy of ks: bs_arc_assign rewrites the
-         * schedule's slots, which are not read again this tick */
+        /* re-assign over the schedule itself: bs_arc_assign rewrites the
+         * slots, which are not read again this tick.  (An earlier draft
+         * declared a scratch bs_arc_sched here and never used it -- a
+         * 29 kB automatic that only -O elides, on an 8 kB thread stack.) */
         bs_arc_assign(ch, S, d->k, d->xi, d->U);
         d->consistent = (memcmp(ks_solved, S->ks, sizeof(ks_solved)) == 0);
     }

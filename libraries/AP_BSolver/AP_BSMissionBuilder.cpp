@@ -199,8 +199,11 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
                       arc_chart_s.n_cells, arc_chart_s.k_end,
                       (unsigned)_run_first, (unsigned)_run_last,
                       (double)dt_us * 1e-3);
+        // (50-char statustext: the old "arc %u B cells + %u B sched of
+        // %u B" form lost the block length -- the boot reservation, which
+        // is the number that changed with the v2 chart-sized bound)
         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                      "BSLV mission: arc %u B cells + %u B sched of %u B",
+                      "BSLV arc mem: cells %u sched %u of %u B",
                       (unsigned)((size_t)arc_chart_s.n_cells * sizeof(bs_arc_cell)),
                       (unsigned)sched_sz, (unsigned)blk_len);
         return true;
