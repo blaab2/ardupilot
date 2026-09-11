@@ -170,8 +170,14 @@ bool AP_BSMissionBuilder::build_pending(AP_Mission &mission)
         }
         const uint32_t t0 = AP_HAL::micros();
         uint8_t *base = (uint8_t *)blk;
-        arc_sched_s = (bs_arc_sched *)(void *)(base + blk_len - sched_sz);
-        const size_t cells_len = (blk_len - sched_sz) & ~(size_t)7u;
+        // ALIGNMENT: the reservation length is the boot-time probe's (any
+        // byte count), so the schedule block must be aligned DOWN to 8 --
+        // a double at an odd address is a UsageFault on the Cortex-M7
+        // (measured: hard fault + watchdog reset 3 s after the first
+        // engage, FLR = the stack-fill pattern), invisible on the x86 SITL.
+        const uintptr_t tail = ((uintptr_t)base + blk_len - sched_sz) & ~(uintptr_t)7u;
+        arc_sched_s = (bs_arc_sched *)(void *)tail;
+        const size_t cells_len = (size_t)(tail - (uintptr_t)base);
         const int rc = bs_arc_chart_build(_vx, _vy, _n_wp, base, cells_len,
                                           &arc_chart_s);
         const uint32_t dt_us = AP_HAL::micros() - t0;

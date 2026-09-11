@@ -857,18 +857,20 @@ static void arc_broadcast_timing(void)
         if (!p95 && acc * 100u >= n * 95u) p95 = (uint32_t)b * 10u + 5u;
         if (!p99 && acc * 100u >= n * 99u) p99 = (uint32_t)b * 10u + 5u;
     }
+    // (statustexts are 50 characters: every line below fits, measured --
+    // the first form lost the max and the seed time to the cut)
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "BSLV: arc tick ms mean %lu p50 %lu p95 %lu p99 %lu max %lu n %lu",
+                  "BSLV: tick ms %lu/%lu/%lu/%lu/%lu n%lu",
                   (unsigned long)(n ? arc_us_sum / n / 1000u : 0), (unsigned long)p50,
                   (unsigned long)p95, (unsigned long)p99,
                   (unsigned long)(arc_us_max / 1000u), (unsigned long)n);
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "BSLV: arc split ms asg %lu/%lu ini %lu/%lu nwt %lu/%lu (mean/max)",
+                  "BSLV: split asg %lu/%lu ini %lu/%lu nwt %lu/%lu",
                   (unsigned long)(n ? arc_asg_sum / n / 1000u : 0), (unsigned long)(arc_asg_max / 1000u),
                   (unsigned long)(n ? arc_ini_sum / n / 1000u : 0), (unsigned long)(arc_ini_max / 1000u),
                   (unsigned long)(n ? arc_nwt_sum / n / 1000u : 0), (unsigned long)(arc_nwt_max / 1000u));
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "BSLV: arc incons %u reasg %u viol %.4f seed %lu ms holds %d skips %d",
+                  "BSLV: inc %u rea %u viol %.3f seed %lu h%d s%d",
                   (unsigned)arc_incons, (unsigned)arc_reassign, (double)arc_viol_max,
                   (unsigned long)arc_seed_ms, arc_d.holds, arc_d.skips);
 }
