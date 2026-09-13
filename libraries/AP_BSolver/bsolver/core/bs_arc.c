@@ -87,11 +87,30 @@ static void add_cell(cell_sink *s, double px, double py, double thx,
     s->n++;
 }
 
+/* The cell count of a straight of length Lp at nominal pace `pace`
+ * (am.build_cells_fillet :: n_cells).  Cell rows (v2c) round UP,
+ * n = ceil(Lp / (pace Ts)), so that every cell's own pace l / Ts is <=
+ * the nominal pace its velocity rows are written about (the forward
+ * margin VLEG - pace_k stays >= VLEG - v_nom on every cell); family
+ * rows keep the archives' int(round(.)), Python's round-half-even,
+ * which is nearbyint under the default rounding mode.  At least one
+ * cell either way.  The ceil is taken on the same double the Python
+ * sees (np.ceil of Lp / (pace * Ts)), no slack: an exact integer ratio
+ * (a 16 m corner-pace part at 8 m/s = 8.0) must give that integer in
+ * both. */
+static int straight_count(double Lp, double pace, int cell_rows)
+{
+    const double r = Lp / (pace * BS_TS);
+    int n = cell_rows ? (int)ceil(r) : (int)nearbyint(r);
+    if (n < 1) n = 1;
+    return n;
+}
+
 /* am.build_cells_fillet :: straight(): corner-pace cells within 16 m
  * after / 20 m before a vertex, trim cells between. */
 static void straight(cell_sink *s, double p0x, double p0y, double thx,
                      double thy, double L, int leg, double chi_at, int n_v,
-                     double corner_pace, double vtrim)
+                     double corner_pace, double vtrim, int cell_rows)
 {
     const double a = (leg > 0) ? BS_ARC_WIN_OUT : 0.0;
     const double b = (leg < n_v - 2) ? BS_ARC_WIN_IN : 0.0;
@@ -108,9 +127,7 @@ static void straight(cell_sink *s, double p0x, double p0y, double thx,
     int first = 1;
     for (int p = 0; p < np; ++p) {
         if (Lp[p] <= 1e-9) continue;
-        /* int(round(Lp / (pace Ts))): Python rounds half to even */
-        int n = (int)nearbyint(Lp[p] / (pace[p] * BS_TS));
-        if (n < 1) n = 1;
+        const int n = straight_count(Lp[p], pace[p], cell_rows);
         const double l = Lp[p] / n;
         for (int j = 0; j < n; ++j) {
             add_cell(s, p0x + thx * sacc, p0y + thy * sacc, thx, thy, l,
@@ -131,7 +148,7 @@ static struct {
 } cp;
 
 static int chart_pass(const double *vx, const double *vy, int n_v,
-                      cell_sink *s, bs_arc_chart *out)
+                      cell_sink *s, bs_arc_chart *out, int cell_rows)
 {
     const double corner_pace = BS_ARC_CORNER_PACE, w = BS_ARC_W;
     const double vtrim = v_trim();
@@ -176,7 +193,8 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
         const double ex = vx[i + 1] - t0 * T[i + 1], ey = vy[i + 1] - t1 * T[i + 1];
         const double L = sqrt((ex - sx) * (ex - sx) + (ey - sy) * (ey - sy));
         if (out != NULL) out->leg_first[i] = s->n;
-        straight(s, sx, sy, t0, t1, L, i, chi_carry, n_v, corner_pace, vtrim);
+        straight(s, sx, sy, t0, t1, L, i, chi_carry, n_v, corner_pace, vtrim,
+                 cell_rows);
         const int k = i + 1;
         if (k < n_v - 1 && T[k] > 0.0) {
             const double sgn = (chi[k] > 0.0) ? 1.0 : ((chi[k] < 0.0) ? -1.0 : 0.0);
@@ -217,11 +235,12 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
         if (out != NULL) out->leg_last[i] = s->n - 1;
     }
     const int k_end = s->n;
-    {   /* the trailing straight: tail / round(tail / (V_TRIM Ts)) cells */
+    {   /* the trailing straight (trim cells): tail / n with n = round(tail
+         * / (V_TRIM Ts)) = 21 under family rows, ceil(.) = 22 under cell
+         * rows */
         const double thx = (s->cells != NULL && s->n > 0) ? s->cells[s->n - 1].thx : tx[n_v - 2];
         const double thy = (s->cells != NULL && s->n > 0) ? s->cells[s->n - 1].thy : ty[n_v - 2];
-        int n = (int)nearbyint(BS_ARC_TAIL / (vtrim * BS_TS));
-        if (n < 1) n = 1;
+        const int n = straight_count(BS_ARC_TAIL, vtrim, cell_rows);
         const double l = BS_ARC_TAIL / n;
         for (int j = 0; j < n; ++j)
             add_cell(s, vx[n_v - 1] + thx * (j * l), vy[n_v - 1] + thy * (j * l),
@@ -235,6 +254,7 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
         out->v_leg = v_leg();
         out->corner_pace = corner_pace;
         out->w = w;
+        out->cell_rows = cell_rows;
     }
     return 0;
 }
@@ -250,22 +270,30 @@ size_t bs_arc_chart_size(int n_wp, double len_m)
     return (size_t)bs_arc_chart_cells_bound(n_wp, len_m) * sizeof(bs_arc_cell);
 }
 
-int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
-                       void *mem, size_t mem_len, bs_arc_chart *out)
+int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
+                            void *mem, size_t mem_len, bs_arc_chart *out,
+                            int cell_rows)
 {
     if (n_wp < 2 || n_wp > BS_ARC_MAX_WP) return -1;
     memset(out, 0, sizeof(*out));
     for (int i = 0; i < n_wp; ++i) { out->vx[i] = vx[i]; out->vy[i] = vy[i]; }
+    cell_rows = cell_rows ? 1 : 0;
     cell_sink cnt = { NULL, 0, 0, 0 };
-    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL);
+    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL, cell_rows);
     if (rc != 0) return rc;
     if ((size_t)cnt.n * sizeof(bs_arc_cell) > mem_len) return -2;
     cell_sink fill = { (bs_arc_cell *)mem, 0, cnt.n, 0 };
-    rc = chart_pass(vx, vy, n_wp, &fill, out);
+    rc = chart_pass(vx, vy, n_wp, &fill, out, cell_rows);
     if (rc != 0) return rc;
     if (fill.overflow || fill.n != cnt.n) return -2;
     out->cells = (bs_arc_cell *)mem;
     return 0;
+}
+
+int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
+                       void *mem, size_t mem_len, bs_arc_chart *out)
+{
+    return bs_arc_chart_build_rows(vx, vy, n_wp, mem, mem_len, out, 1);
 }
 
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
@@ -288,14 +316,27 @@ void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
 int bs_arc_fam_key(const bs_arc_chart *ch, int k)
 {
     const bs_arc_cell *c = &ch->cells[k];
-    if (c->kind == BS_ARC_FILLET) return 2 + k;
+    if (ch->cell_rows || c->kind == BS_ARC_FILLET) return 2 + k;
     return (c->kind == BS_ARC_TA) ? 0 : 1;
+}
+
+/* the pace the velocity rows are written about */
+static double row_pace(const bs_arc_chart *ch, const bs_arc_cell *c)
+{
+    /* cell rows (v2c): the cell's own chart pace on every cell.  Family
+     * rows: V_TRIM for ta, the corner pace for ca (ac.register_families),
+     * the cell's own pace only on a fillet chord (am.fillet_rows). */
+    if (ch->cell_rows || c->kind == BS_ARC_FILLET) return c->l / BS_TS;
+    return (c->kind == BS_ARC_TA) ? ch->v_trim : ch->corner_pace;
 }
 
 /* ha.rows_corner_m layout: (speed_a, accel_a) pairs for a = 0..19, then
  * +e_l, +e_c, +j_l, +j_c, -e_l, -e_c, -j_l, -j_c, and (v1 only) +nu, -nu.
- * Every family of the fillet chart has all NR rows (the disc row with
- * margin < 1e-9 would need pace >= VLEG, which no cell has). */
+ * Every family of the fillet chart has all NR rows: rows_corner_m drops
+ * a velocity row with margin < 1e-9 (pace cos(theta) >= VLEG), which no
+ * cell reaches -- the family paces are below VLEG, and under cell rows
+ * the rounded-up cell counts keep every cell pace at or below its
+ * nominal pace (the gate asserts every margin positive). */
 static void template_rows(double *rows)
 {
     memset(rows, 0, sizeof(double) * NR * 10);
@@ -327,15 +368,12 @@ static void template_rows(double *rows)
 void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
 {
     const bs_arc_cell *c = &ch->cells[k];
-    /* the disc is about the FAMILY's nominal pace: V_TRIM for ta, the
-     * corner pace for ca (ac.register_families), the cell's own pace only
-     * on a fillet chord (am.fillet_rows) */
-    const double pace = (c->kind == BS_ARC_FILLET) ? c->l / BS_TS
-                      : ((c->kind == BS_ARC_TA) ? ch->v_trim : ch->corner_pace);
+    const double pace = row_pace(ch, c);
     const double VLEG = ch->v_leg;
     for (int a = 0; a < 20; ++a) {
         const double th = rad_of(18.0 * a);
         m[2 * a] = VLEG - pace * cos(th);
+        /* the acceleration faces stay by cell KIND in both row modes */
         m[2 * a + 1] = (c->kind == BS_ARC_TA) ? bs_rc_aniso[a] : BS_ARC_ACCC;
     }
     m[40] = BS_ARC_BAND; m[44] = BS_ARC_BAND;
@@ -427,10 +465,16 @@ static int terminal_pair(const bs_arc_chart *ch, bs_arc_sched *S, int k,
     }
     double m[NR];
     bs_arc_margins(ch, k, m);
+    S->dare_solves++;
     if (arc_dare(S->rows, m, P6, K36) != 0) { S->dare_fail++; return -1; }
     const int slot = (S->dare_n < BS_ARC_DARE_CACHE) ? S->dare_n++ : S->dare_next;
     S->dare_next = (slot + 1) % BS_ARC_DARE_CACHE;
-    if (S->dare_next < 2) S->dare_next = 2;    /* keep ta / ca resident */
+    /* family rows: the two straight families (the first two pairs solved)
+     * stay resident, the fillet pairs cycle through slots 2..5.  Cell
+     * rows: every cell is a family and the tip walks the chart, so the
+     * cache is a plain ring (the tip cell of the shift, the K rounds and
+     * usually the next tick's rounds is one of the last few solved). */
+    if (!ch->cell_rows && S->dare_next < 2) S->dare_next = 2;
     S->dare[slot].key = key;
     memcpy(S->dare[slot].P, P6, sizeof(double) * 36);
     memcpy(S->dare[slot].K, K36, sizeof(double) * NU * NX);

@@ -43,6 +43,32 @@
  * ramp to the first cell's pace instead (bs_arc_ramp_seed); 0 keeps
  * U = 0, which reproduces the v1 (p4-current) and v2 (p4-v2) archives.
  *
+ * ROW FAMILIES (v2c: cell-centred rows).  The chart's `cell_rows` (1 by
+ * default: bs_arc_chart_build; bs_arc_chart_build_rows takes it as an
+ * argument) makes EVERY cell its own row family: the twenty velocity
+ * rows are written about the cell's own chart pace l_k / Ts,
+ * m_i = VLEG - pace_k cos(theta_i), so that the velocity polygon is the
+ * world disc |v| <= VLEG on every cell; the acceleration faces stay by
+ * cell kind (the anisotropic vector on trim straights, BS_ARC_ACCC on
+ * corner-pace straights and chords), the corridor / band / jerk rows as
+ * before, and the terminal DARE pair is per cell (key 2 + k for every
+ * cell; the cache is a plain ring).  So that no cell's pace exceeds its
+ * nominal pace (V_TRIM on a trim straight, the corner pace on a
+ * corner-pace straight; a chord is <= one corner-pace cell by its
+ * rule), the straight cell counts are rounded UP under cell rows,
+ * n = ceil(L / (v_nom Ts)), so l = L / n <= v_nom Ts and the forward
+ * velocity margin VLEG - pace_k is >= 0.289 (trim) / >= 3.65 (corner)
+ * on every cell -- the family rows' round() (Python round-half-even)
+ * put 4 trim cells of the Turns mission at 12.34 m/s and 14 of the
+ * Mixed mission at 11.75, above VLEG.  The gate checks every margin of
+ * every cell is positive under cell rows.
+ * `cell_rows = 0` restores the FAMILY-centred rows AND the round()
+ * cell counts of the p4-current / p4-v2 / p4-v2b archives: 'ta' about
+ * V_TRIM, 'ca' about the corner pace, one family per fillet chord
+ * about its own pace, with the DARE cache keeping the two straight
+ * families resident (the gate option --family-rows; tests/arc_regress.sh
+ * runs the archives with it).
+ *
  * WHAT A SOLVE IS.  Before each solve the shifted warm start is rolled out
  * with the same rule to produce the stage -> cell assignment, the composed
  * per-stage transitions (T_t, c_t) and the rollout's within-cell progress
@@ -113,6 +139,11 @@ typedef struct {
     int leg_first[BS_ARC_MAX_WP];      /* first cell of leg i's straight     */
     int leg_last[BS_ARC_MAX_WP];       /* last cell (incl. fillet) of leg i  */
     double v_trim, v_leg, corner_pace, w;
+    int cell_rows;        /* 1 (default): every cell its own row family, the
+                           * velocity rows about the cell's own pace, straight
+                           * cell counts rounded up (v2c); 0: the family-
+                           * centred rows and round() counts of the
+                           * p4-current / p4-v2 / p4-v2b archives           */
 } bs_arc_chart;
 
 /* Upper bound on the cell count / block size for n_wp waypoints of total
@@ -121,9 +152,17 @@ int bs_arc_chart_cells_bound(int n_wp, double len_m);
 size_t bs_arc_chart_size(int n_wp, double len_m);
 
 /* Build the fillet chart.  `mem` holds the cells (>= bs_arc_chart_size).
- * Returns 0, or a negative code (-1 waypoints, -2 memory, -3 geometry). */
+ * bs_arc_chart_build builds the cell-rows chart (cell_rows = 1, the
+ * configuration flown); bs_arc_chart_build_rows takes cell_rows as an
+ * argument (0 = the archives' family rows and cell counts).  The cell
+ * count depends on the mode, so it is a build-time choice, not a field
+ * to flip afterwards.  Returns 0, or a negative code (-1 waypoints,
+ * -2 memory, -3 geometry). */
 int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
                        void *mem, size_t mem_len, bs_arc_chart *out);
+int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
+                            void *mem, size_t mem_len, bs_arc_chart *out,
+                            int cell_rows);
 
 /* world position / velocity / acceleration of a quotient state in cell k */
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
@@ -147,17 +186,23 @@ typedef struct {
     int ks[BS_N + 1];
     double els[BS_N + 1];
     double xiN[BS_NX];                     /* rollout terminal state        */
-    /* terminal-pair cache: key = cell family key (see bs_arc_fam_key) */
+    /* terminal-pair cache: key = cell family key (see bs_arc_fam_key);
+     * a plain ring under cell_rows, else slots 0/1 stay resident */
     struct { int key; double P[BS_NX * BS_NX], K[BS_NU * BS_NX]; }
         dare[BS_ARC_DARE_CACHE];
     int dare_n, dare_next;
     int dare_fail;
+    int dare_solves;      /* DARE pairs solved (cache misses), cumulative */
 } bs_arc_sched;
 
-/* the family key of a cell: 0 = ta, 1 = ca, 2 + k for a fillet cell k */
+/* the family key of a cell: under cell_rows 2 + k for every cell; else
+ * 0 = ta, 1 = ca, 2 + k for a fillet cell k */
 int bs_arc_fam_key(const bs_arc_chart *ch, int k);
 
-/* margins of cell k's family (no trust), BS_NROW entries in template order */
+/* margins of cell k's family (no trust), BS_NROW entries in template
+ * order (the velocity rows about the cell's own pace under cell_rows,
+ * about the family pace otherwise; every margin is positive on every
+ * chart the builder produces -- the gate asserts it) */
 void bs_arc_margins(const bs_arc_chart *ch, int k, double *m);
 
 /* One plant step + the clock rule: y = A xi + B u, then (k_new, T, c) with
