@@ -86,6 +86,58 @@
  * per-stage margin table in bs_schedule, the (a) re-priced stage cost
  * (Q_delta = Q_el = 0; the DARE keeps RL, exactly as the Python does) and
  * the 1.5 progress reward.  The default build is byte-identical.
+ *
+ * THE STOP AT THE LAST WAYPOINT (v2d, doc/V2D-HOVER-CELL-PLAN.md D1-D9,
+ * rule G0 of doc/V2D-P1-W1-2026-09-22.md; the Python of record is
+ * model/arc_v2.py: has_hover .. install_stop and _run).  A chart built
+ * with `hover` = 1 (bs_arc_chart_build: BS_ARC_HOVER, the configuration
+ * of record since v2d; bs_arc_chart_build_rows takes the flag) has NO
+ * trailing straight: the chart ends in ONE cell of kind BS_ARC_HV at the
+ * last waypoint (l = 0, pace 0, chi 0, the last leg's tangent), k_end =
+ * its index.  Its row family (bs_arc_margins): the velocity disc of
+ * radius BS_HV_SPEED_ARC about pace 0, the isotropic BS_ARC_ACCC faces,
+ * +-e_l at BS_HV_BAND (the hover zone), +-e_c at BS_HV_EC_BAND, the jerk
+ * box -- 48 rows in the template order; its terminal pair is the EMITTED
+ * bs_rc_arc_Ph / bs_rc_arc_Kh of the generated header (never solved on
+ * target, counted in bs_arc_sched.dare_hover).  The progress reward is
+ * per stage: BS_HV_W (0) on a stage whose next state is assigned to the
+ * hover cell, BS_SPEED_TILT_W elsewhere (bs_arc_sched.tilt_w ->
+ * bs_schedule.tilt_w; a horizon without a hover stage keeps today's
+ * arithmetic bit for bit).
+ *   GATE   closed from engage until the first tick at which a brake seed
+ *          exists (or the vehicle is already in the hover cell).  While
+ *          closed the hover cell is NOT assignable: bs_arc_assign rolls
+ *          out on the chart without it and the last straight cell holds
+ *          beyond its end with T = I, c = 0 once the rollout state has
+ *          e_l >= 0 (the 'virtual tail': exactly the v2c tail behaviour).
+ *   SEED   once per mission, at the tick the gate opens (after the
+ *          shift-append, before the rounds): the natural rollout of the
+ *          shifted warm start; if its tip is at/past WP_N, the latest
+ *          stage t_b >= M from which an exact jerk-limited stop
+ *          (stop_profile: n1 stages at -J, n2 at 0, n3 at +J', J' from
+ *          a_final = 0, J from v_final = 0) rests within BS_HV_SEED_TOL of
+ *          WP_N by stage N - BS_HV_GATE_MARGIN; ties at that stage by the
+ *          smallest |shortfall|.  The stop's j_l overwrites the warm start
+ *          from t_b and the latch is set to its rest stage.
+ *   LATCH  a stage index (-1 none): every stage >= latch whose natural
+ *          assignment is short of the hover cell is FORCED into it
+ *          (force_to_end: chain through the remaining cells, e_l = the
+ *          signed shortfall to WP_N in the hover frame, so the +-e_l band
+ *          rows demand the plan to be there by that stage); the latch
+ *          moves earlier on natural entry (the first stage > 0 whose
+ *          rollout cell is >= k_end), never later.
+ *   ARRIVAL = zone entry: the first post-step state with e_l >= -BS_HV_BAND
+ *          in the hover frame (the state itself in the hover cell, e_l -
+ *          l_{k_end-1} in the last straight cell).  SETTLED = the first
+ *          tick whose last solved plan has X0..XM in the hover box (speed
+ *          <= BS_HV_SPEED_ARC, |e_l| and |e_c| <= BS_HV_BAND in the hover
+ *          frame, |a| <= BS_HV_A_SETTLE): bs_arc_tick returns 2 on that
+ *          tick (the handback); the driver never sets `finished` by cell
+ *          index on a hover chart.  The caller (tests/arc_gate.c --hover,
+ *          the firmware) runs M more ticks after settle, and treats
+ *          BS_HV_SETTLE_CAP ticks after arrival unsettled as a failed run.
+ * Charts built with hover = 0 reach none of these branches: the v1 / v2 /
+ * v2b / v2c regression charts are bit-identical to before.
  */
 #ifndef BS_ARC_H
 #define BS_ARC_H
@@ -115,8 +167,19 @@
 #define BS_ARC_SEED_ROUNDS 3         /* engage: assignment fixed-point rounds */
 #define BS_ARC_WIN_IN 20.0           /* corner-pace straight before a vertex */
 #define BS_ARC_WIN_OUT 16.0          /* corner-pace straight after a vertex  */
+#define BS_ARC_HOVER 1               /* v2d: bs_arc_chart_build ends the chart
+                                      * in the hover cell (no tail)          */
+/* the v2d block (BS_HV_*, bs_rc_arc_Ph / Kh) is emitted into the v2
+ * header only; the v1 header (byte-identical to its record) has none, so
+ * a v1 build refuses a hover chart (bs_arc_chart_build_rows -> -4) and
+ * bs_arc_chart_build stays the tail chart there */
+#ifdef BS_HV_SPEED_ARC
+#define BS_ARC_HV_AVAILABLE 1
+#else
+#define BS_ARC_HV_AVAILABLE 0
+#endif
 
-enum { BS_ARC_TA = 0, BS_ARC_CA = 1, BS_ARC_FILLET = 2 };
+enum { BS_ARC_TA = 0, BS_ARC_CA = 1, BS_ARC_FILLET = 2, BS_ARC_HV = 3 };
 
 typedef struct {
     double px, py;        /* start point (N, E)                              */
@@ -124,7 +187,7 @@ typedef struct {
     double l;             /* cell length; chart pace = l / BS_TS             */
     double chi;           /* seam angle at the cell START, deg (0 = none)    */
     double d_in;          /* fillet cell: chord-midpoint depth into the corner */
-    signed char kind;     /* BS_ARC_TA / BS_ARC_CA / BS_ARC_FILLET           */
+    signed char kind;     /* BS_ARC_TA / BS_ARC_CA / BS_ARC_FILLET / BS_ARC_HV */
     signed char sense;    /* fillet: +1 / -1 (turn sense), else 0           */
     short leg;            /* polyline leg index                              */
 } bs_arc_cell;
@@ -132,7 +195,8 @@ typedef struct {
 typedef struct {
     bs_arc_cell *cells;
     int n_cells;
-    int k_end;            /* arrival cell = first trailing cell              */
+    int k_end;            /* arrival cell = first trailing cell (tail chart)
+                           * / the hover cell = the last cell (hover chart)  */
     int n_v;              /* vertices kept                                   */
     double vx[BS_ARC_MAX_WP], vy[BS_ARC_MAX_WP];
     double chi_v[BS_ARC_MAX_WP];       /* turn angle at each vertex, deg     */
@@ -144,6 +208,9 @@ typedef struct {
                            * cell counts rounded up (v2c); 0: the family-
                            * centred rows and round() counts of the
                            * p4-current / p4-v2 / p4-v2b archives           */
+    int hover;            /* 1: no tail, the chart ends in the hover cell
+                           * (kind BS_ARC_HV) at the last waypoint (v2d);
+                           * 0: the 60 m trailing straight (v1 .. v2c)      */
 } bs_arc_chart;
 
 /* Upper bound on the cell count / block size for n_wp waypoints of total
@@ -152,17 +219,18 @@ int bs_arc_chart_cells_bound(int n_wp, double len_m);
 size_t bs_arc_chart_size(int n_wp, double len_m);
 
 /* Build the fillet chart.  `mem` holds the cells (>= bs_arc_chart_size).
- * bs_arc_chart_build builds the cell-rows chart (cell_rows = 1, the
- * configuration flown); bs_arc_chart_build_rows takes cell_rows as an
- * argument (0 = the archives' family rows and cell counts).  The cell
- * count depends on the mode, so it is a build-time choice, not a field
- * to flip afterwards.  Returns 0, or a negative code (-1 waypoints,
- * -2 memory, -3 geometry). */
+ * bs_arc_chart_build builds the configuration flown: cell_rows = 1 and
+ * hover = BS_ARC_HOVER (v2d: the chart ends in the hover cell);
+ * bs_arc_chart_build_rows takes both flags (cell_rows 0 = the archives'
+ * family rows and cell counts; hover 0 = the 60 m tail of the v1 .. v2c
+ * archives).  The cell count depends on the mode, so it is a build-time
+ * choice, not a field to flip afterwards.  Returns 0, or a negative code
+ * (-1 waypoints, -2 memory, -3 geometry, -4 hover without cell rows). */
 int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
                        void *mem, size_t mem_len, bs_arc_chart *out);
 int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
                             void *mem, size_t mem_len, bs_arc_chart *out,
-                            int cell_rows);
+                            int cell_rows, int hover);
 
 /* world position / velocity / acceleration of a quotient state in cell k */
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
@@ -193,6 +261,25 @@ typedef struct {
     int dare_n, dare_next;
     int dare_fail;
     int dare_solves;      /* DARE pairs solved (cache misses), cumulative */
+    int dare_hover;       /* terminal pairs served from the emitted hover
+                           * pair (bs_rc_arc_Ph / Kh), cumulative; never a
+                           * cache miss                                    */
+    /* D8: the on-target DARE solves of the current tick, microseconds by
+     * the driver's clock hook (0 without one); the driver copies `micros`
+     * in at the start of every tick and reads us_dare out at its end */
+    unsigned long (*micros)(void);
+    unsigned long us_dare;
+    /* v2d: the per-stage progress reward weight of the rendered horizon,
+     * w_t for the term on delta of X_{t+1}: BS_HV_W when ks[t + 1] is the
+     * hover cell, BS_SPEED_TILT_W otherwise (bs_schedule.tilt_w) */
+    double tilt_w[BS_N];
+    /* v2d: the stop state the assignment consults (arc_v2.HoverStop):
+     * gate_open / latch are the rule's state (the latch a running minimum
+     * over EVERY assign call, -1 = none); forced, t_nat, n_vtail describe
+     * the LAST bs_arc_assign call (stages forced into the hover cell, the
+     * first stage > 0 whose natural cell is >= k_end or -1, virtual-tail
+     * stages).  All zero / -1 on a tail chart. */
+    struct { int gate_open, latch, forced, t_nat, n_vtail; } hv;
 } bs_arc_sched;
 
 /* the family key of a cell: under cell_rows 2 + k for every cell; else
@@ -217,11 +304,33 @@ void bs_arc_plant(const double *xi, const double *u, double *y);
 void bs_arc_assign(const bs_arc_chart *ch, bs_arc_sched *S, int k0,
                    const double *xi0, const double *U);
 
-/* Render the schedule (margins with trust, terminal pair) after
- * bs_arc_assign.  Returns 0, or -1 if the tip family's DARE failed. */
+/* Render the schedule (margins with trust, terminal pair, the per-stage
+ * reward weights) after bs_arc_assign.  Returns 0, or -1 if the tip
+ * family's DARE failed. */
 int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust);
 
 /* ---- the driver ------------------------------------------------------ */
+/* the brake seed of record (arc_v2.brake_seed's info): written once, at
+ * the tick the gate opens with a seed; tick = -1 when none (the gate
+ * opened by the vehicle entering the hover cell, or is still closed) */
+typedef struct {
+    int tick, t_b, n_stop, rest_stage, n_cands;
+    double d_stop, v_b, a_b, dist_wp, rest_short, J, Jp, a_min;
+} bs_arc_seed;
+
+/* the stop model of a hover chart (arc_v2.stop_params, computed ONCE at
+ * engage as HoverStop.__init__ does): the last straight cell's pace v_c,
+ * its family's rear face AB (the brake deceleration of the seed search)
+ * and forward face AF, and the symmetric stop of record from v_c
+ * (brake_profile_exact: n_stop stages, distance d_stop, jerk J, peak
+ * deceleration a_max, residual speed v_residual = 0).  The Python
+ * refuses a chart without that stop (AssertionError); bs_arc_engage
+ * returns -4 on it.  valid = 1 once computed (hover chart only). */
+typedef struct {
+    int valid, n_stop;
+    double AB, AF, v_c, d_stop, J, a_max, v_residual;
+} bs_arc_stop_model;
+
 typedef struct {
     const bs_arc_chart *chart;
     bs_arc_sched *S;
@@ -254,6 +363,35 @@ typedef struct {
     /* per-tick split of the last tick, us (0 without a clock hook):
      * assignment + render (rollouts, margins, DARE), problem init, Newton */
     unsigned long us_assign, us_init, us_newton;
+    /* ---- v2d: the stop at the last waypoint (hover chart only; every
+     * field reset at engage, -1 / 0 on a tail chart) ---- */
+    int gate_open;            /* the gate of rule G0                       */
+    int latch;                /* the latch as the LAST SOLVED plan of the
+                               * tick saw it (the value of the last round's
+                               * assignment, -1 none); S->hv.latch is the
+                               * running state                             */
+    int open_tick;            /* tick index at which the gate opened, -1  */
+    double open_speed;        /* HoverStop.open_speed: the vehicle's speed
+                               * (pace + delta) at the gate tick, m/s      */
+    double open_dist;         /* HoverStop.open_dist = the seed record's
+                               * dist_vehicle: the vehicle's distance to
+                               * WP_N along the chart at the gate tick, m */
+    int arrival_tick;         /* index of the first state sample in the
+                               * hover zone, -1: the engage state (0) when
+                               * it is already in the zone (arc_v2._run
+                               * tests in_zone on sample 0), else the
+                               * post-step state kw + 1                    */
+    int settle_tick;          /* the tick whose plan first settled, -1     */
+    int settled;              /* 1 from the settle tick on                 */
+    int forced;               /* stages forced into the hover cell by the
+                               * last solved plan's assignment             */
+    int n_hv;                 /* stages (of 0..N) of the last solved plan's
+                               * schedule in the hover cell                */
+    bs_arc_seed seed;         /* the brake seed record                     */
+    bs_arc_stop_model stop;   /* the stop model of record (at engage)     */
+    unsigned us_dare;         /* D8: on-target DARE solves this tick, us
+                               * (copied from S->us_dare on EVERY chart,
+                               * tail charts included)                     */
 } bs_arc_driver;
 
 /* Bind the driver to a chart, a schedule block and a solver arena
@@ -275,14 +413,24 @@ void bs_arc_ramp_seed(const bs_arc_chart *ch, double *U);
 /* The engage: at rest on the first vertex, three unpinned fixed-point
  * rounds (assignment + full Newton, <= 300 steps, tol 1e-7) from the
  * seed U (d->seed_ramp: the ramp; else U = 0), commits the first M
- * inputs.  Returns 0 on success. */
+ * inputs.  On a hover chart the stop model of record (d->stop) is
+ * computed first.  Returns 0 on success, -1 when the engage's render
+ * failed, -4 on a hover chart without the symmetric stop of record
+ * (arc_v2.stop_params' AssertionError). */
 int bs_arc_engage(bs_arc_driver *d);
 
-/* One maintained tick, in the order of ac.run: publish (the caller lifts
- * before calling), plant step with the clock rule, shift-append, `rounds`
- * x (assign, render, pinned solve), commit stage M-1.  u0 receives the
- * applied input.  Returns 0 (ticked), 1 (arrived: k >= k_end, nothing
- * applied), or a negative code. */
+/* One maintained tick, in the order of ac.run / arc_v2._run: publish (the
+ * caller lifts before calling), plant step with the clock rule (arrival =
+ * zone entry recorded on the post-step state), shift-append, [hover
+ * chart: the gate test once, HoverStop.tick_gate], `rounds` x (assign,
+ * render, pinned solve), [hover chart: the settle predicate on the last
+ * solved plan's X0..XM], commit stage M-1.  u0 receives the applied
+ * input.  Returns
+ *    0  ticked (an input applied);
+ *    1  tail chart only: arrived, k >= k_end, nothing applied (finished);
+ *    2  hover chart only: ticked, and this is the tick at which `settled`
+ *       first became 1 (later ticks return 0 with settled staying 1);
+ *   <0  failure (-1 not engaged, -2 DARE / render, -3 solve). */
 int bs_arc_tick(bs_arc_driver *d, double *u0);
 
 /* Positions of the committed prefix's nodes (M + 1) from the current

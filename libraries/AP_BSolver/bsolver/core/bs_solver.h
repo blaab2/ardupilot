@@ -197,6 +197,14 @@ typedef struct {
      * (row[9]).  The arc layer renders every stage's margins here (the
      * cell's family with the schedule trust region applied). */
     const bs_real *mstk;
+    /* v2d: per-stage progress reward weight, [length], same clamp as the
+     * per-tick arrays; entry t weights the -w delta term on the state
+     * X_{t+1} (the term bs_problem_init_pinned / bs_eval price at stage
+     * t).  NULL = BS_SPEED_TILT_W on every stage, the arithmetic of
+     * record (bit-identical to the pre-v2d core); the arc layer sets it
+     * (bs_arc_sched.tilt_w: BS_HV_W on a stage whose next state is in the
+     * hover cell, BS_SPEED_TILT_W elsewhere). */
+    const bs_real *tilt_w;
 #endif
 #if BS_STAGE2_PACE_TAB
     /* STAGE 2 (c): the published pace per tick (m/s), same indexing and

@@ -44,6 +44,24 @@
 #define ARC_JL 0            /* input index of j_l */
 #define ARC_JC (NU - 1)     /* input index of j_c */
 
+#if !BS_ARC_HV_AVAILABLE
+/* v1 header: the hover branches are unreachable (a hover chart is refused
+ * at build, -4); placeholders so that the translation unit compiles */
+#define BS_HV_SPEED_ARC 0.0
+#define BS_HV_BAND 0.0
+#define BS_HV_EC_BAND 0.0
+#define BS_HV_W 0.0
+#define BS_HV_SEED_TOL 0.0
+#define BS_HV_GATE_MARGIN 0
+#define BS_HV_N1_MIN 0
+#define BS_HV_N1_MAX -1
+#define BS_HV_N2_MIN 0
+#define BS_HV_N2_MAX -1
+#define BS_HV_N3_MIN 0
+#define BS_HV_N3_MAX -1
+#define BS_HV_A_SETTLE 0.0
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -148,7 +166,8 @@ static struct {
 } cp;
 
 static int chart_pass(const double *vx, const double *vy, int n_v,
-                      cell_sink *s, bs_arc_chart *out, int cell_rows)
+                      cell_sink *s, bs_arc_chart *out, int cell_rows,
+                      int hover)
 {
     const double corner_pace = BS_ARC_CORNER_PACE, w = BS_ARC_W;
     const double vtrim = v_trim();
@@ -237,14 +256,23 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
     const int k_end = s->n;
     {   /* the trailing straight (trim cells): tail / n with n = round(tail
          * / (V_TRIM Ts)) = 21 under family rows, ceil(.) = 22 under cell
-         * rows */
+         * rows.  am.build_cells_fillet: th = cells[-1]['th'] (the last
+         * cell's tangent = the last leg's), p0 = V[-1]. */
         const double thx = (s->cells != NULL && s->n > 0) ? s->cells[s->n - 1].thx : tx[n_v - 2];
         const double thy = (s->cells != NULL && s->n > 0) ? s->cells[s->n - 1].thy : ty[n_v - 2];
-        const int n = straight_count(BS_ARC_TAIL, vtrim, cell_rows);
-        const double l = BS_ARC_TAIL / n;
-        for (int j = 0; j < n; ++j)
-            add_cell(s, vx[n_v - 1] + thx * (j * l), vy[n_v - 1] + thy * (j * l),
-                     thx, thy, l, BS_ARC_TA, 0.0, n_v - 2, 0.0, 0);
+        if (hover) {
+            /* v2d (tail = 0): no tail -- the chart ends in ONE hover cell
+             * at WP_N (kind BS_ARC_HV, l = 0, pace 0, chi 0, leg n_v - 2);
+             * k_end is its index (am.build_cells_fillet tail <= 0). */
+            add_cell(s, vx[n_v - 1], vy[n_v - 1], thx, thy, 0.0, BS_ARC_HV,
+                     0.0, n_v - 2, 0.0, 0);
+        } else {
+            const int n = straight_count(BS_ARC_TAIL, vtrim, cell_rows);
+            const double l = BS_ARC_TAIL / n;
+            for (int j = 0; j < n; ++j)
+                add_cell(s, vx[n_v - 1] + thx * (j * l), vy[n_v - 1] + thy * (j * l),
+                         thx, thy, l, BS_ARC_TA, 0.0, n_v - 2, 0.0, 0);
+        }
     }
     if (out != NULL) {
         out->k_end = k_end;
@@ -255,6 +283,7 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
         out->corner_pace = corner_pace;
         out->w = w;
         out->cell_rows = cell_rows;
+        out->hover = hover;
     }
     return 0;
 }
@@ -272,18 +301,22 @@ size_t bs_arc_chart_size(int n_wp, double len_m)
 
 int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
                             void *mem, size_t mem_len, bs_arc_chart *out,
-                            int cell_rows)
+                            int cell_rows, int hover)
 {
     if (n_wp < 2 || n_wp > BS_ARC_MAX_WP) return -1;
     memset(out, 0, sizeof(*out));
     for (int i = 0; i < n_wp; ++i) { out->vx[i] = vx[i]; out->vy[i] = vy[i]; }
     cell_rows = cell_rows ? 1 : 0;
+    hover = hover ? 1 : 0;
+    /* arc_v2.build_chart: the hover cell needs cell rows; and the v2d
+     * constants / emitted pair, which only the v2 header carries */
+    if (hover && (!cell_rows || !BS_ARC_HV_AVAILABLE)) return -4;
     cell_sink cnt = { NULL, 0, 0, 0 };
-    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL, cell_rows);
+    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL, cell_rows, hover);
     if (rc != 0) return rc;
     if ((size_t)cnt.n * sizeof(bs_arc_cell) > mem_len) return -2;
     cell_sink fill = { (bs_arc_cell *)mem, 0, cnt.n, 0 };
-    rc = chart_pass(vx, vy, n_wp, &fill, out, cell_rows);
+    rc = chart_pass(vx, vy, n_wp, &fill, out, cell_rows, hover);
     if (rc != 0) return rc;
     if (fill.overflow || fill.n != cnt.n) return -2;
     out->cells = (bs_arc_cell *)mem;
@@ -293,7 +326,8 @@ int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
 int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
                        void *mem, size_t mem_len, bs_arc_chart *out)
 {
-    return bs_arc_chart_build_rows(vx, vy, n_wp, mem, mem_len, out, 1);
+    return bs_arc_chart_build_rows(vx, vy, n_wp, mem, mem_len, out, 1,
+                                   BS_ARC_HV_AVAILABLE ? BS_ARC_HOVER : 0);
 }
 
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
@@ -369,13 +403,21 @@ void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
 {
     const bs_arc_cell *c = &ch->cells[k];
     const double pace = row_pace(ch, c);
-    const double VLEG = ch->v_leg;
+    /* arc_v2.rows_corner_m(r_disc): VLEG on every moving cell, the hover
+     * disc BS_HV_SPEED_ARC on the hover cell (pace 0: all 20 margins) */
+    const double VLEG = (c->kind == BS_ARC_HV) ? BS_HV_SPEED_ARC : ch->v_leg;
     for (int a = 0; a < 20; ++a) {
         const double th = rad_of(18.0 * a);
         m[2 * a] = VLEG - pace * cos(th);
-        /* the acceleration faces stay by cell KIND in both row modes */
+        /* the acceleration faces stay by cell KIND in both row modes
+         * (the hover cell: the isotropic tier, D4) */
         m[2 * a + 1] = (c->kind == BS_ARC_TA) ? bs_rc_aniso[a] : BS_ARC_ACCC;
     }
+    if (c->kind == BS_ARC_HV) {
+        /* arc_v2.hover_rows: +-e_l at BAND_H, +-e_c at EC_BAND_H (D3) */
+        m[40] = BS_HV_BAND; m[44] = BS_HV_BAND;
+        m[41] = BS_HV_EC_BAND; m[45] = BS_HV_EC_BAND;
+    } else {
     m[40] = BS_ARC_BAND; m[44] = BS_ARC_BAND;
     if (c->kind == BS_ARC_FILLET) {
         /* am.fillet_rows: s e_c <= max(w - d_in, 0.05), -s e_c <= w + d_in */
@@ -386,6 +428,7 @@ void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
         else              { m[41] = outm; m[45] = in; }
     } else {
         m[41] = ch->w; m[45] = ch->w;
+    }
     }
     m[42] = BS_JBOX; m[43] = BS_JBOX; m[46] = BS_JBOX; m[47] = BS_JBOX;
 #if NU == 3
@@ -455,6 +498,19 @@ static int arc_dare(const double *rows, const double *m, double *P6,
 static int terminal_pair(const bs_arc_chart *ch, bs_arc_sched *S, int k,
                          double *P6, double *K36)
 {
+    if (ch->cells[k].kind == BS_ARC_HV) {
+        /* D7: the hover family's pair is mission-independent and emitted
+         * by gen_runtime_const.py --v2 (arc_v2.dare_pair(hover_rows()));
+         * never solved on target, never a cache miss */
+#if BS_ARC_HV_AVAILABLE
+        memcpy(P6, bs_rc_arc_Ph, sizeof(double) * 36);
+        memcpy(K36, bs_rc_arc_Kh, sizeof(double) * NU * NX);
+        S->dare_hover++;
+        return 0;
+#else
+        return -1;                     /* the v1 header carries no v2d pair */
+#endif
+    }
     const int key = bs_arc_fam_key(ch, k);
     for (int i = 0; i < S->dare_n; ++i) {
         if (S->dare[i].key == key) {
@@ -466,7 +522,12 @@ static int terminal_pair(const bs_arc_chart *ch, bs_arc_sched *S, int k,
     double m[NR];
     bs_arc_margins(ch, k, m);
     S->dare_solves++;
-    if (arc_dare(S->rows, m, P6, K36) != 0) { S->dare_fail++; return -1; }
+    {   /* D8: the on-target solve, timed by the driver's clock hook */
+        const unsigned long t0 = S->micros ? S->micros() : 0UL;
+        const int rc = arc_dare(S->rows, m, P6, K36);
+        if (S->micros) S->us_dare += S->micros() - t0;
+        if (rc != 0) { S->dare_fail++; return -1; }
+    }
     const int slot = (S->dare_n < BS_ARC_DARE_CACHE) ? S->dare_n++ : S->dare_next;
     S->dare_next = (slot + 1) % BS_ARC_DARE_CACHE;
     /* family rows: the two straight families (the first two pairs solved)
@@ -543,15 +604,19 @@ static void mat6_vec(const double *a, const double *x, double *y)
 }
 
 /* ac.transition: given the raw stepped state y (e_l relative to cell k+1's
- * start), hold or advance through every crossed boundary. */
-int bs_arc_transition(const bs_arc_chart *ch, int k, const double *y,
-                      double *T, double *c)
+ * start), hold or advance through every crossed boundary.  `n_cells` is
+ * the chart length the rule sees: ch->n_cells (the vehicle, the natural
+ * rollout), or k_end on a hover chart with the gate closed (arc_v2.
+ * HoverStop.assign's `trunc = cells[:k_end]`: the hover cell is not
+ * assignable, the last straight cell holds at the chart's end). */
+static int transition_n(const bs_arc_chart *ch, int n_cells, int k,
+                        const double *y, double *T, double *c)
 {
     double Tl[NX * NX], cl[NX];
     for (int i = 0; i < NX * NX; ++i) Tl[i] = (i % (NX + 1) == 0) ? 1.0 : 0.0;
     for (int i = 0; i < NX; ++i) cl[i] = 0.0;
     const double pace_k = ch->cells[k].l / BS_TS;
-    if (k + 1 >= ch->n_cells || !crossed(ch, k + 1, y, pace_k)) {
+    if (k + 1 >= n_cells || !crossed(ch, k + 1, y, pace_k)) {
         cl[2] = ch->cells[k].l;                         /* HOLD */
         if (T) memcpy(T, Tl, sizeof(Tl));
         if (c) memcpy(c, cl, sizeof(cl));
@@ -585,7 +650,7 @@ int bs_arc_transition(const bs_arc_chart *ch, int k, const double *y,
         double st2[NX];
         memcpy(st2, state, sizeof(st2));
         st2[2] -= cn->l;
-        if (kn + 1 < ch->n_cells && crossed(ch, kn + 1, st2, pace_new)) {
+        if (kn + 1 < n_cells && crossed(ch, kn + 1, st2, pace_new)) {
             cl[2] -= cn->l;                    /* re-base onto cell kn+1 */
             state[2] -= cn->l;
             kn += 1;
@@ -596,6 +661,327 @@ int bs_arc_transition(const bs_arc_chart *ch, int k, const double *y,
     if (T) memcpy(T, Tl, sizeof(Tl));
     if (c) memcpy(c, cl, sizeof(cl));
     return kn;
+}
+
+int bs_arc_transition(const bs_arc_chart *ch, int k, const double *y,
+                      double *T, double *c)
+{
+    return transition_n(ch, ch->n_cells, k, y, T, c);
+}
+
+/* ------------------------------------------ v2d: the stop at WP_N */
+
+/* arc_v2.force_to_end: the forced transition of a latched stage -- from
+ * cell k through every remaining cell into the hover cell (rotations
+ * and offsets applied, each intermediate cell's length subtracted), so
+ * the returned e_l is the signed shortfall to WP_N in the hover frame. */
+static int force_to_end(const bs_arc_chart *ch, int k, const double *y,
+                        double *T, double *c)
+{
+    double Tl[NX * NX], cl[NX], state[NX];
+    for (int i = 0; i < NX * NX; ++i) Tl[i] = (i % (NX + 1) == 0) ? 1.0 : 0.0;
+    for (int i = 0; i < NX; ++i) cl[i] = 0.0;
+    memcpy(state, y, sizeof(state));
+    const int k_end = ch->n_cells - 1;
+    int kn = k;
+    while (kn < k_end) {
+        kn += 1;
+        const bs_arc_cell *cn = &ch->cells[kn];
+        const double chi = cn->chi;
+        const double pace_old = ch->cells[kn - 1].l / BS_TS;
+        const double pace_new = cn->l / BS_TS;
+        double ck[NX] = { 0, 0, 0, 0, 0, 0 };
+        {   /* so.off_vec */
+            const double ca = cos(rad_of(chi)), sa = sin(rad_of(chi));
+            ck[0] = pace_old * ca - pace_new;
+            ck[4] = -pace_old * sa;
+        }
+        if (fabs(chi) > 0.0) {
+            double Tk[NX * NX], tmp[NX * NX], tv[NX];
+            t_switch(chi, Tk);
+            mat6_mul(Tk, Tl, tmp); memcpy(Tl, tmp, sizeof(Tl));
+            mat6_vec(Tk, cl, tv);
+            for (int i = 0; i < NX; ++i) cl[i] = tv[i] + ck[i];
+            mat6_vec(Tk, state, tv);
+            for (int i = 0; i < NX; ++i) state[i] = tv[i] + ck[i];
+        } else {
+            for (int i = 0; i < NX; ++i) { cl[i] += ck[i]; state[i] += ck[i]; }
+        }
+        if (kn < k_end) {
+            cl[2] -= cn->l;
+            state[2] -= cn->l;
+        }
+    }
+    if (T) memcpy(T, Tl, sizeof(Tl));
+    if (c) memcpy(c, cl, sizeof(cl));
+    return kn;
+}
+
+/* arc_v2.hover_frame: (e_l, e_c) of a state in the hover cell's frame
+ * (frame point WP_N, pace 0, the last leg's tangent): the state itself
+ * in the hover cell, shifted by the last straight cell's length one cell
+ * before it, none further back.  Returns 0 when the frame is undefined. */
+static int hover_frame(const bs_arc_chart *ch, int k, const double *xi,
+                       double *el, double *ec)
+{
+    const int k_end = ch->n_cells - 1;
+    if (k >= k_end) { *el = xi[2]; *ec = xi[3]; return 1; }
+    if (k == k_end - 1) { *el = xi[2] - ch->cells[k].l; *ec = xi[3]; return 1; }
+    return 0;
+}
+
+/* arc_v2.in_zone: arrival -- e_l >= -BAND_H in the hover frame */
+static int in_zone(const bs_arc_chart *ch, int k, const double *xi)
+{
+    double el, ec;
+    return hover_frame(ch, k, xi, &el, &ec) && el >= -BS_HV_BAND;
+}
+
+/* arc_v2.in_box: the settle predicate -- speed <= R_H, |e_l| <= BAND_H
+ * and |e_c| <= BAND_H in the hover frame, |a| <= A_SETTLE */
+static int in_box(const bs_arc_chart *ch, int k, const double *xi)
+{
+    double el, ec;
+    if (!hover_frame(ch, k, xi, &el, &ec)) return 0;
+    const double speed = hypot(ch->cells[k].l / BS_TS + xi[0], xi[4]);
+    const double acc = hypot(xi[1], xi[5]);
+    return speed <= BS_HV_SPEED_ARC && fabs(el) <= BS_HV_BAND
+           && fabs(ec) <= BS_HV_BAND && acc <= BS_HV_A_SETTLE;
+}
+
+/* arc_v2.dist_to_go / brake_seed::dist_to_wp: the distance along the
+ * chart from a state in cell k0 to WP_N (negative past it); the cell
+ * lengths summed in chart order from k0 as the Python's sum() does. */
+static double dist_to_go(const bs_arc_chart *ch, int k0, const double *xi0)
+{
+    const int k_end = ch->n_cells - 1;
+    if (k0 >= k_end) return -xi0[2];
+    double sum = 0.0;
+    for (int c = k0; c < k_end; ++c) sum += ch->cells[c].l;
+    return sum - xi0[2];
+}
+
+/* arc_v2.stop_profile::integrate, the ZOH integration in the Python's
+ * operation order; returns v_final, a_final, the distance and the
+ * minima, and writes js[0..n1+n2+n3-1].  Jp from a_final = 0. */
+static void stop_integrate(double v0, double a0, int n1, int n2, int n3,
+                           double J, double *js, double *x_out,
+                           double *v_out, double *a_out, double *Jp_out,
+                           double *amin_out, double *vmin_out)
+{
+    const double Ts = BS_TS;
+    const double Ts3 = Ts * Ts * Ts;          /* Ts ** 3, exact (a power of two) */
+    const double Jp = (J * n1 * Ts - a0) / (n3 * Ts);
+    const int n = n1 + n2 + n3;
+    for (int i = 0; i < n1; ++i) js[i] = -J;
+    for (int i = n1; i < n1 + n2; ++i) js[i] = 0.0;
+    for (int i = n1 + n2; i < n; ++i) js[i] = Jp;
+    double v = v0, a = a0, x = 0.0, amin = a, vmin = v;
+    for (int i = 0; i < n; ++i) {
+        const double j = js[i];
+        x += v * Ts + 0.5 * a * Ts * Ts + j * Ts3 / 6;
+        v += a * Ts + 0.5 * j * Ts * Ts; a += j * Ts;
+        if (a < amin) amin = a;
+        if (v < vmin) vmin = v;
+    }
+    *x_out = x; *v_out = v; *a_out = a; *Jp_out = Jp;
+    *amin_out = amin; *vmin_out = vmin;
+}
+
+/* arc_v2.stop_profile: js = [-J] n1 + [0] n2 + [+Jp] n3 from (v0, a0) to
+ * EXACT rest on the Ts grid -- Jp fixed by a_final = 0, J by v_final = 0
+ * (v_final affine in J: J = -vA / (vB - vA) from the integrations at
+ * J = 0 and J = 1).  Returns 0 when infeasible (J <= 0, J > JB, |Jp| >
+ * JB, a below -AB, v reversing, rest inexact), else 1 with js, d_stop
+ * (x), n_stop, J, Jp, a_min. */
+static int stop_profile(double v0, double a0, double AB, double JB,
+                        int n1, int n2, int n3, double *js, double *d,
+                        int *n_stop, double *J_out, double *Jp_out,
+                        double *amin_out)
+{
+    double x, vA, vB, a, Jp, amin, vmin;
+    stop_integrate(v0, a0, n1, n2, n3, 0.0, js, &x, &vA, &a, &Jp, &amin, &vmin);
+    stop_integrate(v0, a0, n1, n2, n3, 1.0, js, &x, &vB, &a, &Jp, &amin, &vmin);
+    if (fabs(vB - vA) < 1e-12) return 0;
+    const double J = -vA / (vB - vA);
+    double vf, af;
+    stop_integrate(v0, a0, n1, n2, n3, J, js, &x, &vf, &af, &Jp, &amin, &vmin);
+    if (J <= 0.0 || J > JB + 1e-9 || fabs(Jp) > JB + 1e-9 || amin < -AB - 1e-9
+        || vmin < -1e-6 || fabs(vf) > 1e-9 || fabs(af) > 1e-9)
+        return 0;
+    *d = x; *n_stop = n1 + n2 + n3; *J_out = J; *Jp_out = Jp; *amin_out = amin;
+    return 1;
+}
+
+/* arc_v2.plan_states: the natural-clock rollout of U from (k, xi) --
+ * transition() on the full chart, the hover cell assignable -- cells
+ * ks[0..N] and states xs[0..N]. */
+static void plan_states(const bs_arc_chart *ch, int k, const double *xi,
+                        const double *U, int *ks, double *xs)
+{
+    double x[NX], y[NX], T[NX * NX], c[NX], xn[NX];
+    memcpy(x, xi, sizeof(x));
+    ks[0] = k;
+    memcpy(&xs[0], xi, sizeof(x));
+    int kk = k;
+    for (int t = 0; t < NN; ++t) {
+        bs_arc_plant(x, &U[NU * t], y);
+        kk = bs_arc_transition(ch, kk, y, T, c);
+        mat6_vec(T, y, xn);
+        for (int i = 0; i < NX; ++i) x[i] = xn[i] + c[i];
+        ks[t + 1] = kk;
+        memcpy(&xs[(size_t)(t + 1) * NX], x, sizeof(x));
+    }
+}
+
+/* the (-t, |short|, t, js, d, n, short, J, Jp, a_min, ...) tuple order
+ * of arc_v2.brake_seed's min(cands): returns 1 when candidate a sorts
+ * strictly before b (the same t on both: the loop keeps the FIRST of
+ * equal candidates, as Python's min does) */
+static int cand_before(int t_a, const double *js_a, int n_a, double d_a,
+                       double short_a, double J_a, double Jp_a, double amin_a,
+                       int t_b, const double *js_b, int n_b, double d_b,
+                       double short_b, double J_b, double Jp_b, double amin_b)
+{
+    if (t_a != t_b) return t_a > t_b;                          /* -t ascending */
+    const double sa = fabs(short_a), sb = fabs(short_b);
+    if (sa != sb) return sa < sb;
+    {   /* js: list comparison, lexicographic then by length */
+        const int n = (n_a < n_b) ? n_a : n_b;
+        for (int i = 0; i < n; ++i)
+            if (js_a[i] != js_b[i]) return js_a[i] < js_b[i];
+        if (n_a != n_b) return n_a < n_b;
+    }
+    if (d_a != d_b) return d_a < d_b;
+    if (short_a != short_b) return short_a < short_b;
+    if (J_a != J_b) return J_a < J_b;
+    if (Jp_a != Jp_b) return Jp_a < Jp_b;
+    if (amin_a != amin_b) return amin_a < amin_b;
+    return 0;
+}
+
+/* arc_v2.brake_seed: the G0 seed search on the natural rollout of U
+ * from (k, xi).  Returns 1 and overwrites U's j_l from t_b with the stop
+ * (the seed record in *sd) when a stop rests within BS_HV_SEED_TOL of
+ * WP_N by stage N - BS_HV_GATE_MARGIN from a stage t_b >= M; 0 (U
+ * untouched) otherwise.  The scratch is static: 31 x 6 doubles + the
+ * candidate profiles, off the 8 kB solver-thread stack. */
+#if BS_HV_GATE_MARGIN < 0
+#error "BS_HV_GATE_MARGIN < 0: the seed search's stage bound t + n <= N - margin no longer keeps the profile inside U (the Python raises IndexError there)"
+#endif
+/* the longest profile the stage ranges admit (13 + 10 + 9 = 32 > N): the
+ * break at t + n1 + n2 + n3 > N - margin, with t >= M and margin >= 0
+ * (checked above), keeps every profile that is integrated within N - M
+ * stages, but the scratch is sized for the ranges themselves */
+#define BS_HV_STAGES_MAX ((BS_HV_N1_MAX + BS_HV_N2_MAX + BS_HV_N3_MAX) > NN \
+                          ? (BS_HV_N1_MAX + BS_HV_N2_MAX + BS_HV_N3_MAX) : NN)
+static struct {
+    int ks[NN + 1];
+    double xs[(NN + 1) * NX];
+    double js[BS_HV_STAGES_MAX], js_best[BS_HV_STAGES_MAX];
+} bsd;
+
+static int brake_seed(const bs_arc_chart *ch, int k, const double *xi,
+                      double *U, double AB, int margin, bs_arc_seed *sd)
+{
+    const int M = MM;
+    int *const ks = bsd.ks;
+    double *const xs = bsd.xs;
+    plan_states(ch, k, xi, U, ks, xs);
+#define DIST_TO_WP(t) dist_to_go(ch, ks[t], &xs[(size_t)(t) * NX])
+    if (DIST_TO_WP(NN) > 0.0) return 0;      /* the tip is short of WP_N */
+    int have = 0, n_cands = 0;
+    int b_t = 0, b_n = 0;
+    double b_d = 0, b_short = 0, b_J = 0, b_Jp = 0, b_amin = 0, b_v = 0, b_a = 0, b_dw = 0;
+    for (int t = NN - 1; t >= M; --t) {
+        const double *xt = &xs[(size_t)t * NX];
+        const double v_t = ch->cells[ks[t]].l / BS_TS + xt[0];
+        const double a_t = xt[1];
+        if (v_t <= 0.3) continue;
+        const double dw = DIST_TO_WP(t);
+        if (dw <= 0.0) continue;
+        for (int n1 = BS_HV_N1_MIN; n1 <= BS_HV_N1_MAX; ++n1) {
+            for (int n3 = BS_HV_N3_MIN; n3 <= BS_HV_N3_MAX; ++n3) {
+                for (int n2 = BS_HV_N2_MIN; n2 <= BS_HV_N2_MAX; ++n2) {
+                    if (t + n1 + n2 + n3 > NN - margin) break;
+                    double d, J, Jp, amin;
+                    int n;
+                    if (!stop_profile(v_t, a_t, AB, BS_JBOX, n1, n2, n3, bsd.js,
+                                      &d, &n, &J, &Jp, &amin))
+                        continue;
+                    const double shrt = dw - d;
+                    if (fabs(shrt) <= BS_HV_SEED_TOL) {
+                        n_cands++;
+                        if (!have || cand_before(t, bsd.js, n, d, shrt, J, Jp, amin,
+                                                 b_t, bsd.js_best, b_n, b_d, b_short,
+                                                 b_J, b_Jp, b_amin)) {
+                            have = 1;
+                            b_t = t; b_n = n; b_d = d; b_short = shrt; b_J = J;
+                            b_Jp = Jp; b_amin = amin; b_v = v_t; b_a = a_t; b_dw = dw;
+                            memcpy(bsd.js_best, bsd.js, sizeof(double) * (size_t)n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#undef DIST_TO_WP
+    if (!have) return 0;
+    for (int i = 0; i < b_n; ++i) U[NU * (b_t + i) + ARC_JL] = bsd.js_best[i];
+    sd->t_b = b_t; sd->n_stop = b_n; sd->rest_stage = b_t + b_n;
+    sd->d_stop = b_d; sd->v_b = b_v; sd->a_b = b_a; sd->dist_wp = b_dw;
+    sd->rest_short = b_short; sd->J = b_J; sd->Jp = b_Jp; sd->a_min = b_amin;
+    sd->n_cands = n_cands;
+    return 1;
+}
+
+/* arc_v2.brake_profile_exact: the symmetric stop of record from (v0, a0 =
+ * 0): n1 = round(AB / JB / Ts) stages at -J (Python's round = half to
+ * even = rint under the default rounding mode), the smallest n2 with J <=
+ * JB at 0, n1 at +J, through stop_profile.  Returns 1 with d_stop, n_stop,
+ * J, a_max (= -a_min) and v_residual (0 by stop_profile's exact rest), 0
+ * when no such stop exists or its profile exceeds the scratch (2 n1 + n2
+ * > BS_HV_STOP_MAX stages, a pace beyond 70 m/s at the record's faces;
+ * the Python has no such cap -- both refuse the chart). */
+#define BS_HV_STOP_MAX 64
+static int brake_profile_exact(double v0, double a0, double AB, double JB,
+                               double *d_stop, int *n_stop, double *J,
+                               double *a_max, double *v_res)
+{
+    const double Ts = BS_TS;
+    int n1 = (int)rint(AB / JB / Ts);
+    if (n1 < 1) n1 = 1;
+    int n2 = (int)ceil(v0 / (JB * n1 * Ts * Ts) - n1 - 1e-9);
+    if (n2 < 0) n2 = 0;
+    if (2 * n1 + n2 > BS_HV_STOP_MAX) return 0;
+    double js[BS_HV_STOP_MAX], Jp, amin;
+    if (!stop_profile(v0, a0, AB, JB, n1, n2, n1, js, d_stop, n_stop, J, &Jp, &amin))
+        return 0;
+    *a_max = -amin; *v_res = 0.0;
+    return 1;
+}
+
+/* arc_v2.stop_params (HoverStop.__init__): the stop model of a hover
+ * chart -- the last straight cell's pace v_c, its family's rear face AB
+ * (arc_v2.rear_face: the acceleration row at raster index 10, template
+ * row 21; 5.609 on a trim cell, 5.66 on a corner-pace one) and forward
+ * face AF (forward_face: raster index 0, template row 1), and the
+ * symmetric stop of record from v_c.  Returns 0 when that stop does not
+ * exist (the Python's AssertionError). */
+static int stop_params(const bs_arc_chart *ch, bs_arc_stop_model *sm)
+{
+    const int k_end = ch->n_cells - 1;
+    double m[NR];
+    memset(sm, 0, sizeof(*sm));
+    bs_arc_margins(ch, k_end - 1, m);
+    sm->AB = m[2 * 10 + 1];
+    sm->AF = m[1];
+    sm->v_c = ch->cells[k_end - 1].l / BS_TS;
+    if (!brake_profile_exact(sm->v_c, 0.0, sm->AB, BS_JBOX, &sm->d_stop, &sm->n_stop,
+                             &sm->J, &sm->a_max, &sm->v_residual))
+        return 0;
+    sm->valid = 1;
+    return 1;
 }
 
 /* ------------------------------------------------------- the schedule */
@@ -631,9 +1017,34 @@ void bs_arc_assign(const bs_arc_chart *ch, bs_arc_sched *S, int k0,
     for (int i = 0; i < NX; ++i) S->off[i] = 0.0;
     S->n_rot = 1; S->n_off = 1;
     S->family[0] = 0; S->rotation[0] = 0; S->offset[0] = 0;
+    /* v2d (arc_v2.HoverStop.assign): gate closed -> the virtual tail on
+     * the chart without the hover cell; gate open -> the natural
+     * transition with every stage >= latch short of the hover cell
+     * forced into it.  A tail chart takes neither branch. */
+    const int k_end = ch->n_cells - 1;
+    const int vtail = ch->hover && !S->hv.gate_open && k0 < k_end;
+    const int gated = ch->hover && !vtail;
+    const int t_from = S->hv.latch;            /* -1: none */
+    int forced = 0, n_vt = 0;
     for (int t = 0; t < NN; ++t) {
         bs_arc_plant(xi, &U[NU * t], y);
-        const int kn = bs_arc_transition(ch, k, y, T, c);
+        int kn;
+        if (vtail) {
+            if (k == k_end - 1 && y[2] >= 0.0) {
+                /* the last straight cell repeats beyond WP_N: T = I, c = 0 */
+                for (int i = 0; i < NX * NX; ++i) T[i] = (i % (NX + 1) == 0) ? 1.0 : 0.0;
+                for (int i = 0; i < NX; ++i) c[i] = 0.0;
+                kn = k_end - 1; n_vt++;
+            } else {
+                kn = transition_n(ch, k_end, k, y, T, c);
+            }
+        } else {
+            kn = bs_arc_transition(ch, k, y, T, c);
+            if (gated && kn < k_end && t_from >= 0 && (t + 1) >= t_from) {
+                kn = force_to_end(ch, k, y, T, c);
+                forced++;
+            }
+        }
         double xn[NX];
         mat6_vec(T, y, xn);
         for (int i = 0; i < NX; ++i) xi[i] = xn[i] + c[i];
@@ -652,6 +1063,18 @@ void bs_arc_assign(const bs_arc_chart *ch, bs_arc_sched *S, int k0,
         S->els[t + 1] = xi[2];
     }
     memcpy(S->xiN, xi, sizeof(xi));
+    if (ch->hover) {
+        /* the latch moves earlier on natural entry (the first stage > 0
+         * whose cell is >= k_end), never later */
+        int t_first = -1;
+        if (!vtail) {
+            for (int t = 0; t <= NN; ++t)
+                if (S->ks[t] >= k_end) { t_first = t; break; }
+            if (t_first > 0 && (S->hv.latch < 0 || t_first < S->hv.latch))
+                S->hv.latch = t_first;
+        }
+        S->hv.forced = forced; S->hv.t_nat = t_first; S->hv.n_vtail = n_vt;
+    }
 }
 
 int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust)
@@ -665,6 +1088,12 @@ int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust)
         if (dn < m[44]) m[44] = dn;
     }
     if (terminal_pair(ch, S, S->ks[NN], S->P, S->K) != 0) return -1;
+    /* v2d (arc_v2.TiltedHorizon): w_t by the family of X_{t+1} -- BS_HV_W
+     * on the hover cell, BS_SPEED_TILT_W elsewhere.  On a tail chart every
+     * entry is BS_SPEED_TILT_W and the core's product is the same. */
+    for (int t = 0; t < NN; ++t)
+        S->tilt_w[t] = (ch->hover && S->ks[t + 1] >= ch->n_cells - 1)
+                       ? (double)BS_HV_W : (double)BS_SPEED_TILT_W;
     bs_schedule *sc = &S->sched;
     memset(sc, 0, sizeof(*sc));
     sc->family = S->family;
@@ -680,6 +1109,7 @@ int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust)
     sc->ring_mask = 0;
 #if BS_ARC
     sc->mstk = S->mstk;
+    sc->tilt_w = S->tilt_w;
 #endif
     return 0;
 }
@@ -701,6 +1131,9 @@ void bs_arc_driver_init(bs_arc_driver *d, const bs_arc_chart *ch,
     d->seed_ramp = 1;                         /* v2b: the ramp seed */
     memset(S, 0, sizeof(*S));
     template_rows(S->rows);
+    S->hv.latch = -1; S->hv.t_nat = -1;        /* no latch before engage */
+    d->latch = -1; d->open_tick = -1; d->arrival_tick = -1; d->settle_tick = -1;
+    d->seed.tick = d->seed.t_b = d->seed.n_stop = d->seed.rest_stage = -1;
 }
 
 /* doc section 8, the ramp verbatim: JB = BS_JBOX, AF = the forward face
@@ -750,13 +1183,39 @@ static int solve_pinned(bs_arc_driver *d, int npin, int q,
     return 0;
 }
 
+/* reset the stop state (driver and schedule) -- at engage */
+static void stop_reset(bs_arc_driver *d)
+{
+    bs_arc_sched *S = d->S;
+    S->hv.gate_open = 0; S->hv.latch = -1;
+    S->hv.forced = 0; S->hv.t_nat = -1; S->hv.n_vtail = 0;
+    S->us_dare = 0; S->micros = d->micros;
+    d->gate_open = 0; d->latch = -1; d->open_tick = -1;
+    d->open_speed = 0.0; d->open_dist = 0.0;
+    d->arrival_tick = -1; d->settle_tick = -1; d->settled = 0;
+    d->forced = 0; d->n_hv = 0; d->us_dare = 0;
+    memset(&d->seed, 0, sizeof(d->seed));
+    d->seed.tick = -1; d->seed.t_b = -1; d->seed.n_stop = -1; d->seed.rest_stage = -1;
+    memset(&d->stop, 0, sizeof(d->stop));
+}
+
 int bs_arc_engage(bs_arc_driver *d)
 {
     const bs_arc_chart *ch = d->chart;
     d->k = 0;
     d->kw = 0;
+    stop_reset(d);
+    /* v2d: the stop model of record, once (HoverStop.__init__ ->
+     * stop_params); a hover chart without the symmetric stop from the
+     * last straight cell's pace is refused as the Python refuses it */
+    if (ch->hover && !stop_params(ch, &d->stop)) return -4;
     memset(d->xi, 0, sizeof(d->xi));
     d->xi[0] = -(ch->cells[0].l / BS_TS);          /* at rest on vertex 0 */
+    /* v2d: arc_v2._run tests in_zone on EVERY state sample, the engage
+     * state (sample 0) included -- a chart whose first cell is the last
+     * straight cell (two waypoints closer than BS_HV_BAND) arrives at
+     * tick 0; the settle cap then counts from 0 */
+    if (ch->hover && in_zone(ch, d->k, d->xi)) d->arrival_tick = 0;
     if (d->seed_ramp) bs_arc_ramp_seed(ch, d->U);  /* v2b */
     else memset(d->U, 0, sizeof(d->U));            /* the archives' U = 0 */
     d->seed_iters = 0;
@@ -817,12 +1276,67 @@ int bs_arc_engage(bs_arc_driver *d)
     return 0;
 }
 
+/* arc_v2.HoverStop.tick_gate: once per tick after the shift-append and
+ * before the rounds.  The gate opens at the first tick a brake seed
+ * exists (or the vehicle is in the hover cell); the seed is written into
+ * U and the latch set to its rest stage.  `tick` = the Python's
+ * stop.tick (kw + 1). */
+static void tick_gate(bs_arc_driver *d, int tick)
+{
+    const bs_arc_chart *ch = d->chart;
+    bs_arc_sched *S = d->S;
+    const int k_end = ch->n_cells - 1;
+    if (S->hv.gate_open) return;
+    /* HoverStop.open_dist / open_speed: the vehicle's distance to WP_N
+     * along the chart and its speed at the tick the gate opens (the seed
+     * record's dist_vehicle) */
+    const double open_dist = dist_to_go(ch, d->k, d->xi);
+    const double open_speed = ch->cells[d->k].l / BS_TS + d->xi[0];
+    if (d->k >= k_end) {
+        S->hv.gate_open = 1; d->open_tick = tick;
+        d->open_dist = open_dist; d->open_speed = open_speed;
+        return;
+    }
+    /* AB = the last straight family's rear acceleration face, from the
+     * stop model computed at engage (HoverStop.tick_gate passes
+     * self.params['AB']; 5.609 on a trim cell) */
+    const double AB = d->stop.AB;
+    bs_arc_seed sd;
+    memset(&sd, 0, sizeof(sd));
+    if (!brake_seed(ch, d->k, d->xi, d->U, AB, BS_HV_GATE_MARGIN, &sd)) return;
+    S->hv.gate_open = 1; d->open_tick = tick;
+    d->open_dist = open_dist; d->open_speed = open_speed;
+    sd.tick = tick;
+    d->seed = sd;
+    S->hv.latch = (sd.rest_stage < NN) ? sd.rest_stage : NN;
+}
+
+/* the settle predicate (arc_v2.HoverStop.prefix_settled) on the plan
+ * just solved: X0..XM over the schedule's (ks, T, c) all in the box */
+static int prefix_settled(const bs_arc_chart *ch, const bs_arc_sched *S,
+                          const double *xi0, const double *U)
+{
+    double x[NX], y[NX], xn[NX];
+    memcpy(x, xi0, sizeof(x));
+    if (!in_box(ch, S->ks[0], x)) return 0;
+    for (int t = 0; t < MM; ++t) {
+        bs_arc_plant(x, &U[NU * t], y);
+        const double *T = &S->rot[(size_t)S->rotation[t + 1] * NX * NX];
+        const double *c = &S->off[(size_t)S->offset[t + 1] * NX];
+        mat6_vec(T, y, xn);
+        for (int i = 0; i < NX; ++i) x[i] = xn[i] + c[i];
+        if (!in_box(ch, S->ks[t + 1], x)) return 0;
+    }
+    return 1;
+}
+
 int bs_arc_tick(bs_arc_driver *d, double *u0)
 {
     const bs_arc_chart *ch = d->chart;
     bs_arc_sched *S = d->S;
     if (!d->engaged) return -1;
-    if (d->k >= ch->k_end) { d->finished = 1; return 1; }
+    if (!ch->hover && d->k >= ch->k_end) { d->finished = 1; return 1; }
+    S->us_dare = 0; S->micros = d->micros;
     /* replay the committed prefix (an identity on the pinned path) */
     memcpy(d->U, d->committed, sizeof(double) * NU * MM);
     memcpy(u0, d->U, sizeof(double) * NU);
@@ -853,6 +1367,15 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
         if (kn == d->k) d->holds++;
         if (kn > d->k + 1) d->skips++;
         d->k = kn;
+        /* v2d: arrival = zone entry, on the post-step state (its index is
+         * kw + 1 = the Python's arrival tick).  arc_v2._run tests in_zone
+         * at the top of the NEXT loop iteration, so the sample its last
+         * iteration produces (index max_ticks) is never tested there,
+         * while it is tested here; a run whose first zone entry is that
+         * sample fails in both (no settle), differing only in the
+         * recorded arrival -- no archive run comes near it. */
+        if (ch->hover && d->arrival_tick < 0 && in_zone(ch, d->k, d->xi))
+            d->arrival_tick = d->kw + 1;
     }
     /* warm start: shift + terminal law of the previous assignment's tip
      * (ac.run: assign from the PRE-step state along the final plan) */
@@ -870,6 +1393,8 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
         }
         memcpy(d->U, Us, sizeof(Us));
     }
+    /* v2d: the gate test, once, after the shift-append and before the rounds */
+    if (ch->hover) tick_gate(d, d->kw + 1);
     /* rounds: assignment from the iterate, pinned solve */
     d->reassign = 0;
     d->bt = d->armijo_fail = d->no_step = d->factor_fail = 0;
@@ -885,6 +1410,14 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
         have_prev = 1;
         if (bs_arc_render(ch, S, d->trust) != 0) return -2;
         d->us_assign += clock_us(d) - ta;
+        if (ch->hover && r == d->rounds - 1) {
+            /* the stop state as the last solved plan sees it (the archive's
+             * solve_latch_stage / solve_forced_stages of the last round) */
+            d->latch = S->hv.latch; d->forced = S->hv.forced;
+            int n_hv = 0;
+            for (int t = 0; t <= NN; ++t) if (S->ks[t] >= ch->n_cells - 1) n_hv++;
+            d->n_hv = n_hv;
+        }
         bs_newton_stats st = {0, 0, 0, 0};
         double lam = 0.0;
         if (solve_pinned(d, MM, d->q, &st, &lam) != 0) return -3;
@@ -893,6 +1426,13 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
         d->armijo_fail += st.armijo_fail;
         d->no_step += st.no_step;
         d->factor_fail += st.factor_fail;
+    }
+    /* v2d: the settle predicate on the last solved plan (before the
+     * consistency re-assignment below rewrites the schedule slots) */
+    int settled_now = 0;
+    if (ch->hover && !d->settled && d->rounds > 0
+        && prefix_settled(ch, S, d->xi, d->U)) {
+        d->settled = 1; d->settle_tick = d->kw + 1; settled_now = 1;
     }
     /* the fixed point of the assignment (diagnostic) */
     {
@@ -909,6 +1449,11 @@ int bs_arc_tick(bs_arc_driver *d, double *u0)
     memmove(d->committed, d->committed + NU, sizeof(double) * NU * (MM - 1));
     memcpy(d->committed + NU * (MM - 1), d->U + NU * (MM - 1), sizeof(double) * NU);
     d->kw++;
+    d->us_dare = (unsigned)S->us_dare;       /* D8, on every chart */
+    if (ch->hover) {
+        d->gate_open = S->hv.gate_open;
+        return settled_now ? 2 : 0;          /* never finished by cell index */
+    }
     if (d->k >= ch->k_end) d->finished = 1;
     return 0;
 }

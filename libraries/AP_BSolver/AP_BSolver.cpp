@@ -50,6 +50,7 @@ static uint16_t arc_hist[60];              // 10 ms bins, 0..600 ms
 static uint16_t arc_n_ticks, arc_incons, arc_reassign;
 static float arc_viol_max;
 static uint32_t arc_seed_ms;
+static bool arc_gate_txt;                  // v2d: gate-open statustext sent (once per engage)
 static void arc_yield(void) { hal.scheduler->delay(1); }
 static unsigned long arc_micros(void) { return (unsigned long)AP_HAL::micros(); }
 #endif
@@ -1134,6 +1135,7 @@ void AP_BSolver::reset_mission()
     memset(arc_hist, 0, sizeof(arc_hist));
     arc_n_ticks = arc_incons = arc_reassign = 0;
     arc_viol_max = 0.0f;
+    arc_gate_txt = false;
 #else
     bs_mb.ring_reset();
 #endif
@@ -1460,13 +1462,37 @@ bool AP_BSolver::solve_once()
     if (arc_ch == nullptr || !arc_d.engaged) {
         return false;
     }
-    if (arc_d.finished || arc_d.k >= arc_ch->k_end) {
+    // MISSION COMPLETE.  Tail chart (pass-through, the v2c record): the
+    // vehicle's cell reached the trailing arrival cell k_end.  Hover chart
+    // (v2d, arc_ch->hover: the chart ends in the hover cell at the last
+    // waypoint): the SETTLE of the model -- the committed prefix of the
+    // last solved plan inside the hover box (bs_arc_tick returned 2 on
+    // that tick; arc_d.settled stays 1) -- and never the cell index, which
+    // the vehicle reaches long before it is at rest.  Handback happens
+    // here with the aircraft hovering on the waypoint (plan section 1.4);
+    // the driver never sets finished by cell index on a hover chart.
+    const bool complete = arc_d.finished ||
+        (arc_ch->hover ? (arc_d.settled != 0) : (arc_d.k >= arc_ch->k_end));
+    if (complete) {
         if (!_finished) {
             _finished = true;
             _active = false;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                          "BSLV: mission complete, %d ticks, cell %d",
-                          (int)_tick, (int)arc_d.k);
+            if (arc_ch->hover) {
+                // e_l / e_c in the hover frame (arc_v2.hover_frame): the
+                // state itself in the hover cell, e_l shifted by the last
+                // straight cell's length one cell before it
+                double el = arc_d.xi[2];
+                if (arc_d.k == arc_ch->k_end - 1) {
+                    el -= arc_ch->cells[arc_d.k].l;
+                }
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "BSLV: mission complete, %d ticks, settled t%d el %.2f ec %.2f",
+                              (int)_tick, (int)arc_d.settle_tick, el, (double)arc_d.xi[3]);
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "BSLV: mission complete, %d ticks, cell %d",
+                              (int)_tick, (int)arc_d.k);
+            }
         }
         return false;
     }
@@ -1478,13 +1504,19 @@ bool AP_BSolver::solve_once()
     }
     double u0[BS_NU];
     const int r = bs_arc_tick(&arc_d, u0);
-    if (r != 0) {
-        if (r < 0) {
-            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "BSLV: arc tick failed %d", r);
-            _active = false;
-        }
+    if (r < 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "BSLV: arc tick failed %d", r);
+        _active = false;
         return false;
     }
+    if (r == 1) {
+        // tail chart: arrived (k >= k_end), nothing applied; the next call
+        // declares the mission complete
+        return false;
+    }
+    // r == 0: an applied tick.  r == 2 (hover chart): the applied tick at
+    // which the settle predicate first held -- recorded like any applied
+    // tick; the next call declares the mission complete from this state.
     memcpy(_xi, arc_d.xi, sizeof(_xi));
     memcpy(_U, arc_d.U, sizeof(_U));
     memcpy(_committed, arc_d.committed, sizeof(arc_d.committed));
@@ -1502,6 +1534,18 @@ bool AP_BSolver::solve_once()
     arc_ini_sum += arc_d.us_init;
     arc_nwt_sum += arc_d.us_newton;
     _tick++;
+    if (arc_ch->hover && arc_d.gate_open && !arc_gate_txt) {
+        // v2d rule G0: the brake-onset gate opened (arc_d.open_tick); the
+        // seed record is the driver's bs_arc_seed (t_b, rest stage of the
+        // exact stop written into the warm start; the interface leaves its
+        // value unspecified when the vehicle opened the gate from inside
+        // the hover cell without a seed)
+        arc_gate_txt = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "BSLV: gate open t%d seed tb %d rest %d latch %d",
+                      (int)arc_d.open_tick, (int)arc_d.seed.t_b,
+                      (int)arc_d.seed.rest_stage, (int)arc_d.latch);
+    }
     return true;
 #endif
     // The ingress prefix shifts the clock start: at engage, tau = -ing_n.
@@ -2181,15 +2225,25 @@ void AP_BSolver::write_log() const
         _plan.pos_n[0], _plan.pos_e[0]);
 #if BS_ARC
     // the arc tick's own record: the vehicle cell, the assignment fixed
-    // point, the applied row excess and the per-tick split
+    // point, the applied row excess and the per-tick split; appended
+    // (v2d, D8 and the stop): the microseconds spent in on-target DARE
+    // solves this tick, the cumulative DARE solves / failures of the
+    // schedule, and the stop state -- gate open, latch stage (-1 none),
+    // settled.  Fields are APPENDED so the existing parsers keep reading
+    // the first eight.
     AP::logger().WriteStreaming(
         "BSLA",
-        "TimeUS,Cell,Cons,Reas,Viol,Asg,Ini,Nwt",
-        "s-------", "F-------", "QiBBfIII",
+        "TimeUS,Cell,Cons,Reas,Viol,Asg,Ini,Nwt,Dar,Dsv,Dfl,Gat,Lat,Set",
+        "s-------------", "F-------------", "QiBBfIIIIHHBbB",
         AP_HAL::micros64(),
         (int32_t)arc_d.k, (uint8_t)arc_d.consistent, (uint8_t)arc_d.reassign,
         (float)arc_d.viol, (uint32_t)arc_d.us_assign, (uint32_t)arc_d.us_init,
-        (uint32_t)arc_d.us_newton);
+        (uint32_t)arc_d.us_newton,
+        (uint32_t)arc_d.us_dare,
+        (uint16_t)MIN(arc_d.S->dare_solves, 65535),
+        (uint16_t)MIN(arc_d.S->dare_fail, 65535),
+        (uint8_t)(arc_d.gate_open != 0), (int8_t)arc_d.latch,
+        (uint8_t)(arc_d.settled != 0));
 #endif
 }
 #endif

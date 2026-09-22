@@ -400,9 +400,20 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
 #ifdef BS_SPEED_TILT_W
         /* gradient of the speed tilt: d/dU of -w delta_t is
          * -w * (row 0 of Gam_t); a constant, so it lives in Dquad
-         * beside the affine drift. */
-        for (int a = qpin; a < width; ++a)
-            problem->Dquad[a] -= (bs_real)BS_SPEED_TILT_W * Gt[a];
+         * beside the affine drift.  BS_ARC: w is the schedule's
+         * per-stage weight when it carries one (v2d: BS_HV_W on a hover
+         * stage), else the constant -- the same product either way. */
+        {
+#if BS_ARC
+            const bs_real wt = schedule->tilt_w
+                ? schedule->tilt_w[tick_of(schedule, phase + t)]
+                : (bs_real)BS_SPEED_TILT_W;
+#else
+            const bs_real wt = (bs_real)BS_SPEED_TILT_W;
+#endif
+            for (int a = qpin; a < width; ++a)
+                problem->Dquad[a] -= wt * Gt[a];
+        }
 #endif
         memcpy(phi, next, sizeof(phi));    /* advance after Abar_t is used */
     }
@@ -641,8 +652,18 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
          * "ride the forward face".  Linear in the state: the Hessian --
          * and with it the contraction machinery -- is untouched, exactly
          * like the affine drift.  The matching gradient constant is
-         * accumulated into Dquad at build time. */
-        quad += -(bs_real)BS_SPEED_TILT_W * x[0];
+         * accumulated into Dquad at build time.  BS_ARC: the schedule's
+         * per-stage weight when it carries one (v2d), else the constant. */
+        {
+#if BS_ARC
+            const bs_real wt = schedule->tilt_w
+                ? schedule->tilt_w[tick_of(schedule, phase + t)]
+                : (bs_real)BS_SPEED_TILT_W;
+#else
+            const bs_real wt = (bs_real)BS_SPEED_TILT_W;
+#endif
+            quad += -wt * x[0];
+        }
 #endif
     }
 

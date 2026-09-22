@@ -6,7 +6,9 @@
  * (bs_arc.c).  DO NOT EDIT.  Source of truth: wp5_anytime_sim.py /
  * sim_corner_online.py, BS_ANISO_T=1, plus the v2 plant above.
  * Every v1 symbol is carried verbatim (the v1 mission builder
- * compiles to stubs under BS_NU == 2). */
+ * compiles to stubs under BS_NU == 2).  MODEL REVISION v2d: the
+ * delimited BS_HV_* / bs_rc_arc_Ph / bs_rc_arc_Kh block is sourced
+ * from arc_v2.py, the model of record of the stop at WP_N. */
 #ifndef BS_MODEL_RUNTIME_CONST_H
 #define BS_MODEL_RUNTIME_CONST_H
 
@@ -99,6 +101,63 @@
 #define BS_KINK_K 3.50000000000000000e-02
 #define BS_KINK_MISS 1.19999999999999996e+00
 #define BS_VJ_FLOOR 1.5
+
+/* ==== v2d: the stop at the last waypoint (hover cell, kind BS_ARC_HV)
+ * ==== BEGIN.  Source of truth: scripts/mpc/bsolver/model/arc_v2.py
+ * (the model of record; doc/V2D-HOVER-CELL-PLAN.md D1-D9, rule G0 in
+ * doc/V2D-P1-W1-2026-09-22.md).  Distinct from the v1 BS_HOV_* block
+ * and bs_rc_Ph / bs_rc_Kh below, which are the v1 flash hover family
+ * of bs_mission_build.c. */
+/* hover family rows (arc_v2.hover_rows): the velocity disc of radius
+ * BS_HV_SPEED_ARC about pace 0 (all 20 margins), the isotropic
+ * BS_ARC_ACCC acceleration faces, +-e_l at BS_HV_BAND (the hover
+ * zone), +-e_c at BS_HV_EC_BAND, the jerk box; 48 rows, same order */
+#define BS_HV_SPEED_ARC 1.49999999999999994e-01
+#define BS_HV_BAND 5.00000000000000000e-01
+#define BS_HV_EC_BAND 2.00000000000000000e+00
+/* speed-tilt reward weight on a stage whose next state is in the
+ * hover cell (BS_SPEED_TILT_W elsewhere) */
+#define BS_HV_W 0.00000000000000000e+00
+/* rule G0 brake seed: |rest point - WP_N| accepted (m); the rest
+ * stage must be <= BS_N - BS_HV_GATE_MARGIN; stop_profile stage
+ * counts n1 (ramp in), n2 (hold), n3 (ramp out), inclusive bounds */
+#define BS_HV_SEED_TOL 7.50000000000000000e-01
+#define BS_HV_GATE_MARGIN 0
+#define BS_HV_N1_MIN 3
+#define BS_HV_N1_MAX 13
+#define BS_HV_N2_MIN 0
+#define BS_HV_N2_MAX 10
+#define BS_HV_N3_MIN 3
+#define BS_HV_N3_MAX 9
+/* settle predicate on the solved plan's X0..XM in the hover frame:
+ * speed <= BS_HV_SPEED_ARC, |e_l| and |e_c| <= BS_HV_BAND,
+ * |a| <= BS_HV_A_SETTLE; the run must settle within BS_HV_SETTLE_CAP
+ * ticks of arrival (zone entry) */
+#define BS_HV_A_SETTLE 9.00000000000000022e-01
+#define BS_HV_SETTLE_CAP 200
+/* the hover family's terminal pair (D7): arc_v2.dare_pair(
+ * arc_v2.hover_rows()) at NU = 2, row-major P 6x6 / K 2x6 and its
+ * contraction factor c_f.  Mission-independent; terminal_pair
+ * returns it for the hover cell, never solved on target (the host
+ * gate checks bs_dare_solve on the hover margins reproduces it). */
+static const double bs_rc_arc_Ph[36] = {
+    +1.31005471586847847e+02, +7.24923381408727874e+00, +1.14461224949162617e+01, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, +0.00000000000000000e+00, +7.24923381408727874e+00, +1.70902900803689706e+00,
+    +1.19484319501117886e+00, +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00,
+    +1.14461224949162617e+01, +1.19484319501117886e+00, +5.01796074466640434e+01, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, +1.26664402314837723e+01, +2.95563098602908525e+00, +3.10218676382895242e-01,
+    +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00, +2.95563098602908525e+00,
+    +1.28849597419414920e+02, +7.02435490923930761e+00, +0.00000000000000000e+00, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, +3.10218676382895242e-01, +7.02435490923930761e+00, +1.67545040208618756e+00
+};
+static const double bs_rc_arc_Kh[12] = {
+    -1.59385713598318617e+01, -5.62795847378633685e+00, -2.04554010643492123e+00, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00, +0.00000000000000000e+00,
+    +0.00000000000000000e+00, -5.42129208640654170e-01, -1.56064709522335008e+01, -5.59247679513918960e+00
+};
+#define BS_HV_CF 1.61951161880771716e-01
+/* ==== v2d END */
 
 /* The core's canonical names for the mission-independent
  * constants.  When a flash model header is ALSO present (host
