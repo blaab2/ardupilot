@@ -104,10 +104,10 @@
 
 /* ==== v2d: the stop at the last waypoint (hover cell, kind BS_ARC_HV)
  * ==== BEGIN.  Source of truth: scripts/mpc/bsolver/model/arc_v2.py
- * (the model of record; doc/V2D-HOVER-CELL-PLAN.md D1-D9, rule G0 in
- * doc/V2D-P1-W1-2026-09-22.md).  Distinct from the v1 BS_HOV_* block
- * and bs_rc_Ph / bs_rc_Kh below, which are the v1 flash hover family
- * of bs_mission_build.c. */
+ * (the model of record; doc/V2D-HOVER-CELL-PLAN.md D1-D9, brake onset
+ * rule G1 in doc/V2D-G1-DESIGN-2026-09-25.md).  Distinct from the
+ * v1 BS_HOV_* block and bs_rc_Ph / bs_rc_Kh below, which are the v1
+ * flash hover family of bs_mission_build.c. */
 /* hover family rows (arc_v2.hover_rows): the velocity disc of radius
  * BS_HV_SPEED_ARC about pace 0 (all 20 margins), the isotropic
  * BS_ARC_ACCC acceleration faces, +-e_l at BS_HV_BAND (the hover
@@ -118,17 +118,11 @@
 /* speed-tilt reward weight on a stage whose next state is in the
  * hover cell (BS_SPEED_TILT_W elsewhere) */
 #define BS_HV_W 0.00000000000000000e+00
-/* rule G0 brake seed: |rest point - WP_N| accepted (m); the rest
- * stage must be <= BS_N - BS_HV_GATE_MARGIN; stop_profile stage
- * counts n1 (ramp in), n2 (hold), n3 (ramp out), inclusive bounds */
-#define BS_HV_SEED_TOL 7.50000000000000000e-01
+/* rule G1 brake onset: a stage t of the onset scan qualifies when
+ * a_req = v_t^2 / (2 d_t) <= a_nom and its rest stage t + max(2,
+ * ceil(v_t / (a_req Ts))) <= BS_N - BS_HV_GATE_MARGIN; a_nom = v_c^2 /
+ * (2 d_stop) of the stop of record (per chart, at engage) */
 #define BS_HV_GATE_MARGIN 0
-#define BS_HV_N1_MIN 3
-#define BS_HV_N1_MAX 13
-#define BS_HV_N2_MIN 0
-#define BS_HV_N2_MAX 10
-#define BS_HV_N3_MIN 3
-#define BS_HV_N3_MAX 9
 /* settle predicate on the solved plan's X0..XM in the hover frame:
  * speed <= BS_HV_SPEED_ARC, |e_l| and |e_c| <= BS_HV_BAND,
  * |a| <= BS_HV_A_SETTLE; the run must settle within BS_HV_SETTLE_CAP

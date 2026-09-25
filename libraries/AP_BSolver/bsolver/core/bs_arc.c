@@ -51,15 +51,20 @@
 #define BS_HV_BAND 0.0
 #define BS_HV_EC_BAND 0.0
 #define BS_HV_W 0.0
-#define BS_HV_SEED_TOL 0.0
 #define BS_HV_GATE_MARGIN 0
-#define BS_HV_N1_MIN 0
-#define BS_HV_N1_MAX -1
-#define BS_HV_N2_MIN 0
-#define BS_HV_N2_MAX -1
-#define BS_HV_N3_MIN 0
-#define BS_HV_N3_MAX -1
 #define BS_HV_A_SETTLE 0.0
+#endif
+
+/* rule G1's two scan literals (arc_v2.V_ONSET_MIN / N_REST_MIN): stages
+ * with v_t <= BS_HV_V_ONSET_MIN are skipped by the onset scan; the rest
+ * count is n = max(BS_HV_N_REST_MIN, ceil(v_t / (a_req Ts))).  Not
+ * emitted by gen_runtime_const.py (model constants of the rule, not of
+ * the plant); a header that does define them wins. */
+#ifndef BS_HV_V_ONSET_MIN
+#define BS_HV_V_ONSET_MIN 0.3
+#endif
+#ifndef BS_HV_N_REST_MIN
+#define BS_HV_N_REST_MIN 2
 #endif
 
 #ifndef M_PI
@@ -749,7 +754,8 @@ static int in_box(const bs_arc_chart *ch, int k, const double *xi)
            && fabs(ec) <= BS_HV_BAND && acc <= BS_HV_A_SETTLE;
 }
 
-/* arc_v2.dist_to_go / brake_seed::dist_to_wp: the distance along the
+/* arc_v2.dist_to_go (the gate distance of record, open_dist; the G1
+ * onset scan uses the backward suffix sums instead): the distance along the
  * chart from a state in cell k0 to WP_N (negative past it); the cell
  * lengths summed in chart order from k0 as the Python's sum() does. */
 static double dist_to_go(const bs_arc_chart *ch, int k0, const double *xi0)
@@ -788,7 +794,8 @@ static void stop_integrate(double v0, double a0, int n1, int n2, int n3,
     *amin_out = amin; *vmin_out = vmin;
 }
 
-/* arc_v2.stop_profile: js = [-J] n1 + [0] n2 + [+Jp] n3 from (v0, a0) to
+/* arc_v2.stop_profile (G1: used only by brake_profile_exact, once per
+ * chart, for the stop of record): js = [-J] n1 + [0] n2 + [+Jp] n3 from (v0, a0) to
  * EXACT rest on the Ts grid -- Jp fixed by a_final = 0, J by v_final = 0
  * (v_final affine in J: J = -vA / (vB - vA) from the integrations at
  * J = 0 and J = 1).  Returns 0 when infeasible (J <= 0, J > JB, |Jp| >
@@ -834,105 +841,212 @@ static void plan_states(const bs_arc_chart *ch, int k, const double *xi,
     }
 }
 
-/* the (-t, |short|, t, js, d, n, short, J, Jp, a_min, ...) tuple order
- * of arc_v2.brake_seed's min(cands): returns 1 when candidate a sorts
- * strictly before b (the same t on both: the loop keeps the FIRST of
- * equal candidates, as Python's min does) */
-static int cand_before(int t_a, const double *js_a, int n_a, double d_a,
-                       double short_a, double J_a, double Jp_a, double amin_a,
-                       int t_b, const double *js_b, int n_b, double d_b,
-                       double short_b, double J_b, double Jp_b, double amin_b)
+/* arc_v2.seed_integrate over the grid trapezoid of arc_v2.trapezoid_grid
+ * (js_of(s) = [j1] * n_r + [0.0] * n_h + [j3] * n_r2): the exact ZOH
+ * integration from (v0, a0) in the Python's operation order, the jerk of
+ * stage i generated in place (no array: the profile may run past N).
+ * Returns (x, v) at its end. */
+static void seed_integrate(double v0, double a0, int n_r, int n_h, int n_r2,
+                           double j1, double j3, double *x_out, double *v_out)
 {
-    if (t_a != t_b) return t_a > t_b;                          /* -t ascending */
-    const double sa = fabs(short_a), sb = fabs(short_b);
-    if (sa != sb) return sa < sb;
-    {   /* js: list comparison, lexicographic then by length */
-        const int n = (n_a < n_b) ? n_a : n_b;
-        for (int i = 0; i < n; ++i)
-            if (js_a[i] != js_b[i]) return js_a[i] < js_b[i];
-        if (n_a != n_b) return n_a < n_b;
+    const double Ts = BS_TS;
+    const double Ts3 = Ts * Ts * Ts;          /* Ts ** 3, exact (a power of two) */
+    const int n = n_r + n_h + n_r2;
+    double v = v0, a = a0, x = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double j = (i < n_r) ? j1 : ((i < n_r + n_h) ? 0.0 : j3);
+        x += v * Ts + 0.5 * a * Ts * Ts + j * Ts3 / 6;
+        v += a * Ts + 0.5 * j * Ts * Ts; a += j * Ts;
     }
-    if (d_a != d_b) return d_a < d_b;
-    if (short_a != short_b) return short_a < short_b;
-    if (J_a != J_b) return J_a < J_b;
-    if (Jp_a != Jp_b) return Jp_a < Jp_b;
-    if (amin_a != amin_b) return amin_a < amin_b;
-    return 0;
+    *x_out = x; *v_out = v;
 }
 
-/* arc_v2.brake_seed: the G0 seed search on the natural rollout of U
- * from (k, xi).  Returns 1 and overwrites U's j_l from t_b with the stop
- * (the seed record in *sd) when a stop rests within BS_HV_SEED_TOL of
- * WP_N by stage N - BS_HV_GATE_MARGIN from a stage t_b >= M; 0 (U
- * untouched) otherwise.  The scratch is static: 31 x 6 doubles + the
- * candidate profiles, off the 8 kB solver-thread stack. */
-#if BS_HV_GATE_MARGIN < 0
-#error "BS_HV_GATE_MARGIN < 0: the seed search's stage bound t + n <= N - margin no longer keeps the profile inside U (the Python raises IndexError there)"
+/* arc_v2.trapezoid_closed_form: the plateau deceleration a_s of the
+ * jerk-limited trapezoid in acceleration from (v, a) resting at distance
+ * d (ramp a -> -a_s at -JB, hold, ramp -a_s -> 0 at +JB), the smaller
+ * root of (v' / (2 JB)) a_s^2 - d' a_s + v'^2 / 2 = 0 after the pre-phase
+ * to a = 0 on the same jerk line.  Returns BS_ARC_SEED_OK with a_s and
+ * the continuous duration, else the no-root reason (d' <= 0, disc < 0,
+ * a_s > AB, a_s < -a), in the Python's operation order.  The powers are
+ * explicit products in the Python's order (tau0 * tau0, tau0 * tau0 *
+ * tau0, vp * vp * vp): no libm pow, so the result does not depend on the
+ * target's libm (glibc on the host, newlib on the Cube). */
+static int trapezoid_closed_form(double v, double a, double d, double JB, double AB,
+                                 double *s_out, double *dur_out)
+{
+    const double tau0 = fabs(a) / JB;
+    const double vp = v + a * a / (2.0 * JB);
+    const double x0 = (a >= 0)
+        ? (v * tau0 + a * (tau0 * tau0) / 2 - JB * (tau0 * tau0 * tau0) / 6)
+        : -(vp * tau0 - JB * (tau0 * tau0 * tau0) / 6);
+    const double dp = d - x0;
+    if (dp <= 0.0) return BS_ARC_SEED_DPRIME;
+    const double disc = dp * dp - (vp * vp * vp) / JB;
+    if (disc < 0.0) return BS_ARC_SEED_DISC;
+    const double s = JB * (dp - sqrt(disc)) / vp;
+    if (s > AB) return BS_ARC_SEED_AB;
+    if (s < -a) return BS_ARC_SEED_RAMPUP;
+    const double T_h = vp / s - s / JB;
+    const double tau1 = (a + s) / JB, tau2 = s / JB;
+    *s_out = s;
+    *dur_out = tau1 + T_h + tau2;
+    return BS_ARC_SEED_OK;
+}
+
+/* the onset scan's distance table (arc_v2.dist_suffix): S[kk] = sum_{c =
+ * kk}^{k_end - 1} l_c accumulated BACKWARD from WP_N (S[k_end] = 0, S[c]
+ * = S[c + 1] + l_c), from the engage checkpoints (bs_arc_stop_model.
+ * dist_cp, every dist_stride-th S): a lookup starts at the checkpoint at
+ * or above kk (k_end with S = 0 past the last one) and walks down, the
+ * Python's additions in the Python's order, so the value is bit-identical
+ * to its table.  The scan visits the stages t = N-1 down to M, whose
+ * cells never increase (transition_n holds k or advances past it, never
+ * lowers it), so one walk serves the whole scan: at most dist_stride - 1
+ * + (ks[N-1] - ks[M]) additions per tick.  The re-start branch (kk above
+ * the walk's position) is defensive only; it cannot be reached from the
+ * scan. */
+typedef struct { int c; double s; } dist_walk;
+
+static void dist_checkpoints(const bs_arc_chart *ch, bs_arc_stop_model *sm)
+{
+    const int k_end = ch->n_cells - 1;
+    int stride = (k_end + (BS_HV_DIST_CP - 1) - 1) / (BS_HV_DIST_CP - 1);
+    if (stride < 1) stride = 1;
+    sm->dist_stride = stride;
+    double s = 0.0;
+    for (int c = k_end - 1; c >= 0; --c) {
+        s = s + ch->cells[c].l;
+        if (c % stride == 0) sm->dist_cp[c / stride] = s;
+    }
+}
+
+static void dist_walk_start(const bs_arc_chart *ch, const bs_arc_stop_model *sm,
+                            dist_walk *w, int kk)
+{
+    const int k_end = ch->n_cells - 1;
+    const int stride = sm->dist_stride;
+    const int c_up = ((kk + stride - 1) / stride) * stride;   /* checkpoint at or above kk */
+    if (c_up >= k_end) { w->c = k_end; w->s = 0.0; }
+    else { w->c = c_up; w->s = sm->dist_cp[c_up / stride]; }
+}
+
+static double suffix_at(const bs_arc_chart *ch, const bs_arc_stop_model *sm,
+                        dist_walk *w, int kk)
+{
+    if (w->c < 0 || kk > w->c) dist_walk_start(ch, sm, w, kk);
+    while (w->c > kk) { w->c--; w->s = w->s + ch->cells[w->c].l; }
+    return w->s;
+}
+
+/* arc_v2.brake_seed (rule G1, doc/V2D-G1-DESIGN-2026-09-25.md, variant
+ * cdB), once per tick while the gate is closed: one natural rollout of
+ * the warm start U from (k, xi), one onset scan over t = N-1 down to M
+ * (v_t = pace + delta, d_t = S[kk] - e_l, or -e_l in the hover cell;
+ * skip v_t <= BS_HV_V_ONSET_MIN or d_t <= 0; a_req = v_t^2 / (2 d_t),
+ * n = max(BS_HV_N_REST_MIN, ceil(v_t / (a_req Ts))), rest = t + n; the
+ * first stage of the downward scan with a_req <= a_nom and rest <= N -
+ * margin is t_b); at t_b the jerk-box trapezoid at the constant
+ * deceleration a_s (trapezoid_closed_form), on the Ts grid with a_s
+ * re-solved so the seed ends at rest (v_final affine in a_s: two ZOH
+ * integrations), written into j_l from t_b (stages at or beyond N not
+ * written).  Returns BS_ARC_SEED_OK (U seeded, the record in *sd),
+ * BS_ARC_SEED_NONE when no stage qualifies (U untouched), or a no-root
+ * reason BS_ARC_SEED_DPRIME .. BS_ARC_SEED_LONG (U untouched; *sd carries
+ * t_b, v_b, a_b, dist_wp, a_req, a_nom): the gate stays closed this tick
+ * (owner policy 2026-09-25, no fallback seed).
+ * The rollout scratch is static (31 x 6 doubles + 31 ints), off the
+ * 8 kB solver-thread stack; the seed itself needs no array. */
+/* The margin guard, re-derived for G1.  Memory is safe for ANY margin:
+ * the seed write is clamped at stage N (t_b + i < N, as the Python's
+ * `if t_b + i < N`) and the latch is min(N, rest stage).  What the range
+ * protects is the rule: a qualifying stage needs t >= M and t + n <= N -
+ * margin with n >= BS_HV_N_REST_MIN, so margin > N - M - BS_HV_N_REST_MIN
+ * leaves the scan nothing to find (the gate would open only on entry into
+ * the hover cell), and a negative margin admits stops that rest beyond
+ * the horizon (the latch then sits at N while the plan is still moving). */
+#if BS_HV_N_REST_MIN < 1
+#error "BS_HV_N_REST_MIN < 1: the rest stage must lie after the onset stage"
 #endif
-/* the longest profile the stage ranges admit (13 + 10 + 9 = 32 > N): the
- * break at t + n1 + n2 + n3 > N - margin, with t >= M and margin >= 0
- * (checked above), keeps every profile that is integrated within N - M
- * stages, but the scratch is sized for the ranges themselves */
-#define BS_HV_STAGES_MAX ((BS_HV_N1_MAX + BS_HV_N2_MAX + BS_HV_N3_MAX) > NN \
-                          ? (BS_HV_N1_MAX + BS_HV_N2_MAX + BS_HV_N3_MAX) : NN)
+#if BS_HV_GATE_MARGIN < 0 || BS_HV_GATE_MARGIN > BS_N - BS_M_COMMIT - BS_HV_N_REST_MIN
+#error "BS_HV_GATE_MARGIN out of range: need 0 <= margin <= N - M - BS_HV_N_REST_MIN (a qualifying stage t >= M with t + n <= N - margin must exist; a negative margin admits stops resting past the horizon)"
+#endif
+/* the grid trapezoid's stage count is bounded by the scan (a qualifying
+ * stage has 2 d_t / (v_t Ts) <= N, and the trapezoid's duration is that
+ * of a stop over the same distance, about 2 d' / v'); this cap only
+ * refuses a non-finite or absurd duration before it is cast to int -- a
+ * C-side guard with no Python counterpart, unreachable on the scan's
+ * stages (reason BS_ARC_SEED_LONG, the gate stays closed) */
+#define BS_HV_SEED_STAGES_CAP (4 * NN)
 static struct {
     int ks[NN + 1];
     double xs[(NN + 1) * NX];
-    double js[BS_HV_STAGES_MAX], js_best[BS_HV_STAGES_MAX];
 } bsd;
 
-static int brake_seed(const bs_arc_chart *ch, int k, const double *xi,
-                      double *U, double AB, int margin, bs_arc_seed *sd)
+static int brake_seed(const bs_arc_chart *ch, const bs_arc_stop_model *sm,
+                      int k, const double *xi, double *U, double AB,
+                      double a_nom, int margin, bs_arc_seed *sd)
 {
     const int M = MM;
+    const int k_end = ch->n_cells - 1;
+    const double Ts = BS_TS;
+    const double JB = BS_JBOX;
     int *const ks = bsd.ks;
     double *const xs = bsd.xs;
     plan_states(ch, k, xi, U, ks, xs);
-#define DIST_TO_WP(t) dist_to_go(ch, ks[t], &xs[(size_t)(t) * NX])
-    if (DIST_TO_WP(NN) > 0.0) return 0;      /* the tip is short of WP_N */
-    int have = 0, n_cands = 0;
-    int b_t = 0, b_n = 0;
-    double b_d = 0, b_short = 0, b_J = 0, b_Jp = 0, b_amin = 0, b_v = 0, b_a = 0, b_dw = 0;
+    /* arc_v2.onset_scan */
+    dist_walk w = { -1, 0.0 };               /* started at the first lookup */
+    int t_b = -1;
+    double a_req = 0.0, v_b = 0.0, a_b = 0.0, d_b = 0.0;
     for (int t = NN - 1; t >= M; --t) {
+        const int kk = ks[t];
         const double *xt = &xs[(size_t)t * NX];
-        const double v_t = ch->cells[ks[t]].l / BS_TS + xt[0];
-        const double a_t = xt[1];
-        if (v_t <= 0.3) continue;
-        const double dw = DIST_TO_WP(t);
-        if (dw <= 0.0) continue;
-        for (int n1 = BS_HV_N1_MIN; n1 <= BS_HV_N1_MAX; ++n1) {
-            for (int n3 = BS_HV_N3_MIN; n3 <= BS_HV_N3_MAX; ++n3) {
-                for (int n2 = BS_HV_N2_MIN; n2 <= BS_HV_N2_MAX; ++n2) {
-                    if (t + n1 + n2 + n3 > NN - margin) break;
-                    double d, J, Jp, amin;
-                    int n;
-                    if (!stop_profile(v_t, a_t, AB, BS_JBOX, n1, n2, n3, bsd.js,
-                                      &d, &n, &J, &Jp, &amin))
-                        continue;
-                    const double shrt = dw - d;
-                    if (fabs(shrt) <= BS_HV_SEED_TOL) {
-                        n_cands++;
-                        if (!have || cand_before(t, bsd.js, n, d, shrt, J, Jp, amin,
-                                                 b_t, bsd.js_best, b_n, b_d, b_short,
-                                                 b_J, b_Jp, b_amin)) {
-                            have = 1;
-                            b_t = t; b_n = n; b_d = d; b_short = shrt; b_J = J;
-                            b_Jp = Jp; b_amin = amin; b_v = v_t; b_a = a_t; b_dw = dw;
-                            memcpy(bsd.js_best, bsd.js, sizeof(double) * (size_t)n);
-                        }
-                    }
-                }
-            }
+        const double v_t = ch->cells[kk].l / BS_TS + xt[0];
+        const double d_t = (kk >= k_end) ? (-xt[2]) : (suffix_at(ch, sm, &w, kk) - xt[2]);
+        if (v_t <= BS_HV_V_ONSET_MIN || d_t <= 0.0) continue;
+        const double ar = v_t * v_t / (2.0 * d_t);
+        /* n and rest as doubles: exact integers, no int overflow on a far
+         * stage (v_t / (a_req Ts) = 2 d_t / (v_t Ts)) */
+        double n = ceil(v_t / (ar * Ts) - 1e-12);
+        if (n < BS_HV_N_REST_MIN) n = BS_HV_N_REST_MIN;
+        const double rest = t + n;
+        if (ar <= a_nom && rest <= NN - margin) {
+            t_b = t; a_req = ar; v_b = v_t; a_b = xt[1]; d_b = d_t;
+            break;
         }
     }
-#undef DIST_TO_WP
-    if (!have) return 0;
-    for (int i = 0; i < b_n; ++i) U[NU * (b_t + i) + ARC_JL] = bsd.js_best[i];
-    sd->t_b = b_t; sd->n_stop = b_n; sd->rest_stage = b_t + b_n;
-    sd->d_stop = b_d; sd->v_b = b_v; sd->a_b = b_a; sd->dist_wp = b_dw;
-    sd->rest_short = b_short; sd->J = b_J; sd->Jp = b_Jp; sd->a_min = b_amin;
-    sd->n_cands = n_cands;
-    return 1;
+    if (t_b < 0) return BS_ARC_SEED_NONE;
+    sd->t_b = t_b; sd->v_b = v_b; sd->a_b = a_b; sd->dist_wp = d_b;
+    sd->a_req = a_req; sd->a_nom = a_nom;
+    double s_c = 0.0, dur = 0.0;
+    const int why = trapezoid_closed_form(v_b, a_b, d_b, JB, AB, &s_c, &dur);
+    if (why != BS_ARC_SEED_OK) return why;
+    if (!(dur / Ts <= BS_HV_SEED_STAGES_CAP)) return BS_ARC_SEED_LONG;
+    /* arc_v2.trapezoid_grid */
+    int n_r = (int)ceil((a_b + s_c) / (JB * Ts) - 1e-9);
+    if (n_r < 1) n_r = 1;
+    int n_r2 = (int)ceil(s_c / (JB * Ts) - 1e-9);
+    if (n_r2 < 1) n_r2 = 1;
+    int n_tot = (int)rint(dur / Ts);          /* Python's round(): half to even */
+    if (n_tot < n_r + n_r2) n_tot = n_r + n_r2;
+    const int n_h = n_tot - n_r - n_r2;
+    double x, vA, vB;
+    seed_integrate(v_b, a_b, n_r, n_h, n_r2, -(a_b + 0.0) / (n_r * Ts), 0.0 / (n_r2 * Ts), &x, &vA);
+    seed_integrate(v_b, a_b, n_r, n_h, n_r2, -(a_b + 1.0) / (n_r * Ts), 1.0 / (n_r2 * Ts), &x, &vB);
+    const double s = -vA / (vB - vA);
+    const double j1 = -(a_b + s) / (n_r * Ts), j3 = s / (n_r2 * Ts);
+    /* the third integration serves the record only (d_stop, rest_short:
+     * the Python's x_r, compared by the parity), once per mission on the
+     * gate tick; the seed write below does not use it */
+    double x_r, v_r;
+    seed_integrate(v_b, a_b, n_r, n_h, n_r2, j1, j3, &x_r, &v_r);
+    for (int i = 0; i < n_tot && t_b + i < NN; ++i)
+        U[NU * (t_b + i) + ARC_JL] = (i < n_r) ? j1 : ((i < n_r + n_h) ? 0.0 : j3);
+    sd->n_stop = n_tot; sd->rest_stage = t_b + n_tot;
+    sd->d_stop = x_r; sd->rest_short = d_b - x_r;
+    sd->a_s_cont = s_c; sd->a_s = s; sd->a_min = -s;
+    sd->n_r = n_r; sd->n_h = n_h; sd->n_r2 = n_r2;
+    sd->j_max = (fabs(j1) >= fabs(j3)) ? fabs(j1) : fabs(j3);
+    return BS_ARC_SEED_OK;
 }
 
 /* arc_v2.brake_profile_exact: the symmetric stop of record from (v0, a0 =
@@ -966,8 +1080,9 @@ static int brake_profile_exact(double v0, double a0, double AB, double JB,
  * (arc_v2.rear_face: the acceleration row at raster index 10, template
  * row 21; 5.609 on a trim cell, 5.66 on a corner-pace one) and forward
  * face AF (forward_face: raster index 0, template row 1), and the
- * symmetric stop of record from v_c.  Returns 0 when that stop does not
- * exist (the Python's AssertionError). */
+ * symmetric stop of record from v_c, and rule G1's nominal deceleration
+ * a_nom = v_c^2 / (2 d_stop).  Returns 0 when that stop does not exist
+ * (the Python's AssertionError). */
 static int stop_params(const bs_arc_chart *ch, bs_arc_stop_model *sm)
 {
     const int k_end = ch->n_cells - 1;
@@ -980,6 +1095,9 @@ static int stop_params(const bs_arc_chart *ch, bs_arc_stop_model *sm)
     if (!brake_profile_exact(sm->v_c, 0.0, sm->AB, BS_JBOX, &sm->d_stop, &sm->n_stop,
                              &sm->J, &sm->a_max, &sm->v_residual))
         return 0;
+    /* rule G1's nominal deceleration (HoverStop.__init__: a_nom =
+     * v_c * v_c / (2.0 * d_stop), the same product, no libm pow) */
+    sm->a_nom = sm->v_c * sm->v_c / (2.0 * sm->d_stop);
     sm->valid = 1;
     return 1;
 }
@@ -1196,6 +1314,7 @@ static void stop_reset(bs_arc_driver *d)
     d->forced = 0; d->n_hv = 0; d->us_dare = 0;
     memset(&d->seed, 0, sizeof(d->seed));
     d->seed.tick = -1; d->seed.t_b = -1; d->seed.n_stop = -1; d->seed.rest_stage = -1;
+    d->no_root = 0; d->no_root_tick = -1; d->no_root_tb = -1; d->no_root_reason = 0;
     memset(&d->stop, 0, sizeof(d->stop));
 }
 
@@ -1209,6 +1328,8 @@ int bs_arc_engage(bs_arc_driver *d)
      * stop_params); a hover chart without the symmetric stop from the
      * last straight cell's pace is refused as the Python refuses it */
     if (ch->hover && !stop_params(ch, &d->stop)) return -4;
+    /* rule G1's distance checkpoints (HoverStop.__init__ -> dist_suffix) */
+    if (ch->hover) dist_checkpoints(ch, &d->stop);
     memset(d->xi, 0, sizeof(d->xi));
     d->xi[0] = -(ch->cells[0].l / BS_TS);          /* at rest on vertex 0 */
     /* v2d: arc_v2._run tests in_zone on EVERY state sample, the engage
@@ -1277,10 +1398,12 @@ int bs_arc_engage(bs_arc_driver *d)
 }
 
 /* arc_v2.HoverStop.tick_gate: once per tick after the shift-append and
- * before the rounds.  The gate opens at the first tick a brake seed
- * exists (or the vehicle is in the hover cell); the seed is written into
- * U and the latch set to its rest stage.  `tick` = the Python's
- * stop.tick (kw + 1). */
+ * before the rounds.  The gate opens at the first tick rule G1 yields a
+ * brake seed (or the vehicle is in the hover cell); the seed is written
+ * into U and the latch set to min(N, its rest stage).  A tick whose scan
+ * qualifies a stage but whose quadratic has no admissible root leaves
+ * the gate closed (HoverStop.no_root: counted, the first one recorded).
+ * `tick` = the Python's stop.tick (kw + 1). */
 static void tick_gate(bs_arc_driver *d, int tick)
 {
     const bs_arc_chart *ch = d->chart;
@@ -1289,23 +1412,34 @@ static void tick_gate(bs_arc_driver *d, int tick)
     if (S->hv.gate_open) return;
     /* HoverStop.open_dist / open_speed: the vehicle's distance to WP_N
      * along the chart and its speed at the tick the gate opens (the seed
-     * record's dist_vehicle) */
-    const double open_dist = dist_to_go(ch, d->k, d->xi);
-    const double open_speed = ch->cells[d->k].l / BS_TS + d->xi[0];
+     * record's dist_vehicle).  Computed on the opening tick only, as the
+     * Python does (dist_to_go is a forward sum over k..k_end-1, O(n_cells);
+     * brake_seed changes neither d->k nor d->xi, so the value is the same
+     * before or after it). */
     if (d->k >= k_end) {
         S->hv.gate_open = 1; d->open_tick = tick;
-        d->open_dist = open_dist; d->open_speed = open_speed;
+        d->open_dist = dist_to_go(ch, d->k, d->xi);
+        d->open_speed = ch->cells[d->k].l / BS_TS + d->xi[0];
         return;
     }
-    /* AB = the last straight family's rear acceleration face, from the
-     * stop model computed at engage (HoverStop.tick_gate passes
-     * self.params['AB']; 5.609 on a trim cell) */
-    const double AB = d->stop.AB;
+    /* AB = the last straight family's rear acceleration face and a_nom =
+     * v_c^2 / (2 d_stop), both from the stop model computed at engage
+     * (HoverStop.tick_gate passes self.params['AB'] and self.a_nom) */
     bs_arc_seed sd;
     memset(&sd, 0, sizeof(sd));
-    if (!brake_seed(ch, d->k, d->xi, d->U, AB, BS_HV_GATE_MARGIN, &sd)) return;
+    const int r = brake_seed(ch, &d->stop, d->k, d->xi, d->U, d->stop.AB,
+                             d->stop.a_nom, BS_HV_GATE_MARGIN, &sd);
+    if (r == BS_ARC_SEED_NONE) return;
+    if (r != BS_ARC_SEED_OK) {                 /* no admissible root: stays closed */
+        if (d->no_root == 0) {
+            d->no_root_tick = tick; d->no_root_tb = sd.t_b; d->no_root_reason = r;
+        }
+        d->no_root++;
+        return;
+    }
     S->hv.gate_open = 1; d->open_tick = tick;
-    d->open_dist = open_dist; d->open_speed = open_speed;
+    d->open_dist = dist_to_go(ch, d->k, d->xi);
+    d->open_speed = ch->cells[d->k].l / BS_TS + d->xi[0];
     sd.tick = tick;
     d->seed = sd;
     S->hv.latch = (sd.rest_stage < NN) ? sd.rest_stage : NN;

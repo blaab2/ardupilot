@@ -87,8 +87,10 @@
  * (Q_delta = Q_el = 0; the DARE keeps RL, exactly as the Python does) and
  * the 1.5 progress reward.  The default build is byte-identical.
  *
- * THE STOP AT THE LAST WAYPOINT (v2d, doc/V2D-HOVER-CELL-PLAN.md D1-D9,
- * rule G0 of doc/V2D-P1-W1-2026-09-22.md; the Python of record is
+ * THE STOP AT THE LAST WAYPOINT (v2d, doc/V2D-HOVER-CELL-PLAN.md D1-D9;
+ * brake onset rule G1 of doc/V2D-G1-DESIGN-2026-09-25.md, which replaced
+ * the stop_profile enumeration of rule G0, doc/V2D-P1-W1-2026-09-22.md,
+ * on 2026-09-25; the Python of record is
  * model/arc_v2.py: has_hover .. install_stop and _run).  A chart built
  * with `hover` = 1 (bs_arc_chart_build: BS_ARC_HOVER, the configuration
  * of record since v2d; bs_arc_chart_build_rows takes the flag) has NO
@@ -104,21 +106,29 @@
  * hover cell, BS_SPEED_TILT_W elsewhere (bs_arc_sched.tilt_w ->
  * bs_schedule.tilt_w; a horizon without a hover stage keeps today's
  * arithmetic bit for bit).
- *   GATE   closed from engage until the first tick at which a brake seed
- *          exists (or the vehicle is already in the hover cell).  While
+ *   GATE   closed from engage until the first tick at which rule G1
+ *          yields a brake seed (or the vehicle is already in the hover
+ *          cell; doc/V2D-G1-DESIGN-2026-09-25.md, variant cdB).  While
  *          closed the hover cell is NOT assignable: bs_arc_assign rolls
  *          out on the chart without it and the last straight cell holds
  *          beyond its end with T = I, c = 0 once the rollout state has
  *          e_l >= 0 (the 'virtual tail': exactly the v2c tail behaviour).
- *   SEED   once per mission, at the tick the gate opens (after the
- *          shift-append, before the rounds): the natural rollout of the
- *          shifted warm start; if its tip is at/past WP_N, the latest
- *          stage t_b >= M from which an exact jerk-limited stop
- *          (stop_profile: n1 stages at -J, n2 at 0, n3 at +J', J' from
- *          a_final = 0, J from v_final = 0) rests within BS_HV_SEED_TOL of
- *          WP_N by stage N - BS_HV_GATE_MARGIN; ties at that stage by the
- *          smallest |shortfall|.  The stop's j_l overwrites the warm start
- *          from t_b and the latch is set to its rest stage.
+ *   SEED   every tick while the gate is closed (after the shift-append,
+ *          before the rounds): the natural rollout of the shifted warm
+ *          start and ONE scan of its stages t = N-1 down to M (closed
+ *          form, O(N), no enumeration): v_t = pace + delta, d_t = the
+ *          distance to WP_N; stages with v_t <= 0.3 or d_t <= 0 skipped;
+ *          a_req = v_t^2 / (2 d_t), rest = t + max(2, ceil(v_t / (a_req
+ *          Ts))).  A stage qualifies when a_req <= a_nom = v_c^2 / (2
+ *          d_stop) (the stop of record, bs_arc_stop_model) and rest <= N
+ *          - BS_HV_GATE_MARGIN; t_b = the latest one.  The seed from
+ *          (v_b, a_b, d_b) at t_b is the constant deceleration a_s entered
+ *          and left at the jerk box (a trapezoid in acceleration, a_s the
+ *          smaller root of one quadratic, re-solved on the Ts grid so the
+ *          seed ends at rest); it overwrites the warm start's j_l from t_b
+ *          (stages < N) and the latch is set to min(N, its rest stage).
+ *          No admissible root at t_b: the gate stays closed this tick
+ *          (bs_arc_driver.no_root), no fallback seed.
  *   LATCH  a stage index (-1 none): every stage >= latch whose natural
  *          assignment is short of the hover cell is FORCED into it
  *          (force_to_end: chain through the remaining cells, e_l = the
@@ -310,25 +320,59 @@ void bs_arc_assign(const bs_arc_chart *ch, bs_arc_sched *S, int k0,
 int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust);
 
 /* ---- the driver ------------------------------------------------------ */
-/* the brake seed of record (arc_v2.brake_seed's info): written once, at
- * the tick the gate opens with a seed; tick = -1 when none (the gate
- * opened by the vehicle entering the hover cell, or is still closed) */
+/* the brake seed of record (arc_v2.brake_seed's info, rule G1): written
+ * once, at the tick the gate opens with a seed; tick = -1 when none (the
+ * gate opened by the vehicle entering the hover cell, or is still
+ * closed).  t_b = the onset stage, n_stop = n_r + n_h + n_r2 the seed's
+ * stages (ramp in at -jerk, hold at -a_s, ramp out), rest_stage = t_b +
+ * n_stop (may exceed N: stages >= N are not written); d_stop = the seed's
+ * own rest distance, rest_short = dist_wp - d_stop; a_req = v_b^2 / (2
+ * dist_wp), a_nom = the stop of record's mean deceleration, a_s_cont =
+ * the continuous-time root, a_s the grid re-solve, a_min = -a_s, j_max =
+ * the seed's largest |j_l|. */
 typedef struct {
-    int tick, t_b, n_stop, rest_stage, n_cands;
-    double d_stop, v_b, a_b, dist_wp, rest_short, J, Jp, a_min;
+    int tick, t_b, n_stop, rest_stage, n_r, n_h, n_r2;
+    double d_stop, v_b, a_b, dist_wp, rest_short;
+    double a_req, a_nom, a_s_cont, a_s, a_min, j_max;
 } bs_arc_seed;
+
+/* brake_seed / tick_gate outcomes (the no-root reasons of
+ * arc_v2.trapezoid_closed_form; LONG is a C-side guard on a non-finite or
+ * absurd seed duration, unreachable on a qualifying stage) */
+enum {
+    BS_ARC_SEED_NONE = 0,     /* no stage qualifies: gate stays closed   */
+    BS_ARC_SEED_OK = 1,       /* seeded: gate opens                      */
+    BS_ARC_SEED_DPRIME = 2,   /* d' <= 0                                 */
+    BS_ARC_SEED_DISC = 3,     /* the quadratic's discriminant < 0        */
+    BS_ARC_SEED_AB = 4,       /* a_s > AB                                */
+    BS_ARC_SEED_RAMPUP = 5,   /* a_s < -a_b (a ramp up would be needed)  */
+    BS_ARC_SEED_LONG = 6      /* duration beyond 4 N stages (C guard)    */
+};
 
 /* the stop model of a hover chart (arc_v2.stop_params, computed ONCE at
  * engage as HoverStop.__init__ does): the last straight cell's pace v_c,
- * its family's rear face AB (the brake deceleration of the seed search)
- * and forward face AF, and the symmetric stop of record from v_c
+ * its family's rear face AB (the bound on rule G1's plateau a_s) and
+ * forward face AF, the symmetric stop of record from v_c
  * (brake_profile_exact: n_stop stages, distance d_stop, jerk J, peak
- * deceleration a_max, residual speed v_residual = 0).  The Python
+ * deceleration a_max, residual speed v_residual = 0) and rule G1's
+ * nominal deceleration a_nom = v_c^2 / (2 d_stop).  The Python
  * refuses a chart without that stop (AssertionError); bs_arc_engage
- * returns -4 on it.  valid = 1 once computed (hover chart only). */
+ * returns -4 on it.  valid = 1 once computed (hover chart only).
+ * dist_cp / dist_stride: checkpoints of rule G1's distance table (arc_v2.
+ * dist_suffix, S[c] = S[c + 1] + l_c accumulated backward from WP_N):
+ * dist_cp[i] = S[i * dist_stride] for i * dist_stride < k_end, dist_stride
+ * = max(1, ceil(k_end / (BS_HV_DIST_CP - 1))), built once at engage.  The
+ * onset scan walks down from the checkpoint at or above a stage's cell,
+ * the same additions in the same order as the Python's table, so a
+ * closed tick costs at most dist_stride - 1 + (the cells the horizon
+ * spans) additions (O(N) for charts up to (BS_HV_DIST_CP - 1) N cells;
+ * verts: 967 cells, stride 16) with 8 B per checkpoint, not per cell. */
+#define BS_HV_DIST_CP 64
 typedef struct {
     int valid, n_stop;
-    double AB, AF, v_c, d_stop, J, a_max, v_residual;
+    double AB, AF, v_c, d_stop, J, a_max, v_residual, a_nom;
+    int dist_stride;
+    double dist_cp[BS_HV_DIST_CP];
 } bs_arc_stop_model;
 
 typedef struct {
@@ -365,7 +409,7 @@ typedef struct {
     unsigned long us_assign, us_init, us_newton;
     /* ---- v2d: the stop at the last waypoint (hover chart only; every
      * field reset at engage, -1 / 0 on a tail chart) ---- */
-    int gate_open;            /* the gate of rule G0                       */
+    int gate_open;            /* the gate of rule G1                       */
     int latch;                /* the latch as the LAST SOLVED plan of the
                                * tick saw it (the value of the last round's
                                * assignment, -1 none); S->hv.latch is the
@@ -388,6 +432,11 @@ typedef struct {
     int n_hv;                 /* stages (of 0..N) of the last solved plan's
                                * schedule in the hover cell                */
     bs_arc_seed seed;         /* the brake seed record                     */
+    int no_root;              /* rule G1: closed-gate ticks whose scan
+                               * qualified a stage but whose quadratic had
+                               * no admissible root (HoverStop.no_root)    */
+    int no_root_tick, no_root_tb, no_root_reason;  /* the first such tick,
+                               * its t_b and BS_ARC_SEED_* reason, -1 / 0  */
     bs_arc_stop_model stop;   /* the stop model of record (at engage)     */
     unsigned us_dare;         /* D8: on-target DARE solves this tick, us
                                * (copied from S->us_dare on EVERY chart,

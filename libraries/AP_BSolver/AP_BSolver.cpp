@@ -51,6 +51,19 @@ static uint16_t arc_n_ticks, arc_incons, arc_reassign;
 static float arc_viol_max;
 static uint32_t arc_seed_ms;
 static bool arc_gate_txt;                  // v2d: gate-open statustext sent (once per engage)
+static bool arc_noroot_txt;                // v2d rule G1: first no-root statustext sent (once per engage)
+// rule G1's no-root reasons (bs_arc.h BS_ARC_SEED_DPRIME .. BS_ARC_SEED_LONG)
+static const char *arc_noroot_name(int r)
+{
+    switch (r) {
+    case BS_ARC_SEED_DPRIME: return "dprime";
+    case BS_ARC_SEED_DISC:   return "disc";
+    case BS_ARC_SEED_AB:     return "ab";
+    case BS_ARC_SEED_RAMPUP: return "rampup";
+    case BS_ARC_SEED_LONG:   return "long";
+    default:                 return "?";
+    }
+}
 static void arc_yield(void) { hal.scheduler->delay(1); }
 static unsigned long arc_micros(void) { return (unsigned long)AP_HAL::micros(); }
 #endif
@@ -1136,6 +1149,7 @@ void AP_BSolver::reset_mission()
     arc_n_ticks = arc_incons = arc_reassign = 0;
     arc_viol_max = 0.0f;
     arc_gate_txt = false;
+    arc_noroot_txt = false;
 #else
     bs_mb.ring_reset();
 #endif
@@ -1488,6 +1502,14 @@ bool AP_BSolver::solve_once()
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "BSLV: mission complete, %d ticks, settled t%d el %.2f ec %.2f",
                               (int)_tick, (int)arc_d.settle_tick, el, (double)arc_d.xi[3]);
+                // rule G1: the mission's no-root count (bs_arc_driver.no_root,
+                // HoverStop.no_root), 0 on a clean onset; a separate line
+                // because the one above already fills the 50-character
+                // statustext (it is cut after "el")
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "BSLV: G1 no root %d ticks, first t%d tb %d",
+                              (int)arc_d.no_root, (int)arc_d.no_root_tick,
+                              (int)arc_d.no_root_tb);
             } else {
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "BSLV: mission complete, %d ticks, cell %d",
@@ -1534,12 +1556,28 @@ bool AP_BSolver::solve_once()
     arc_ini_sum += arc_d.us_init;
     arc_nwt_sum += arc_d.us_newton;
     _tick++;
+    if (arc_ch->hover && arc_d.no_root > 0 && !arc_noroot_txt) {
+        // v2d rule G1, owner policy (a): the first closed-gate tick whose
+        // onset scan qualified a stage t_b but whose closed form had no
+        // admissible root (the gate stays closed, no fallback seed); the
+        // driver keeps the first such tick, its t_b and BS_ARC_SEED_* reason
+        // (bs_arc.h bs_arc_driver.no_root*); the count is reported at
+        // mission complete.  Not in the 14-field BSLA packet.
+        arc_noroot_txt = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "BSLV: G1 no root t%d tb %d reason %s(%d)",
+                      (int)arc_d.no_root_tick, (int)arc_d.no_root_tb,
+                      arc_noroot_name(arc_d.no_root_reason),
+                      (int)arc_d.no_root_reason);
+    }
     if (arc_ch->hover && arc_d.gate_open && !arc_gate_txt) {
-        // v2d rule G0: the brake-onset gate opened (arc_d.open_tick); the
-        // seed record is the driver's bs_arc_seed (t_b, rest stage of the
-        // exact stop written into the warm start; the interface leaves its
-        // value unspecified when the vehicle opened the gate from inside
-        // the hover cell without a seed)
+        // v2d rule G1: the brake-onset gate opened (arc_d.open_tick); the
+        // seed record is the driver's bs_arc_seed (t_b, the onset stage,
+        // and rest_stage = t_b + n_stop of the constant-deceleration
+        // trapezoid written into the warm start; latch = min(N, rest)).
+        // When the gate opened without a seed (the vehicle entered the
+        // hover cell first) the record keeps its reset values: tb -1,
+        // rest -1 (bs_arc.c stop_reset)
         arc_gate_txt = true;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                       "BSLV: gate open t%d seed tb %d rest %d latch %d",
