@@ -153,6 +153,20 @@ static const double bs_rc_arc_Kh[12] = {
 #define BS_HV_CF 1.61951161880771716e-01
 /* ==== v2d END */
 
+/* ==== v2e: tube fillets ==== BEGIN.  Source of truth:
+ * scripts/mpc/bsolver/model/arc_v2.py TUBE_DELTA_V2E (owner decision
+ * 2026-09-27; study tests/fix1b_tube_2026-09-27).  With the tube on, the
+ * chart builder sizes every fillet with the inside clearance
+ * BS_TUBE_DELTA: r_f = (w - BS_TUBE_DELTA) / (1 - cos h), h = |chi|/2
+ * (tangent-length cap and chord rule unchanged), and gives every chord
+ * the corridor rows s e_c <= b_k (inner corner of the legs' offset
+ * lines at w) and -s e_c <= o_k (closed-form exit to the corridor's
+ * outer boundary, the smaller over the chord's two endpoints), once
+ * per chart (stage2_arc_clock_mission.build_cells_fillet /
+ * tube_outer_reach).  Tube off: the fillets and rows of v2c / v2d. */
+#define BS_TUBE_DELTA 4.00000000000000022e-01
+/* ==== v2e END */
+
 /* The core's canonical names for the mission-independent
  * constants.  When a flash model header is ALSO present (host
  * test builds) it owns these names and the aliases stand down. */

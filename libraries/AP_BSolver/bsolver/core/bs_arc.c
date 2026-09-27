@@ -97,17 +97,127 @@ typedef struct {
 
 static void add_cell(cell_sink *s, double px, double py, double thx,
                      double thy, double l, int kind, double chi, int leg,
-                     double d_in, int sense)
+                     double d_in, int sense, double tube_in, double tube_out)
 {
     if (s->cells != NULL) {
         if (s->n >= s->cap) { s->overflow = 1; return; }
         bs_arc_cell *c = &s->cells[s->n];
         c->px = px; c->py = py; c->thx = thx; c->thy = thy;
         c->l = l; c->chi = chi; c->d_in = d_in;
+        c->tube_in = tube_in; c->tube_out = tube_out;
         c->kind = (signed char)kind; c->sense = (signed char)sense;
         c->leg = (short)leg;
     }
     s->n++;
+}
+
+/* ---- v2e: the corridor's outer boundary in closed form
+ * (stage2_arc_clock_mission._ray_slab / _ray_disc / _ray_capsule /
+ * tube_outer_reach, the same operations in the same order).  An interval
+ * of the ray parameter t is (lo, hi); "none" is a return of 0. */
+
+/* _ray_slab: {t : lo <= s0 + t su <= hi}; su == 0 and s0 inside: the
+ * whole line (-inf, inf).  fpclassify(su) == FP_ZERO is exactly the
+ * Python's su == 0.0 (both signed zeros; false on NaN) without the
+ * firmware's -Wfloat-equal. */
+static int ray_slab(double s0, double su, double lo, double hi,
+                    double *t_lo, double *t_hi)
+{
+    if (fpclassify(su) == FP_ZERO) {
+        if (lo <= s0 && s0 <= hi) { *t_lo = -HUGE_VAL; *t_hi = HUGE_VAL; return 1; }
+        return 0;
+    }
+    const double t1 = (lo - s0) / su;
+    const double t2 = (hi - s0) / su;
+    if (t1 <= t2) { *t_lo = t1; *t_hi = t2; }
+    else          { *t_lo = t2; *t_hi = t1; }
+    return 1;
+}
+
+/* _ray_disc: {t : |p + t u - c| <= w} for a unit u, the two roots of
+ * t^2 + 2 beta t + gamma = 0 */
+static int ray_disc(double px, double py, double ux, double uy, double cx,
+                    double cy, double w, double *t_lo, double *t_hi)
+{
+    const double dx = px - cx;
+    const double dy = py - cy;
+    const double beta = dx * ux + dy * uy;
+    const double gamma = (dx * dx + dy * dy) - w * w;
+    const double disc = beta * beta - gamma;
+    if (disc < 0.0) return 0;
+    const double sq = sqrt(disc);
+    *t_lo = -beta - sq;
+    *t_hi = -beta + sq;
+    return 1;
+}
+
+/* _ray_capsule: {t : dist(p + t u, [a, b]) <= w}, the hull of the
+ * rectangle's slab interval (0 <= s <= L, |c| <= w, n = (-ty, tx)) and
+ * the two disc intervals about a and b, in that order */
+static int ray_capsule(double px, double py, double ux, double uy,
+                       double ax, double ay, double bx, double by,
+                       double tx, double ty, double L, double w,
+                       double *t_lo, double *t_hi)
+{
+    const double rx = px - ax;
+    const double ry = py - ay;
+    const double s0 = rx * tx + ry * ty;
+    const double su = ux * tx + uy * ty;
+    const double c0 = rx * (-ty) + ry * tx;
+    const double cu = ux * (-ty) + uy * tx;
+    int have = 0;
+    double lo = 0.0, hi = 0.0;
+    double s_lo, s_hi, c_lo, c_hi;
+    if (ray_slab(s0, su, 0.0, L, &s_lo, &s_hi)
+        && ray_slab(c0, cu, -w, w, &c_lo, &c_hi)) {
+        const double a = (s_lo >= c_lo) ? s_lo : c_lo;
+        const double b = (s_hi <= c_hi) ? s_hi : c_hi;
+        if (a <= b) { lo = a; hi = b; have = 1; }
+    }
+    for (int e = 0; e < 2; ++e) {
+        double a, b;
+        if (ray_disc(px, py, ux, uy, e ? bx : ax, e ? by : ay, w, &a, &b)) {
+            if (!have) { lo = a; hi = b; have = 1; }
+            else {
+                if (a < lo) lo = a;
+                if (b > hi) hi = b;
+            }
+        }
+    }
+    if (!have) return 0;
+    *t_lo = lo; *t_hi = hi;
+    return 1;
+}
+
+/* tube_outer_reach: the first t >= 0 at which p + t u leaves the union of
+ * the capsules of radius w about the legs [V[k-1], V[k]] and [V[k],
+ * V[k+1]].  Returns 0 (and *e) or -5 when p lies in neither capsule. */
+static int tube_outer_reach(double px, double py, double ux, double uy,
+                            const double *vx, const double *vy,
+                            const double *tx, const double *ty,
+                            const double *Ls, int k, double w, double *e_out)
+{
+    double a0 = 0.0, a1 = 0.0, b0 = 0.0, b1 = 0.0;
+    const int hA = ray_capsule(px, py, ux, uy, vx[k - 1], vy[k - 1], vx[k], vy[k],
+                               tx[k - 1], ty[k - 1], Ls[k - 1], w, &a0, &a1);
+    const int hB = ray_capsule(px, py, ux, uy, vx[k], vy[k], vx[k + 1], vy[k + 1],
+                               tx[k], ty[k], Ls[k], w, &b0, &b1);
+    const int inA = hA && a0 <= 0.0 && 0.0 <= a1;
+    const int inB = hB && b0 <= 0.0 && 0.0 <= b1;
+    double e;
+    if (inA && inB) {
+        e = (a1 >= b1) ? a1 : b1;
+    } else if (inA) {
+        e = a1;
+        if (hB && b0 <= e && b1 > e) e = b1;
+    } else if (inB) {
+        e = b1;
+        if (hA && a0 <= e && a1 > e) e = a1;
+    } else {
+        return -5;
+    }
+    *e_out = e;
+    return 0;
 }
 
 /* The cell count of a straight of length Lp at nominal pace `pace`
@@ -154,7 +264,8 @@ static void straight(cell_sink *s, double p0x, double p0y, double thx,
         const double l = Lp[p] / n;
         for (int j = 0; j < n; ++j) {
             add_cell(s, p0x + thx * sacc, p0y + thy * sacc, thx, thy, l,
-                     kind[p], (first && j == 0) ? chi_at : 0.0, leg, 0.0, 0);
+                     kind[p], (first && j == 0) ? chi_at : 0.0, leg, 0.0, 0,
+                     0.0, 0.0);
             sacc += l;
         }
         first = 0;
@@ -172,7 +283,7 @@ static struct {
 
 static int chart_pass(const double *vx, const double *vy, int n_v,
                       cell_sink *s, bs_arc_chart *out, int cell_rows,
-                      int hover)
+                      int hover, double tube_delta)
 {
     const double corner_pace = BS_ARC_CORNER_PACE, w = BS_ARC_W;
     const double vtrim = v_trim();
@@ -194,7 +305,9 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
     for (int k = 1; k + 1 < n_v; ++k) {
         const double h = 0.5 * rad_of(fabs(chi[k]));
         if (h < 1e-6) continue;
-        rf[k] = w / (1.0 - cos(h));
+        /* v2e: (w - delta) / (1 - cos h); tube_delta 0: w / (1 - cos h)
+         * bit for bit (w - 0.0 == w) */
+        rf[k] = (w - tube_delta) / (1.0 - cos(h));
         T[k] = rf[k] * tan(h);
     }
     for (int k = 1; k + 1 < n_v; ++k) {
@@ -237,6 +350,16 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
             const double ang0 = atan2(ey - Cy, ex - Cx);
             double prevx = t0, prevy = t1;
             const double tBx = tx[i + 1], tBy = ty[i + 1];
+            /* v2e: the inner corner C_in of the corridor (the legs' inner
+             * offset lines at w, not w - delta), algebraic form:
+             * C_in = V + (nA + nB) * (w / (1 + tA . tB)) */
+            double cinx = 0.0, ciny = 0.0;
+            if (tube_delta > 0.0) {
+                const double nBx = -tBy * sgn, nBy = tBx * sgn;
+                const double f_in = w / (1.0 + (t0 * tBx + t1 * tBy));
+                cinx = vx[k] + (nAx + nBx) * f_in;
+                ciny = vy[k] + (nAy + nBy) * f_in;
+            }
             for (int j = 0; j < n_ch; ++j) {
                 const double a0 = ang0 + j * dpsi, a1 = ang0 + (j + 1) * dpsi;
                 const double p0x = Cx + rf[k] * cos(a0), p0y = Cy + rf[k] * sin(a0);
@@ -248,8 +371,22 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
                 const double mx = 0.5 * (p0x + p1x), my = 0.5 * (p0y + p1y);
                 const double dA = fabs((mx - vx[k]) * (-t1) + (my - vy[k]) * t0);
                 const double dB = fabs((mx - vx[k]) * (-tBy) + (my - vy[k]) * tBx);
+                double b_k = 0.0, o_k = 0.0;
+                if (tube_delta > 0.0 && s->cells != NULL) {
+                    /* v2e: the chord's inward margin b_k (to C_in) and
+                     * outward margin o_k (to the outer boundary), on the
+                     * filling pass only (the counting pass needs none) */
+                    const double nix = -thy * sgn, niy = thx * sgn;   /* n_k = sense * nh */
+                    b_k = nix * (cinx - p0x) + niy * (ciny - p0y);
+                    double o0, o1;
+                    if (tube_outer_reach(p0x, p0y, -nix, -niy, vx, vy, tx, ty, Ls, k, w, &o0) != 0
+                        || tube_outer_reach(p1x, p1y, -nix, -niy, vx, vy, tx, ty, Ls, k, w, &o1) != 0)
+                        return -5;
+                    o_k = (o0 <= o1) ? o0 : o1;
+                    if (!(b_k > 0.0 && o_k > 0.0)) return -5;
+                }
                 add_cell(s, p0x, p0y, thx, thy, l, BS_ARC_FILLET, dchi, i,
-                         (dA < dB) ? dA : dB, (int)sgn);
+                         (dA < dB) ? dA : dB, (int)sgn, b_k, o_k);
                 prevx = thx; prevy = thy;
             }
             chi_carry = wrap180(deg_of(atan2(tBy, tBx) - atan2(prevy, prevx)));
@@ -270,13 +407,13 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
              * at WP_N (kind BS_ARC_HV, l = 0, pace 0, chi 0, leg n_v - 2);
              * k_end is its index (am.build_cells_fillet tail <= 0). */
             add_cell(s, vx[n_v - 1], vy[n_v - 1], thx, thy, 0.0, BS_ARC_HV,
-                     0.0, n_v - 2, 0.0, 0);
+                     0.0, n_v - 2, 0.0, 0, 0.0, 0.0);
         } else {
             const int n = straight_count(BS_ARC_TAIL, vtrim, cell_rows);
             const double l = BS_ARC_TAIL / n;
             for (int j = 0; j < n; ++j)
                 add_cell(s, vx[n_v - 1] + thx * (j * l), vy[n_v - 1] + thy * (j * l),
-                         thx, thy, l, BS_ARC_TA, 0.0, n_v - 2, 0.0, 0);
+                         thx, thy, l, BS_ARC_TA, 0.0, n_v - 2, 0.0, 0, 0.0, 0.0);
         }
     }
     if (out != NULL) {
@@ -289,6 +426,8 @@ static int chart_pass(const double *vx, const double *vy, int n_v,
         out->w = w;
         out->cell_rows = cell_rows;
         out->hover = hover;
+        out->tube = (tube_delta > 0.0) ? 1 : 0;
+        out->tube_delta = tube_delta;
     }
     return 0;
 }
@@ -304,9 +443,9 @@ size_t bs_arc_chart_size(int n_wp, double len_m)
     return (size_t)bs_arc_chart_cells_bound(n_wp, len_m) * sizeof(bs_arc_cell);
 }
 
-int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
+int bs_arc_chart_build_tube(const double *vx, const double *vy, int n_wp,
                             void *mem, size_t mem_len, bs_arc_chart *out,
-                            int cell_rows, int hover)
+                            int cell_rows, int hover, double tube_delta)
 {
     if (n_wp < 2 || n_wp > BS_ARC_MAX_WP) return -1;
     memset(out, 0, sizeof(*out));
@@ -316,23 +455,41 @@ int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
     /* arc_v2.build_chart: the hover cell needs cell rows; and the v2d
      * constants / emitted pair, which only the v2 header carries */
     if (hover && (!cell_rows || !BS_ARC_HV_AVAILABLE)) return -4;
+    /* arc_v2.configure: 0 <= tube_delta < EC_BAND (= w); NaN refused */
+    if (!(tube_delta >= 0.0 && tube_delta < BS_ARC_W)) return -5;
     cell_sink cnt = { NULL, 0, 0, 0 };
-    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL, cell_rows, hover);
+    int rc = chart_pass(vx, vy, n_wp, &cnt, NULL, cell_rows, hover, tube_delta);
     if (rc != 0) return rc;
     if ((size_t)cnt.n * sizeof(bs_arc_cell) > mem_len) return -2;
     cell_sink fill = { (bs_arc_cell *)mem, 0, cnt.n, 0 };
-    rc = chart_pass(vx, vy, n_wp, &fill, out, cell_rows, hover);
+    rc = chart_pass(vx, vy, n_wp, &fill, out, cell_rows, hover, tube_delta);
     if (rc != 0) return rc;
     if (fill.overflow || fill.n != cnt.n) return -2;
     out->cells = (bs_arc_cell *)mem;
     return 0;
 }
 
+int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
+                            void *mem, size_t mem_len, bs_arc_chart *out,
+                            int cell_rows, int hover)
+{
+    return bs_arc_chart_build_tube(vx, vy, n_wp, mem, mem_len, out,
+                                   cell_rows, hover, 0.0);
+}
+
+/* the flown configuration: v2e under the v2 header (cell rows, the hover
+ * cell, tube fillets at BS_TUBE_DELTA); BS_ARC_TUBE = 0 builds v2d */
+#if BS_ARC_TUBE_AVAILABLE && BS_ARC_TUBE
+#define BS_ARC_TUBE_DEFAULT BS_TUBE_DELTA
+#else
+#define BS_ARC_TUBE_DEFAULT 0.0
+#endif
 int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
                        void *mem, size_t mem_len, bs_arc_chart *out)
 {
-    return bs_arc_chart_build_rows(vx, vy, n_wp, mem, mem_len, out, 1,
-                                   BS_ARC_HV_AVAILABLE ? BS_ARC_HOVER : 0);
+    return bs_arc_chart_build_tube(vx, vy, n_wp, mem, mem_len, out, 1,
+                                   BS_ARC_HV_AVAILABLE ? BS_ARC_HOVER : 0,
+                                   BS_ARC_TUBE_DEFAULT);
 }
 
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
@@ -425,10 +582,18 @@ void bs_arc_margins(const bs_arc_chart *ch, int k, double *m)
     } else {
     m[40] = BS_ARC_BAND; m[44] = BS_ARC_BAND;
     if (c->kind == BS_ARC_FILLET) {
-        /* am.fillet_rows: s e_c <= max(w - d_in, 0.05), -s e_c <= w + d_in */
-        double in = ch->w - c->d_in;
-        if (in < 0.05) in = 0.05;
-        const double outm = ch->w + c->d_in;
+        /* am.fillet_rows: s e_c <= max(w - d_in, 0.05), -s e_c <= w + d_in;
+         * a tube chart (v2e, arc_v2.fillet_rows): s e_c <= b_k, -s e_c <=
+         * o_k, built once with the chart */
+        double in, outm;
+        if (ch->tube) {
+            in = c->tube_in;
+            outm = c->tube_out;
+        } else {
+            in = ch->w - c->d_in;
+            if (in < 0.05) in = 0.05;
+            outm = ch->w + c->d_in;
+        }
         if (c->sense > 0) { m[41] = in; m[45] = outm; }
         else              { m[41] = outm; m[45] = in; }
     } else {

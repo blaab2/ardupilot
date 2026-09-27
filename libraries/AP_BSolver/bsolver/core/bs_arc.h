@@ -148,6 +148,16 @@
  *          BS_HV_SETTLE_CAP ticks after arrival unsettled as a failed run.
  * Charts built with hover = 0 reach none of these branches: the v1 / v2 /
  * v2b / v2c regression charts are bit-identical to before.
+ *
+ * TUBE FILLETS (v2e = v2d + tube fillets, 2026-09-27): a chart built with
+ * tube_delta > 0 (bs_arc_chart_build: BS_TUBE_DELTA = 0.4 m when
+ * BS_ARC_TUBE, the configuration flown since v2e; bs_arc_chart_build_tube
+ * takes the delta) sizes every fillet with that inside clearance and
+ * gives its chords the inner-corner / outer-boundary corridor rows, all
+ * computed once at the chart build (see bs_arc_chart_build below).  The
+ * tick path is unchanged: bs_arc_margins reads the two stored margins.
+ * tube_delta = 0 (bs_arc_chart_build_rows, and every chart before v2e)
+ * is bit-identical to the v1 .. v2d charts.
  */
 #ifndef BS_ARC_H
 #define BS_ARC_H
@@ -179,6 +189,14 @@
 #define BS_ARC_WIN_OUT 16.0          /* corner-pace straight after a vertex  */
 #define BS_ARC_HOVER 1               /* v2d: bs_arc_chart_build ends the chart
                                       * in the hover cell (no tail)          */
+#ifndef BS_ARC_TUBE
+#define BS_ARC_TUBE 1                /* v2e: bs_arc_chart_build sizes the
+                                      * fillets with the inside clearance
+                                      * BS_TUBE_DELTA and gives the chords
+                                      * the tube rows (0: the v2d chart; a
+                                      * firmware build takes --define
+                                      * BS_ARC_TUBE=0 at configure)        */
+#endif
 /* the v2d block (BS_HV_*, bs_rc_arc_Ph / Kh) is emitted into the v2
  * header only; the v1 header (byte-identical to its record) has none, so
  * a v1 build refuses a hover chart (bs_arc_chart_build_rows -> -4) and
@@ -187,6 +205,14 @@
 #define BS_ARC_HV_AVAILABLE 1
 #else
 #define BS_ARC_HV_AVAILABLE 0
+#endif
+/* the v2e constant BS_TUBE_DELTA (the owner's delta = 0.4 m) is likewise
+ * emitted into the v2 header only; without it bs_arc_chart_build builds
+ * no tube (bs_arc_chart_build_tube still takes any delta explicitly) */
+#ifdef BS_TUBE_DELTA
+#define BS_ARC_TUBE_AVAILABLE 1
+#else
+#define BS_ARC_TUBE_AVAILABLE 0
 #endif
 
 enum { BS_ARC_TA = 0, BS_ARC_CA = 1, BS_ARC_FILLET = 2, BS_ARC_HV = 3 };
@@ -197,6 +223,14 @@ typedef struct {
     double l;             /* cell length; chart pace = l / BS_TS             */
     double chi;           /* seam angle at the cell START, deg (0 = none)    */
     double d_in;          /* fillet cell: chord-midpoint depth into the corner */
+    double tube_in;       /* v2e fillet chord (chart tube on): b_k, the
+                           * inward corridor margin s e_c <= b_k (the
+                           * distance from the chord line to the corridor's
+                           * inner corner C_in); 0 otherwise                */
+    double tube_out;      /* v2e fillet chord: o_k, the outward margin
+                           * -s e_c <= o_k (closed-form exit to the
+                           * corridor's outer boundary, the smaller over
+                           * the chord's two endpoints); 0 otherwise        */
     signed char kind;     /* BS_ARC_TA / BS_ARC_CA / BS_ARC_FILLET / BS_ARC_HV */
     signed char sense;    /* fillet: +1 / -1 (turn sense), else 0           */
     short leg;            /* polyline leg index                              */
@@ -221,6 +255,11 @@ typedef struct {
     int hover;            /* 1: no tail, the chart ends in the hover cell
                            * (kind BS_ARC_HV) at the last waypoint (v2d);
                            * 0: the 60 m trailing straight (v1 .. v2c)      */
+    int tube;             /* 1: tube fillets (v2e): the chords carry
+                           * tube_in / tube_out and bs_arc_margins uses
+                           * them; 0: the fillets and rows of v1 .. v2d     */
+    double tube_delta;    /* the inside clearance the fillets were sized
+                           * with, m (0 when tube = 0)                      */
 } bs_arc_chart;
 
 /* Upper bound on the cell count / block size for n_wp waypoints of total
@@ -229,18 +268,51 @@ int bs_arc_chart_cells_bound(int n_wp, double len_m);
 size_t bs_arc_chart_size(int n_wp, double len_m);
 
 /* Build the fillet chart.  `mem` holds the cells (>= bs_arc_chart_size).
- * bs_arc_chart_build builds the configuration flown: cell_rows = 1 and
- * hover = BS_ARC_HOVER (v2d: the chart ends in the hover cell);
- * bs_arc_chart_build_rows takes both flags (cell_rows 0 = the archives'
+ * bs_arc_chart_build builds the configuration flown: cell_rows = 1,
+ * hover = BS_ARC_HOVER (v2d: the chart ends in the hover cell) and the
+ * tube fillets at BS_TUBE_DELTA when BS_ARC_TUBE (v2e; the v2 header
+ * carries the constant, the v1 header does not: no tube there);
+ * bs_arc_chart_build_rows takes the two flags (cell_rows 0 = the archives'
  * family rows and cell counts; hover 0 = the 60 m tail of the v1 .. v2c
- * archives).  The cell count depends on the mode, so it is a build-time
- * choice, not a field to flip afterwards.  Returns 0, or a negative code
- * (-1 waypoints, -2 memory, -3 geometry, -4 hover without cell rows). */
+ * archives) with the tube OFF (the v1 .. v2d charts, bit for bit);
+ * bs_arc_chart_build_tube takes the inside clearance as well (0 = off).
+ * The cell count depends on the mode, so it is a build-time choice, not a
+ * field to flip afterwards.  Returns 0, or a negative code (-1 waypoints,
+ * -2 memory, -3 geometry, -4 hover without cell rows, -5 tube: delta not
+ * in [0, BS_ARC_W), a chord endpoint outside the corridor, or a
+ * non-positive tube margin -- stage2_arc_clock_mission.build_cells_fillet
+ * raises ValueError on the same charts).
+ *
+ * TUBE FILLETS (v2e = v2d + tube fillets, owner decision 2026-09-27,
+ * study tests/fix1b_tube_2026-09-27; Python of record
+ * stage2_arc_clock_mission.build_cells_fillet(tube_delta) and
+ * tube_outer_reach, arc_v2.fillet_rows).  tube_delta > 0: every fillet
+ * radius is r_f = (w - tube_delta) / (1 - cos h), h = |chi| / 2 (the
+ * tangent-length cap and the chord-count rule unchanged), and every chord
+ * cell k carries, computed here once per chart (closed form, no search):
+ *   tube_in  b_k = n_k . (C_in - p_k), n_k = sense * (-thy, thx) the
+ *            inward chord normal, p_k the chord start, C_in = V + (nA +
+ *            nB) * (w / (1 + tA . tB)) the corner of the two legs' inner
+ *            offset lines at w (not w - delta);
+ *   tube_out o_k = the smaller over the chord's two endpoints of the exit
+ *            distance along -n_k from the union of the two leg capsules
+ *            of radius w (the outer offset lines joined by the radius-w
+ *            cap about the vertex): per capsule the hull of the ray's
+ *            slab interval on the rectangle and its two disc intervals
+ *            (t = -beta +- sqrt(beta^2 - gamma)).
+ * bs_arc_margins then writes s e_c <= b_k, -s e_c <= o_k on the chord in
+ * place of max(w - d_in, 0.05) / w + d_in.  Straight cells, the hover
+ * cell, all other rows, the reward, the solver and rule G1 are
+ * unchanged.  tube_delta = 0: r_f = (w - 0) / (1 - cos h) = w / (1 - cos
+ * h) bit for bit and no chord carries a tube margin. */
 int bs_arc_chart_build(const double *vx, const double *vy, int n_wp,
                        void *mem, size_t mem_len, bs_arc_chart *out);
 int bs_arc_chart_build_rows(const double *vx, const double *vy, int n_wp,
                             void *mem, size_t mem_len, bs_arc_chart *out,
                             int cell_rows, int hover);
+int bs_arc_chart_build_tube(const double *vx, const double *vy, int n_wp,
+                            void *mem, size_t mem_len, bs_arc_chart *out,
+                            int cell_rows, int hover, double tube_delta);
 
 /* world position / velocity / acceleration of a quotient state in cell k */
 void bs_arc_world(const bs_arc_chart *ch, int k, const double *xi,
