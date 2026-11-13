@@ -213,6 +213,12 @@ private:
     void write_log() const {}
 #endif
     void lift_prefix(Plan &plan) const;
+    // BSLV_WDJ clamped to its documented range [0, 3]; NaN / negative -> 0
+    float arc_wdj() const {
+        const float w = _wdj.get();
+        if (!(w >= 0.0f)) return 0.0f;
+        return (w > 3.0f) ? 3.0f : w;
+    }
 
     AP_Int8  _enable;
     AP_Int8  _q;                 // Newton iterations per maintained solve
@@ -220,6 +226,7 @@ private:
     AP_Int8  _ir;                // restrict the setup to the pinned rows
     AP_Int8  _k;                 // arc-cell clock: assignment/solve rounds per tick
     AP_Int8  _seed;              // arc-cell clock: engage seed (1 ramp = v2b, 0 U = 0)
+    AP_Float _wdj;               // arc-cell clock: world-frame jerk-change penalty weight
 
     bool _inited;
     bool _thread_created;

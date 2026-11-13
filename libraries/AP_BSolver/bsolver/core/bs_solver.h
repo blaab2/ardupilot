@@ -205,6 +205,18 @@ typedef struct {
      * (bs_arc_sched.tilt_w: BS_HV_W on a stage whose next state is in the
      * hover cell, BS_SPEED_TILT_W elsewhere). */
     const bs_real *tilt_w;
+    /* World-frame jerk-change penalty (arc_v2.W_DJ, study 2026-10-20,
+     * runtime port 2026-11-13): the input weight of the horizon becomes
+     *     Rbar + w_dj D'D,   ||D U||^2 = sum_{t=1..N-1} ||u_t - G_(t-1) u_(t-1)||^2,
+     * G_(t-1) the (a_l, a_c) block -- rows / columns 1 and 5 -- of the
+     * frozen transition T(k+t) that carries input t-1's chart frame into
+     * input t's (the identity on a hold).  A RUNTIME weight: the arc layer
+     * copies bs_arc_sched.w_dj here at every render.  0 (every flash
+     * initializer, every memset schedule) adds nothing and leaves the
+     * arithmetic bit for bit as before; defined for BS_NU == 2 only (the
+     * v1 three-input header ignores it, bs_arc_engage refuses w_dj > 0
+     * there). */
+    bs_real w_dj;
 #endif
 #if BS_STAGE2_PACE_TAB
     /* STAGE 2 (c): the published pace per tick (m/s), same indexing and

@@ -275,6 +275,23 @@ const AP_Param::GroupInfo AP_BSolver::var_info[] = {
     // and v2 (p4-v2) archives and the flights scored against them.
     AP_GROUPINFO("SEED", 7, AP_BSolver, _seed, 1),
 
+    // @Param: WDJ
+    // @DisplayName: Arc-cell clock: world-frame jerk-change penalty weight
+    // @Description: Weight W of the world-frame jerk-change penalty W * sum_t |R(theta_t) u_t - R(theta_(t-1)) u_(t-1)|^2 added to the horizon's input cost (the input weight becomes Rbar + W D'D). It smooths the commanded jerk across cell and heading changes. 0 reproduces revision v2e bit for bit; 1 is the owner's setting (2026-11-13). Read at engage; arc-cell clock builds only.
+    // @Range: 0 3
+    // @Increment: 0.1
+    // @User: Advanced
+    // BS_ARC builds only, read at engage into bs_arc_sched.w_dj (copied into
+    // bs_schedule.w_dj by every render; core/bs_solver.c adds 2 W D'D to
+    // the Hessian and W |D U|^2 to the value).  Host study: scripts/mpc/
+    // bsolver/tests/jerkrate_2026-10-20 (W 0.1-0.3 the sweet spot, 1.0 the
+    // owner's choice); C-vs-Python parity at W = 1 and the per-tick cost:
+    // scripts/mpc/bsolver/doc/WDJ1-PORT-2026-11-13.md.  The value is
+    // clamped to [0, 3] at engage; a NaN reads as 0.  Not in the BSLV /
+    // BSLA records (both are at the logger's field / label limits): the
+    // PARM record carries it, and the engage statustexts name it.
+    AP_GROUPINFO("WDJ", 8, AP_BSolver, _wdj, 1.0f),
+
     AP_GROUPEND
 };
 
@@ -899,7 +916,12 @@ void AP_BSolver::engage()
     if (!_inited) return;
     _active = true;
     _next_solve_ms = AP_HAL::millis();
+#if BS_ARC
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: engaged (q=%d K=%d wdj=%.2f)",
+                  (int)_q, (int)_k, (double)arc_wdj());
+#else
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: engaged (q=%d)", (int)_q);
+#endif
 }
 
 void AP_BSolver::disengage()
@@ -1322,6 +1344,9 @@ void AP_BSolver::seed_once()
         // the engage seed (BSLV_SEED): the driver defaults to the v2b
         // ramp; 0 keeps the archives' U = 0 for comparison flights
         arc_d.seed_ramp = (_seed != 0) ? 1 : 0;
+        // the jerk-change penalty (BSLV_WDJ): after driver_init, which
+        // zeroes the schedule; clamped to the documented range
+        S->w_dj = (double)arc_wdj();
         arc_d.yield = arc_yield;
         arc_d.micros = arc_micros;
         _tick = 0;
@@ -1352,6 +1377,7 @@ void AP_BSolver::seed_once()
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc seed %d steps, %.0f ms (q%d K%d %s)",
                       arc_d.seed_iters, (double)_solve_ms, q, rounds,
                       arc_d.seed_ramp ? "ramp" : "zero");
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BSLV: arc wdj %.3f", S->w_dj);
         return;
     }
 #endif

@@ -1393,6 +1393,7 @@ int bs_arc_render(const bs_arc_chart *ch, bs_arc_sched *S, double trust)
 #if BS_ARC
     sc->mstk = S->mstk;
     sc->tilt_w = S->tilt_w;
+    sc->w_dj = S->w_dj;
 #endif
     return 0;
 }
@@ -1493,6 +1494,12 @@ int bs_arc_engage(bs_arc_driver *d)
      * stop_params); a hover chart without the symmetric stop from the
      * last straight cell's pace is refused as the Python refuses it */
     if (ch->hover && !stop_params(ch, &d->stop)) return -4;
+    if (!(d->S->w_dj >= 0.0)) return -5;       /* negative / NaN weight */
+#if BS_NU != 2
+    /* the jerk-change penalty is defined for the two-input model only
+     * (arc_v2.jerk_change_gram raises at NU != 2; bs_solver ignores it) */
+    if (d->S->w_dj > 0.0) return -5;
+#endif
     /* rule G1's distance checkpoints (HoverStop.__init__ -> dist_suffix) */
     if (ch->hover) dist_checkpoints(ch, &d->stop);
     memset(d->xi, 0, sizeof(d->xi));

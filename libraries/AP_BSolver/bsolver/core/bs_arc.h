@@ -355,6 +355,12 @@ typedef struct {
      * w_t for the term on delta of X_{t+1}: BS_HV_W when ks[t + 1] is the
      * hover cell, BS_SPEED_TILT_W otherwise (bs_schedule.tilt_w) */
     double tilt_w[BS_N];
+    /* the world-frame jerk-change penalty weight (arc_v2.W_DJ, runtime
+     * port 2026-11-13): copied into bs_schedule.w_dj by every
+     * bs_arc_render.  bs_arc_driver_init zeroes it (v2e bit for bit); the
+     * caller sets d->S->w_dj AFTER bs_arc_driver_init and before
+     * bs_arc_engage (the firmware: BSLV_WDJ).  BS_NU == 2 only. */
+    double w_dj;
     /* v2d: the stop state the assignment consults (arc_v2.HoverStop):
      * gate_open / latch are the rule's state (the latch a running minimum
      * over EVERY assign call, -1 = none); forced, t_nat, n_vtail describe
@@ -537,7 +543,9 @@ void bs_arc_ramp_seed(const bs_arc_chart *ch, double *U);
  * inputs.  On a hover chart the stop model of record (d->stop) is
  * computed first.  Returns 0 on success, -1 when the engage's render
  * failed, -4 on a hover chart without the symmetric stop of record
- * (arc_v2.stop_params' AssertionError). */
+ * (arc_v2.stop_params' AssertionError), -5 on an invalid jerk-change
+ * weight d->S->w_dj (negative / NaN, or non-zero on the three-input v1
+ * model). */
 int bs_arc_engage(bs_arc_driver *d);
 
 /* One maintained tick, in the order of ac.run / arc_v2._run: publish (the

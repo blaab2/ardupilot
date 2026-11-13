@@ -121,6 +121,25 @@ static const bs_real *rot_of(const bs_schedule *schedule, int t)
 #endif
 }
 
+/* The world-frame jerk-change penalty (bs_schedule.w_dj) exists on the arc
+ * build with the two-input model only. */
+#if BS_ARC && (BS_NU == 2)
+#define BS_JC 1
+/* G_(t-1) of the penalty, t = 1..N-1: the (a_l, a_c) block of T(k+t) --
+ * rows and columns 1 and 5, row-major 2x2 -- the transition that carries
+ * input t-1's chart frame into input t's.  arc_v2.jerk_change_gram reads
+ * T[t-1] = S.T_abs(tau + t), the matrix rot_of(phase + t) returns. */
+static void jc_block(const bs_schedule *schedule, int phase, int t,
+                     bs_real G[4])
+{
+    const bs_real *T = rot_of(schedule, phase + t);
+    G[0] = T[1 * NX + 1]; G[1] = T[1 * NX + 5];
+    G[2] = T[5 * NX + 1]; G[3] = T[5 * NX + 5];
+}
+#else
+#define BS_JC 0
+#endif
+
 /* The affine seam offset applied at DESTINATION tick t, i.e. the c(t) of
  *     xi_t = T(t) (A xi_{t-1} + B u_{t-1}) + c(t).
  * Mirrors rot_of(): same clamped/wrapped tick, same table-plus-index
@@ -423,6 +442,40 @@ bs_status bs_problem_init_pinned(bs_problem *problem,
             for (int j = 0; j < NU; ++j)
                 problem->Hquad[(size_t)(t * NU + i) * NV + (t * NU + j)]
                     += 2.0 * bs_R[(size_t)i * NU + j];
+#if BS_JC
+    /* + 2 w_dj D'D (the jerk-change penalty, bs_schedule.w_dj), built rows
+     * only.  Row block t of D is [-G_(t-1) | I] on input blocks (t-1, t),
+     * so D'D gains G'G on (t-1, t-1), -G' on (t-1, t), -G on (t, t-1) and
+     * I on (t, t); a block lands only when its ROW block is >= npin (the
+     * (t, t-1) block of the first free stage reaches into a pinned column,
+     * which the gradient's full-row product needs).  The gradient is
+     * Hquad U, so it carries the term with no further code. */
+    if (schedule->w_dj > 0.0) {
+        const bs_real w2 = 2.0 * schedule->w_dj;
+        for (int t = 1; t < NN; ++t) {
+            bs_real G[4];
+            jc_block(schedule, phase, t, G);
+            const int b0 = NU * (t - 1), b1 = NU * t;
+            if (t - 1 >= npin) {
+                for (int i = 0; i < 2; ++i) {
+                    bs_real *hrow = &problem->Hquad[(size_t)(b0 + i) * NV];
+                    for (int j = 0; j < 2; ++j) {
+                        hrow[b0 + j] += w2 * (G[i] * G[j] + G[2 + i] * G[2 + j]);
+                        hrow[b1 + j] -= w2 * G[2 * j + i];
+                    }
+                }
+            }
+            if (t >= npin) {
+                for (int i = 0; i < 2; ++i) {
+                    bs_real *hrow = &problem->Hquad[(size_t)(b1 + i) * NV];
+                    for (int j = 0; j < 2; ++j)
+                        hrow[b0 + j] -= w2 * G[2 * i + j];
+                    hrow[b1 + i] += w2;
+                }
+            }
+        }
+    }
+#endif
 
     return BS_OK;
 }
@@ -631,6 +684,21 @@ static bs_status eval_impl(const bs_problem *problem, const bs_real *U,
         for (int i = 0; i < NU; ++i)
             for (int j = 0; j < NU; ++j)
                 quad += U[t * NU + i] * bs_R[(size_t)i * NU + j] * U[t * NU + j];
+#if BS_JC
+    /* + w_dj ||D U||^2 = w_dj sum_{t=1..N-1} ||u_t - G_(t-1) u_(t-1)||^2 */
+    if (schedule->w_dj > 0.0) {
+        bs_real jc = 0.0;
+        for (int t = 1; t < NN; ++t) {
+            bs_real G[4];
+            jc_block(schedule, phase, t, G);
+            const bs_real *up = &U[NU * (t - 1)], *ut = &U[NU * t];
+            const bs_real r0 = ut[0] - (G[0] * up[0] + G[1] * up[1]);
+            const bs_real r1 = ut[1] - (G[2] * up[0] + G[3] * up[1]);
+            jc += r0 * r0 + r1 * r1;
+        }
+        quad += schedule->w_dj * jc;
+    }
+#endif
     const bs_real *Pterm = schedule->P_tab
         ? &schedule->P_tab[(size_t)terminal_family_of(schedule, phase + NN)
                            * NX * NX]
