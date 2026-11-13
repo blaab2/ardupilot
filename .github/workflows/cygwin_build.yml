@@ -245,9 +245,15 @@ jobs:
           path: artifacts
           retention-days: 7
 
-      # Smoke test, NON-BLOCKING (the artifact is already uploaded): start
-      # the exe exactly as Mission Planner does with the P4 extra command
-      # line, fly the turns mission with native Windows Python + pymavlink.
+      # Smoke tests, NON-BLOCKING (the artifact is already uploaded); both fly
+      # the turns mission with native Windows Python + pymavlink.
+      # Pass 1 (smoke/): the ROMFS variant -- empty cwd, model and parameters
+      # from @ROMFS/models/, -w.  Pass 2 (smoke_mp/): the argument list Mission
+      # Planner's SITL dialog builds (GCSViews/SITL.cs StartSITL) with the P4
+      # extra command line of 01 section 3: cwd holds SN77.json + p4_sitl.parm,
+      # MP's own --defaults "<absolute Windows path>\copter.parm" comes first,
+      # --wipe last.  Each pass also requires 'Loaded model params from
+      # SN77.json' on the SITL console.
       - uses: actions/setup-python@v5
         continue-on-error: true
         with:
@@ -273,14 +279,45 @@ jobs:
           taskkill //F //IM ArduCopter.elf.exe || true
           sleep 2
           ls -la run || true
+          grep -q "Loaded model params from SN77.json" sitl_stdout.txt || { echo "model SN77.json not loaded"; rc=1; }
+          exit $rc
+      - name: Smoke test 2 (Mission Planner argument list)
+        id: smoke_mp
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set +e
+          set -x
+          mkdir -p smoke_mp/run
+          cp Tools/scripts/p4_cygwin/p4_sitl.parm smoke_mp/run/
+          cp artifacts/SN77.json smoke_mp/run/
+          cp Tools/autotest/default_params/copter.parm smoke_mp/copter.parm
+          MP_PARM="$(cd smoke_mp && pwd -W)\\copter.parm"
+          cd smoke_mp/run
+          ../../artifacts/ArduCopter.elf.exe -M+ -O50.2917,10.3986,300,0 -s1 --serial0 tcp:0 \
+            --defaults "$MP_PARM" \
+            --model +:SN77.json --defaults p4_sitl.parm --home 50.2917,10.3986,0,0 \
+            --wipe > ../sitl_stdout.txt 2>&1 &
+          sleep 5
+          cd ..
+          python ../Tools/scripts/p4_cygwin/smoke_sitl.py ../Tools/scripts/p4_cygwin/turns.waypoints . 2>&1 | tee smoke_log.txt
+          rc=${PIPESTATUS[0]}
+          taskkill //F //IM ArduCopter.elf.exe || true
+          sleep 2
+          ls -la run || true
+          grep -q "Loaded model params from SN77.json" sitl_stdout.txt || { echo "model SN77.json not loaded"; rc=1; }
           exit $rc
       - name: Smoke test result
         if: always()
         shell: bash
         run: |
-          echo "smoke outcome: ${{ steps.smoke.outcome }}"
+          echo "smoke outcome (ROMFS): ${{ steps.smoke.outcome }}"
+          echo "smoke outcome (Mission Planner args): ${{ steps.smoke_mp.outcome }}"
           cat smoke/smoke_result.json || true
+          cat smoke_mp/smoke_result.json || true
           tail -50 smoke/sitl_stdout.txt || true
+          tail -50 smoke_mp/sitl_stdout.txt || true
       - name: Archive smoke logs
         if: always()
         continue-on-error: true
@@ -292,4 +329,8 @@ jobs:
             smoke/smoke_result.json
             smoke/sitl_stdout.txt
             smoke/run/logs/
+            smoke_mp/smoke_log.txt
+            smoke_mp/smoke_result.json
+            smoke_mp/sitl_stdout.txt
+            smoke_mp/run/logs/
           retention-days: 7
