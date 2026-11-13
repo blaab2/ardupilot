@@ -1,0 +1,16 @@
+    <message id="11061" name="MPC_TRAJECTORY">
+      <description>A chunk of an onboard-MPC time-parametrized trajectory (NED, row/local frame), fed raw (un-reshaped) to the position controller. Multiple chunks (start_index 0..num_points) assemble one trajectory identified by traj_id; the chunk with start_index+count==num_points commits it. First cut is NE-only (altitude held).</description>
+      <field type="uint16_t" name="traj_id">Monotonic trajectory id (one per MPC solve). Chunks with a mismatched id are dropped.</field>
+      <field type="uint16_t" name="num_points">Total number of nodes in the full trajectory.</field>
+      <field type="uint16_t" name="start_index">Index of the first node carried in this chunk.</field>
+      <field type="uint8_t" name="count">Number of valid nodes in this chunk (1..6).</field>
+      <field type="uint16_t" name="dt_ms" units="ms">Nominal node spacing; node i has time start_index_i*dt_ms.</field>
+      <field type="float[6]" name="pos_n" units="m">North position of each node (local NED).</field>
+      <field type="float[6]" name="pos_e" units="m">East position of each node (local NED).</field>
+      <field type="float[6]" name="vel_n" units="m/s">North velocity of each node.</field>
+      <field type="float[6]" name="vel_e" units="m/s">East velocity of each node.</field>
+      <field type="float[6]" name="acc_n" units="m/s/s">North kinematic acceleration of each node.</field>
+      <field type="float[6]" name="acc_e" units="m/s/s">East kinematic acceleration of each node.</field>
+      <field type="uint32_t" name="time_boot_ms" units="ms">Vehicle time_boot_ms of the state used as node 0 (the solve anchor), echoed from LOCAL_POSITION_NED so it stays in the vehicle clock domain. The replay clock starts here, compensating solve+transport latency. 0 = unknown (firmware falls back to arrival time).</field>
+      <field type="float" name="drag_k" units="1/m">Quadratic drag coefficient k/m of the airframe model. The firmware adds drag_k*|v|*v (v = velocity estimate) as thrust-side acceleration feed-forward after the velocity PID, so the accelerations above stay kinematic and the PID only corrects unmodeled effects. 0 disables.</field>
+    </message>

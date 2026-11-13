@@ -153,9 +153,32 @@ jobs:
     runs-on: 'windows-latest'
 
     steps:
+      # P4 (branch p4-wdj1): modules/mavlink's gitlink 0dafe8cab2 is a
+      # local-only commit (MPC_TRAJECTORY, id 11061), so a recursive
+      # checkout cannot fetch it.  Check out without submodules, init every
+      # submodule except mavlink, then take mavlink's upstream parent
+      # 13f2f7351a and re-insert the one message
+      # (Tools/scripts/p4_cygwin/mavlink_add_mpc_trajectory.py).
       - uses: actions/checkout@v7
         with:
-          submodules: 'recursive'
+          submodules: false
+      - name: Submodules (mavlink = upstream parent + MPC_TRAJECTORY)
+        shell: bash
+        run: |
+          set -ex
+          git submodule init
+          git config submodule.modules/mavlink.update none
+          git submodule update --recursive --depth 1 || git submodule update --recursive
+          rm -rf modules/mavlink
+          git init modules/mavlink
+          git -C modules/mavlink config core.autocrlf false
+          git -C modules/mavlink remote add origin https://github.com/ArduPilot/mavlink
+          git -C modules/mavlink fetch --depth 1 origin 13f2f7351a9bdf5292a2c243eb9a2c19ff4b6472
+          git -C modules/mavlink checkout FETCH_HEAD
+          git -C modules/mavlink submodule update --init --recursive --depth 1 || git -C modules/mavlink submodule update --init --recursive
+          python Tools/scripts/p4_cygwin/mavlink_add_mpc_trajectory.py modules/mavlink/message_definitions/v1.0/ardupilotmega.xml
+          grep -c 'name="MPC_TRAJECTORY"' modules/mavlink/message_definitions/v1.0/ardupilotmega.xml
+          git submodule status
       - uses: cygwin/cygwin-install-action@v6
         with:
           packages: cygwin64 gcc-g++=13.4.0-1 ccache python312 python312-pip git procps gettext
@@ -179,7 +202,7 @@ jobs:
           ccache -s
       - uses: ./.github/actions/setup-ccache
         with:
-          key-suffix: cygwin-sitl
+          key-suffix: cygwin-sitl-p4
       - name: Prepare Python environment
         env:
           PATH: /usr/bin:$(cygpath ${SYSTEMROOT})/system32
@@ -194,17 +217,17 @@ jobs:
           ln -s ccache /usr/local/bin/x86_64-pc-cygwin-gcc &&
           ln -s ccache /usr/local/bin/x86_64-pc-cygwin-g++
 
-      - name: Build SITL
+      - name: Build SITL (ArduCopter, BSLV_ARC=1)
         env:
           PATH: /usr/bin:$(cygpath ${SYSTEMROOT})/system32
         shell: C:\cygwin\bin\bash.exe -eo pipefail '{0}'
         run: >-
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}" &&
           CYGPATH_GITHUB_WORKSPACE=$(cygpath -u "$GITHUB_WORKSPACE") &&
-          git config --global --add safe.directory "${CYGPATH_GITHUB_WORKSPACE}" &&
+          git config --global --add safe.directory '*' &&
           export PATH=/usr/local/bin:/usr/bin:$(cygpath ${SYSTEMROOT})/system32 &&
           source ~/ccache.conf &&
-          Tools/scripts/cygwin_build.sh &&
+          bash Tools/scripts/p4_cygwin/cygwin_build_p4.sh &&
           ccache -s
       - uses: ./.github/actions/save-ccache
 
@@ -212,7 +235,7 @@ jobs:
         id: check_files
         uses: andstor/file-existence-action@v3
         with:
-          files: "artifacts/*"
+          files: "artifacts/ArduCopter.elf.exe, artifacts/cygwin1.dll"
           fail: true
 
       - name: Archive build
@@ -220,4 +243,53 @@ jobs:
         with:
           name: binaries
           path: artifacts
+          retention-days: 7
+
+      # Smoke test, NON-BLOCKING (the artifact is already uploaded): start
+      # the exe exactly as Mission Planner does with the P4 extra command
+      # line, fly the turns mission with native Windows Python + pymavlink.
+      - uses: actions/setup-python@v5
+        continue-on-error: true
+        with:
+          python-version: '3.12'
+      - name: Smoke test (turns mission, BSLV statustexts)
+        id: smoke
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set +e
+          set -x
+          python -m pip install --progress-bar off pymavlink
+          mkdir -p smoke/run
+          cd smoke/run
+          ../../artifacts/ArduCopter.elf.exe -M+ -O50.2917,10.3986,0,0 -s1 --serial0 tcp:0 \
+            --model +:SN77.json --defaults @ROMFS/models/p4_sitl.parm \
+            --home 50.2917,10.3986,0,0 -w > ../sitl_stdout.txt 2>&1 &
+          sleep 5
+          cd ..
+          python ../Tools/scripts/p4_cygwin/smoke_sitl.py ../Tools/scripts/p4_cygwin/turns.waypoints . 2>&1 | tee smoke_log.txt
+          rc=${PIPESTATUS[0]}
+          taskkill //F //IM ArduCopter.elf.exe || true
+          sleep 2
+          ls -la run || true
+          exit $rc
+      - name: Smoke test result
+        if: always()
+        shell: bash
+        run: |
+          echo "smoke outcome: ${{ steps.smoke.outcome }}"
+          cat smoke/smoke_result.json || true
+          tail -50 smoke/sitl_stdout.txt || true
+      - name: Archive smoke logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-logs
+          path: |
+            smoke/smoke_log.txt
+            smoke/smoke_result.json
+            smoke/sitl_stdout.txt
+            smoke/run/logs/
           retention-days: 7
