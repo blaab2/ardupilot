@@ -1945,9 +1945,9 @@ static void publish_ff(AP_BSolver::Plan &plan, const double *pn,
     }
 
     const double inv = 1.0 / BS_TS;
-    double kn[PLAN_NODES], ke[PLAN_NODES];
-    double kvn[PLAN_NODES], kve[PLAN_NODES];
-    double kan[PLAN_NODES], kae[PLAN_NODES];
+    double kn[PLAN_NODES] = {}, ke[PLAN_NODES] = {};
+    double kvn[PLAN_NODES] = {}, kve[PLAN_NODES] = {};
+    double kan[PLAN_NODES] = {}, kae[PLAN_NODES] = {};
     for (uint8_t m = 0; m < nkeep; ++m) {
         kn[m] = pn[keep[m]];
         ke[m] = pe[keep[m]];
@@ -2033,7 +2033,7 @@ static void publish_ff(AP_BSolver::Plan &plan, const double *pn,
     // without adding the two actuator states an augmented model would need
     // (see papers/.../notes/attitude-lag-model.tex for that alternative).
     // Positions and velocities are untouched.
-    double kjn[PLAN_NODES], kje[PLAN_NODES];
+    double kjn[PLAN_NODES] = {}, kje[PLAN_NODES] = {};
     for (uint8_t m = 0; m < nkeep; ++m) {
         if (nkeep < 2) {
             kjn[m] = kje[m] = 0.0;
